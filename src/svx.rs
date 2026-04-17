@@ -526,7 +526,7 @@ impl Demuxer for SvxDemuxer {
 
 /// Open a muxer through the [`ContainerRegistry`] with no container-level
 /// metadata. For callers that need to write `NAME` / `AUTH` / `ANNO` /
-/// `CHRS` chunks, construct [`SvxMuxer`] directly via
+/// `(c) ` / `CHRS` chunks, construct [`SvxMuxer`] directly via
 /// [`SvxMuxer::with_metadata`] — the `Muxer` trait doesn't currently carry
 /// metadata through its opening hook.
 fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
@@ -538,17 +538,18 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
 /// `VHDR` (20 bytes) + optional string metadata + `BODY` (the raw samples).
 ///
 /// Construct via [`SvxMuxer::new`] for a bare voice, or
-/// [`SvxMuxer::with_metadata`] to attach `NAME` / `AUTH` / `ANNO` / `CHRS`
-/// chunks. `(c) ` (copyright) is **not** emitted — the FourCC's trailing
-/// space and the demuxer's ASCII-trim make arbitrary UTF-8 copyright
-/// strings awkward to round-trip, so we stay out of that chunk for now.
+/// [`SvxMuxer::with_metadata`] to attach `NAME` / `AUTH` / `ANNO` /
+/// `(c) ` / `CHRS` chunks. The demuxer trims values at the first NUL and
+/// decodes them UTF-8-lossy, which matches how the muxer writes them
+/// (NUL-terminated, even-padded payload).
 pub struct SvxMuxer {
     output: Box<dyn WriteSeek>,
     channels: Channels,
     compression: Compression,
     sample_rate: u32,
     /// Ordered (key, value) pairs. Recognised keys: `title` → `NAME`,
-    /// `artist` → `AUTH`, `comment` → `ANNO`, `characters` → `CHRS`.
+    /// `artist` → `AUTH`, `comment` → `ANNO`, `copyright` → `(c) `,
+    /// `characters` → `CHRS`.
     metadata: Vec<(String, String)>,
     form_size_offset: u64,
     body_size_offset: u64,
@@ -663,6 +664,7 @@ fn metadata_fourcc(key: &str) -> Option<&'static [u8; 4]> {
         "title" => Some(b"NAME"),
         "artist" => Some(b"AUTH"),
         "comment" => Some(b"ANNO"),
+        "copyright" => Some(b"(c) "),
         "characters" => Some(b"CHRS"),
         _ => None,
     }

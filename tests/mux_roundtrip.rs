@@ -433,6 +433,74 @@ fn mux_roundtrip_stereo_fibonacci_within_2_lsb() {
 }
 
 #[test]
+fn mux_roundtrip_all_string_chunks() {
+    let sr = 8000u32;
+    let payload = sawtooth_200ms_8khz();
+    let stream = build_stream(sr);
+    let metadata = vec![
+        ("title".to_string(), "voice-01".to_string()),
+        ("artist".to_string(), "anon".to_string()),
+        ("comment".to_string(), "a quick test".to_string()),
+        ("copyright".to_string(), "(c) 1987 Example".to_string()),
+        ("characters".to_string(), "abc".to_string()),
+    ];
+    let path = tmp_path("all-strings");
+
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux =
+            SvxMuxer::with_metadata(ws, std::slice::from_ref(&stream), &metadata).unwrap();
+        mux.write_header().unwrap();
+        mux.write_packet(&Packet::new(0, stream.time_base, payload.clone()))
+            .unwrap();
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    // Every declared FourCC must appear on disk, before BODY.
+    let body_pos = bytes
+        .windows(4)
+        .position(|w| w == b"BODY")
+        .expect("BODY chunk");
+    for fourcc in [b"NAME", b"AUTH", b"ANNO", b"(c) ", b"CHRS"] {
+        let pos = bytes
+            .windows(4)
+            .position(|w| w == fourcc)
+            .unwrap_or_else(|| panic!("missing chunk {}", std::str::from_utf8(fourcc).unwrap()));
+        assert!(
+            pos < body_pos,
+            "{} must precede BODY",
+            std::str::from_utf8(fourcc).unwrap()
+        );
+    }
+
+    let reg = registry();
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut dmx = reg.open_demuxer("iff_8svx", rs).unwrap();
+    let md: std::collections::HashMap<_, _> = dmx.metadata().iter().cloned().collect();
+    assert_eq!(md.get("title").map(String::as_str), Some("voice-01"));
+    assert_eq!(md.get("artist").map(String::as_str), Some("anon"));
+    assert_eq!(md.get("comment").map(String::as_str), Some("a quick test"));
+    assert_eq!(
+        md.get("copyright").map(String::as_str),
+        Some("(c) 1987 Example")
+    );
+    assert_eq!(md.get("characters").map(String::as_str), Some("abc"));
+
+    let mut got = Vec::<u8>::new();
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => got.extend_from_slice(&p.data),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+    assert_eq!(got, payload);
+}
+
+#[test]
 fn muxer_rejects_wrong_codec() {
     let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
     params.media_type = MediaType::Audio;
