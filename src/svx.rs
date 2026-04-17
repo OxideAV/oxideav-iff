@@ -8,10 +8,26 @@
 //! - `BODY`: raw signed 8-bit samples (or Fibonacci-delta compressed).
 //!
 //! We expose an 8SVX file as a single audio stream with codec id
-//! `pcm_s8` and emit the BODY bytes in reasonably-sized packets. Only
-//! uncompressed (`sCompression = 0`), mono (single `CHAN`/no CHAN) is
-//! supported today; Fibonacci-delta decoding and the CHAN=6 stereo layout
-//! are straightforward follow-ups.
+//! `pcm_s8`. Two compression modes are supported:
+//!
+//! * `sCompression = 0` — raw signed 8-bit PCM.
+//! * `sCompression = 1` — Fibonacci-delta (lossy). Each channel's
+//!   compressed stream starts with a 1-byte pad, then a 1-byte initial
+//!   sample, then 4-bit delta indices packed two-per-byte high-nibble
+//!   first. The decoded delta table is
+//!   `[-34, -21, -13, -8, -5, -3, -2, -1, 0, 1, 2, 3, 5, 8, 13, 21]`
+//!   (16 entries). The task prompt listed a 17-entry variant; we use the
+//!   16-entry table from the Amiga ROM Kernel Manual / AmigaOS wiki
+//!   because the nibble is only 4 bits wide and 16 codes are all that
+//!   can actually be addressed. See `FIB_DELTA_TABLE` below.
+//!
+//! Channel layout: `CHAN` payload is 4 bytes BE. We recognise `2`
+//! (LEFT, mono) and `6` (LEFT|RIGHT, stereo). Stereo BODY layout is
+//! **concatenated halves** — left channel in full, then right channel in
+//! full (the common convention cited by the AmigaOS wiki and sampling
+//! software). For Fibonacci-compressed stereo each half carries its own
+//! pad + initial-sample header, so the two channels can be decoded
+//! independently.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -38,6 +54,217 @@ fn probe(p: &oxideav_container::ProbeData) -> u8 {
         100
     } else {
         0
+    }
+}
+
+// --- Compression + channel types -----------------------------------------
+
+/// 8SVX `sCompression` values we support end-to-end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Compression {
+    /// No compression; BODY is raw signed 8-bit PCM.
+    #[default]
+    None,
+    /// Fibonacci-delta compression (`sCompression = 1`). Each channel's
+    /// compressed byte stream begins with a pad byte and an initial
+    /// signed 8-bit sample, followed by 4-bit delta nibbles (high nibble
+    /// first).
+    Fibonacci,
+}
+
+impl Compression {
+    fn to_vhdr_byte(self) -> u8 {
+        match self {
+            Compression::None => 0,
+            Compression::Fibonacci => 1,
+        }
+    }
+
+    fn from_vhdr_byte(b: u8) -> Result<Self> {
+        match b {
+            0 => Ok(Compression::None),
+            1 => Ok(Compression::Fibonacci),
+            other => Err(Error::unsupported(format!(
+                "8SVX: compression {} not implemented (0=none, 1=Fibonacci)",
+                other
+            ))),
+        }
+    }
+}
+
+/// Channel layout accepted by the muxer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Channels {
+    /// Single-channel voice; no `CHAN` chunk needed (LEFT implied).
+    #[default]
+    Mono,
+    /// Two channels stored back-to-back in BODY (LEFT then RIGHT).
+    Stereo,
+}
+
+impl Channels {
+    fn count(self) -> u16 {
+        match self {
+            Channels::Mono => 1,
+            Channels::Stereo => 2,
+        }
+    }
+
+    /// `CHAN` chunk payload: LEFT (2), RIGHT (4), STEREO (LEFT|RIGHT = 6).
+    fn chan_value(self) -> u32 {
+        match self {
+            Channels::Mono => 2,
+            Channels::Stereo => 6,
+        }
+    }
+}
+
+// --- Fibonacci-delta codec -----------------------------------------------
+
+/// Standard Amiga 8SVX Fibonacci-delta table (16 entries). The 4-bit
+/// nibble selector indexes directly into this array. We deliberately use
+/// the 16-entry version from the Amiga ROM Kernel Manual / AmigaOS wiki
+/// rather than the 17-entry variant sometimes cited — a 4-bit code only
+/// covers codes 0..15 so the 17th value (`34`) is unreachable.
+pub const FIB_DELTA_TABLE: [i32; 16] =
+    [-34, -21, -13, -8, -5, -3, -2, -1, 0, 1, 2, 3, 5, 8, 13, 21];
+
+/// Pick the nibble (0..=15) whose delta most closely approaches
+/// `target - prev` and return `(nibble, new_prev)` where `new_prev` is
+/// clamped to [-128, 127] — matching what the decoder will reconstruct.
+fn fib_pick_nibble(prev: i32, target: i32) -> (u8, i32) {
+    let mut best_idx = 0u8;
+    let mut best_err = i64::MAX;
+    let mut best_next = prev;
+    for (i, delta) in FIB_DELTA_TABLE.iter().enumerate() {
+        let next = (prev + delta).clamp(-128, 127);
+        let err = (next as i64 - target as i64).abs();
+        if err < best_err {
+            best_err = err;
+            best_idx = i as u8;
+            best_next = next;
+        }
+    }
+    (best_idx, best_next)
+}
+
+/// Encode one mono channel's worth of `i8` samples to the Fibonacci-delta
+/// byte stream: `[pad=0x00, initial_sample_u8, packed_nibbles..]`. Two
+/// deltas share one byte, high nibble first. If the sample count after
+/// the initial is odd the final low nibble is padded with index 8 (delta
+/// 0) so the result is always a whole number of bytes.
+pub fn fibonacci_encode_channel(samples: &[i8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(0u8); // pad byte
+    if samples.is_empty() {
+        out.push(0u8);
+        return out;
+    }
+    let initial = samples[0];
+    out.push(initial as u8);
+
+    let mut prev = initial as i32;
+    let deltas = &samples[1..];
+    let mut i = 0;
+    while i < deltas.len() {
+        let (hi_idx, next_hi) = fib_pick_nibble(prev, deltas[i] as i32);
+        prev = next_hi;
+        let (lo_idx, next_lo) = if i + 1 < deltas.len() {
+            let (idx, np) = fib_pick_nibble(prev, deltas[i + 1] as i32);
+            (idx, np)
+        } else {
+            // Pad with zero-delta (index 8) so the stream stays whole bytes.
+            (8u8, prev)
+        };
+        prev = next_lo;
+        out.push((hi_idx << 4) | (lo_idx & 0x0F));
+        i += 2;
+    }
+    out
+}
+
+/// Decode one mono channel's Fibonacci-delta byte stream. Returns the
+/// reconstructed `i8` samples, including the stored initial value. The
+/// caller is responsible for knowing how many samples the channel should
+/// produce (typically `VHDR.oneShotHiSamples`); callers can truncate the
+/// output.
+pub fn fibonacci_decode_channel(body: &[u8]) -> Result<Vec<i8>> {
+    if body.len() < 2 {
+        return Err(Error::invalid(
+            "8SVX Fibonacci BODY: need at least pad + initial byte",
+        ));
+    }
+    // body[0] is the pad byte (ignored — typically 0).
+    let initial = body[1] as i8;
+    let mut out = Vec::with_capacity(2 * (body.len() - 2) + 1);
+    out.push(initial);
+    let mut prev = initial as i32;
+    for &byte in &body[2..] {
+        let hi = ((byte >> 4) & 0x0F) as usize;
+        let lo = (byte & 0x0F) as usize;
+        prev = (prev + FIB_DELTA_TABLE[hi]).clamp(-128, 127);
+        out.push(prev as i8);
+        prev = (prev + FIB_DELTA_TABLE[lo]).clamp(-128, 127);
+        out.push(prev as i8);
+    }
+    Ok(out)
+}
+
+/// Decode a whole BODY: takes the compression mode, channel count, and
+/// expected per-channel frame count. Returns interleaved `pcm_s8` bytes
+/// (as produced by the demuxer: L0 R0 L1 R1 …).
+fn decode_body(
+    body: &[u8],
+    compression: Compression,
+    channels: u16,
+    frames_per_channel: usize,
+) -> Result<Vec<u8>> {
+    match compression {
+        Compression::None => {
+            // Raw PCM: mono is already interleaved-by-definition; for
+            // stereo we need to convert concatenated halves (L…L R…R)
+            // into interleaved (L R L R …).
+            if channels <= 1 {
+                return Ok(body.to_vec());
+            }
+            if body.len() < 2 * frames_per_channel {
+                return Err(Error::invalid(
+                    "8SVX stereo BODY shorter than 2 * frames_per_channel",
+                ));
+            }
+            let (left, rest) = body.split_at(frames_per_channel);
+            let right = &rest[..frames_per_channel];
+            let mut out = Vec::with_capacity(2 * frames_per_channel);
+            for i in 0..frames_per_channel {
+                out.push(left[i]);
+                out.push(right[i]);
+            }
+            Ok(out)
+        }
+        Compression::Fibonacci => {
+            if channels <= 1 {
+                let samples = fibonacci_decode_channel(body)?;
+                let take = frames_per_channel.min(samples.len());
+                Ok(samples[..take].iter().map(|&s| s as u8).collect())
+            } else {
+                // Stereo: the two halves are equal length.
+                if body.len() % 2 != 0 {
+                    return Err(Error::invalid(
+                        "8SVX Fibonacci stereo BODY: odd length can't split into equal halves",
+                    ));
+                }
+                let half = body.len() / 2;
+                let left = fibonacci_decode_channel(&body[..half])?;
+                let right = fibonacci_decode_channel(&body[half..])?;
+                let take = frames_per_channel.min(left.len()).min(right.len());
+                let mut out = Vec::with_capacity(2 * take);
+                for i in 0..take {
+                    out.push(left[i] as u8);
+                    out.push(right[i] as u8);
+                }
+                Ok(out)
+            }
+        }
     }
 }
 
@@ -144,20 +371,49 @@ fn open(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
     }
 
     let vhdr = vhdr.ok_or_else(|| Error::invalid("8SVX: missing VHDR chunk"))?;
-    if vhdr.compression != 0 {
-        return Err(Error::unsupported(format!(
-            "8SVX: compression {} (Fibonacci-delta / other) not yet implemented",
-            vhdr.compression
-        )));
-    }
+    let compression = Compression::from_vhdr_byte(vhdr.compression)?;
     if body_size == 0 {
         return Err(Error::invalid("8SVX: missing BODY chunk"));
     }
 
     let sample_rate = vhdr.samples_per_sec as u32;
     let time_base = TimeBase::new(1, sample_rate as i64);
-    let bytes_per_frame = channels as u64;
-    let total_frames = body_size / bytes_per_frame;
+
+    // Work out the total frame count. VHDR.one_shot_hi_samples counts
+    // frames per channel when it's populated; fall back to deriving from
+    // BODY size (only valid for uncompressed).
+    let frames_per_channel: u64 = if vhdr.one_shot_hi_samples > 0 {
+        vhdr.one_shot_hi_samples as u64
+    } else {
+        match compression {
+            Compression::None => body_size / channels as u64,
+            Compression::Fibonacci => {
+                // (body_size / channels - 2) header bytes per channel,
+                // then 2 decoded samples per remaining byte, plus the
+                // stored initial sample.
+                let per_channel = body_size / channels as u64;
+                if per_channel < 2 {
+                    0
+                } else {
+                    1 + 2 * (per_channel - 2)
+                }
+            }
+        }
+    };
+    let total_frames = frames_per_channel * channels as u64;
+
+    // Read the whole BODY into memory and decode once. 8SVX voices are
+    // typically short (seconds, not hours) so this is fine in practice
+    // and keeps the streaming path trivial.
+    input.seek(SeekFrom::Start(body_offset))?;
+    let mut raw_body = vec![0u8; body_size as usize];
+    input.read_exact(&mut raw_body)?;
+    let decoded = decode_body(
+        &raw_body,
+        compression,
+        channels,
+        frames_per_channel as usize,
+    )?;
 
     let mut params = CodecParameters::audio(CodecId::new("pcm_s8"));
     params.media_type = MediaType::Audio;
@@ -169,23 +425,23 @@ fn open(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
     let stream = StreamInfo {
         index: 0,
         time_base,
-        duration: Some(total_frames as i64),
+        duration: Some(frames_per_channel as i64),
         start_time: Some(0),
         params,
     };
 
     let duration_micros: i64 = if sample_rate > 0 {
-        (total_frames as i128 * 1_000_000 / sample_rate as i128) as i64
+        (frames_per_channel as i128 * 1_000_000 / sample_rate as i128) as i64
     } else {
         0
     };
 
-    input.seek(SeekFrom::Start(body_offset))?;
+    let _ = total_frames; // kept for debug symmetry; not otherwise used.
+
     Ok(Box::new(SvxDemuxer {
-        input,
         streams: vec![stream],
-        body_end: body_offset + body_size,
-        cursor: body_offset,
+        decoded,
+        cursor: 0,
         channels,
         frames_emitted: 0,
         metadata,
@@ -201,17 +457,20 @@ fn pad_after<R: Seek + ?Sized>(r: &mut R, c: &ChunkHeader) -> Result<()> {
 }
 
 struct SvxDemuxer {
-    input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
-    body_end: u64,
-    cursor: u64,
+    /// Fully-decoded interleaved `pcm_s8` bytes. For mono this is the raw
+    /// BODY (after Fibonacci decompression if needed); for stereo this
+    /// has been de-concatenated from LEFT-then-RIGHT halves to interleaved
+    /// L R L R … frames.
+    decoded: Vec<u8>,
+    cursor: usize,
     channels: u16,
     frames_emitted: i64,
     metadata: Vec<(String, String)>,
     duration_micros: i64,
 }
 
-const CHUNK_FRAMES: u64 = 4096;
+const CHUNK_FRAMES: usize = 4096;
 
 impl Demuxer for SvxDemuxer {
     fn format_name(&self) -> &str {
@@ -223,20 +482,18 @@ impl Demuxer for SvxDemuxer {
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
-        if self.cursor >= self.body_end {
+        if self.cursor >= self.decoded.len() {
             return Err(Error::Eof);
         }
-        let bytes_per_frame = self.channels as u64;
-        let remaining = self.body_end - self.cursor;
+        let bytes_per_frame = self.channels as usize;
+        let remaining = self.decoded.len() - self.cursor;
         let want_bytes = (CHUNK_FRAMES * bytes_per_frame).min(remaining);
         let want_bytes = (want_bytes / bytes_per_frame) * bytes_per_frame;
         if want_bytes == 0 {
             return Err(Error::Eof);
         }
 
-        self.input.seek(SeekFrom::Start(self.cursor))?;
-        let mut buf = vec![0u8; want_bytes as usize];
-        self.input.read_exact(&mut buf)?;
+        let buf = self.decoded[self.cursor..self.cursor + want_bytes].to_vec();
         self.cursor += want_bytes;
 
         let stream = &self.streams[0];
@@ -287,20 +544,28 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
 /// strings awkward to round-trip, so we stay out of that chunk for now.
 pub struct SvxMuxer {
     output: Box<dyn WriteSeek>,
-    channels: u16,
+    channels: Channels,
+    compression: Compression,
     sample_rate: u32,
     /// Ordered (key, value) pairs. Recognised keys: `title` → `NAME`,
     /// `artist` → `AUTH`, `comment` → `ANNO`, `characters` → `CHRS`.
     metadata: Vec<(String, String)>,
     form_size_offset: u64,
     body_size_offset: u64,
-    body_bytes: u64,
+    /// Interleaved pcm_s8 bytes buffered from `write_packet`. We emit
+    /// the actual BODY at `write_trailer` time, since both stereo
+    /// (concat halves) and Fibonacci (needs full per-channel streams)
+    /// require seeing all samples before writing.
+    pending: Vec<u8>,
     header_written: bool,
     trailer_written: bool,
 }
 
 impl SvxMuxer {
     /// Build a muxer that only writes VHDR + BODY (no string chunks).
+    /// Defaults to uncompressed, mono is inferred from the stream's
+    /// channel count (1 = mono, 2 = stereo). Use [`Self::with_compression`]
+    /// after construction to switch on Fibonacci-delta.
     pub fn new(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Self> {
         Self::with_metadata(output, streams, &[])
     }
@@ -335,16 +600,20 @@ impl SvxMuxer {
                 )));
             }
         }
-        let channels = s
+        let ch_count = s
             .params
             .channels
             .ok_or_else(|| Error::invalid("8SVX muxer: missing channels"))?;
-        if channels != 1 {
-            return Err(Error::unsupported(format!(
-                "8SVX muxer: only mono is supported today (got {} channels)",
-                channels
-            )));
-        }
+        let channels = match ch_count {
+            1 => Channels::Mono,
+            2 => Channels::Stereo,
+            n => {
+                return Err(Error::unsupported(format!(
+                    "8SVX muxer: only mono or stereo is supported (got {} channels)",
+                    n
+                )))
+            }
+        };
         let sample_rate = s
             .params
             .sample_rate
@@ -358,14 +627,32 @@ impl SvxMuxer {
         Ok(Self {
             output,
             channels,
+            compression: Compression::None,
             sample_rate,
             metadata: metadata.to_vec(),
             form_size_offset: 0,
             body_size_offset: 0,
-            body_bytes: 0,
+            pending: Vec::new(),
             header_written: false,
             trailer_written: false,
         })
+    }
+
+    /// Select the compression mode for the BODY. Must be called before
+    /// `write_header`.
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Access the configured channel layout (derived from the stream).
+    pub fn channels(&self) -> Channels {
+        self.channels
+    }
+
+    /// Access the configured compression mode.
+    pub fn compression(&self) -> Compression {
+        self.compression
     }
 }
 
@@ -411,8 +698,17 @@ impl Muxer for SvxMuxer {
         self.output
             .write_all(&(self.sample_rate as u16).to_be_bytes())?;
         self.output.write_all(&[1u8])?; // ctOctave
-        self.output.write_all(&[0u8])?; // sCompression (none)
+        self.output.write_all(&[self.compression.to_vhdr_byte()])?; // sCompression
         self.output.write_all(&0x0001_0000u32.to_be_bytes())?; // volume 1.0
+
+        // CHAN chunk for stereo (LEFT|RIGHT = 6). Mono is the default
+        // when CHAN is absent, so we skip it there.
+        if self.channels == Channels::Stereo {
+            self.output.write_all(b"CHAN")?;
+            self.output.write_all(&4u32.to_be_bytes())?;
+            self.output
+                .write_all(&self.channels.chan_value().to_be_bytes())?;
+        }
 
         // Optional metadata chunks. Preserve caller-supplied order so
         // round-trips are stable. The demuxer strips trailing NULs, so
@@ -451,9 +747,11 @@ impl Muxer for SvxMuxer {
         if self.trailer_written {
             return Err(Error::other("8SVX muxer: write_packet after trailer"));
         }
-        // Payload is raw 8-bit signed PCM — one byte per mono frame.
-        self.output.write_all(&packet.data)?;
-        self.body_bytes += packet.data.len() as u64;
+        // Incoming payload is interleaved pcm_s8 — `channels` bytes per
+        // frame. We buffer and commit to BODY at `write_trailer` time so
+        // we can split stereo into concatenated halves and/or apply
+        // Fibonacci-delta encoding to each channel independently.
+        self.pending.extend_from_slice(&packet.data);
         Ok(())
     }
 
@@ -464,30 +762,68 @@ impl Muxer for SvxMuxer {
         if !self.header_written {
             return Err(Error::other("8SVX muxer: write_header not called"));
         }
+
+        // Build the on-disk BODY bytes from buffered interleaved pcm_s8.
+        let ch_count = self.channels.count();
+        if self.pending.len() % ch_count as usize != 0 {
+            return Err(Error::invalid(
+                "8SVX muxer: packet total not a multiple of channel count",
+            ));
+        }
+        let frames_per_channel = self.pending.len() / ch_count as usize;
+        let body = match (self.channels, self.compression) {
+            (Channels::Mono, Compression::None) => self.pending.clone(),
+            (Channels::Mono, Compression::Fibonacci) => {
+                let samples: Vec<i8> = self.pending.iter().map(|&b| b as i8).collect();
+                fibonacci_encode_channel(&samples)
+            }
+            (Channels::Stereo, Compression::None) => {
+                // De-interleave into concatenated halves (L…L then R…R).
+                let mut out = Vec::with_capacity(self.pending.len());
+                out.extend(self.pending.iter().step_by(2).copied());
+                out.extend(self.pending.iter().skip(1).step_by(2).copied());
+                out
+            }
+            (Channels::Stereo, Compression::Fibonacci) => {
+                let mut left: Vec<i8> = Vec::with_capacity(frames_per_channel);
+                let mut right: Vec<i8> = Vec::with_capacity(frames_per_channel);
+                for frame in self.pending.chunks_exact(2) {
+                    left.push(frame[0] as i8);
+                    right.push(frame[1] as i8);
+                }
+                let mut l_enc = fibonacci_encode_channel(&left);
+                let r_enc = fibonacci_encode_channel(&right);
+                l_enc.extend_from_slice(&r_enc);
+                l_enc
+            }
+        };
+
+        let body_bytes = body.len() as u64;
+        self.output.write_all(&body)?;
+
         // IFF chunks pad to even length; BODY is the last child chunk so
         // its pad byte (if any) also pads the enclosing FORM.
-        let body_pad = self.body_bytes & 1;
-        if body_pad == 1 {
+        if body_bytes & 1 == 1 {
             self.output.write_all(&[0u8])?;
         }
         let end = self.output.stream_position()?;
 
         // Patch BODY chunk size.
-        let body_size_u32: u32 = self
-            .body_bytes
+        let body_size_u32: u32 = body_bytes
             .try_into()
             .map_err(|_| Error::other("8SVX BODY chunk exceeds 4 GiB"))?;
         self.output.seek(SeekFrom::Start(self.body_size_offset))?;
         self.output.write_all(&body_size_u32.to_be_bytes())?;
 
-        // Patch VHDR.oneShotHiSamples with the total frame count
-        // (mono, 1 byte per frame). `form_size_offset` points at the
-        // FORM size field (4 bytes), then comes "8SVX" (4), "VHDR" (4),
-        // VHDR size (4) — so oneShotHiSamples lives at
-        // form_size_offset + 16. Writing this lets a decoder that
-        // inspects VHDR know the full length of the voice even before
-        // reaching BODY.
-        let one_shot = (self.body_bytes / self.channels as u64) as u32;
+        // Patch VHDR.oneShotHiSamples with the per-channel frame count.
+        // `form_size_offset` points at the FORM size field (4 bytes),
+        // then comes "8SVX" (4), "VHDR" (4), VHDR size (4) — so
+        // oneShotHiSamples lives at form_size_offset + 16. Writing this
+        // lets a decoder that inspects VHDR know the full length of the
+        // voice even before reaching BODY (and is especially useful for
+        // Fibonacci-compressed voices, where the sample count isn't
+        // trivially recoverable from BODY size).
+        let one_shot = frames_per_channel as u32;
         self.output
             .seek(SeekFrom::Start(self.form_size_offset + 16))?;
         self.output.write_all(&one_shot.to_be_bytes())?;
@@ -563,5 +899,50 @@ mod tests {
         // End of stream.
         let err = dmx.next_packet().unwrap_err();
         assert!(matches!(err, Error::Eof));
+    }
+
+    /// Fibonacci round-trip on a smooth signal should reconstruct each
+    /// sample within ±2 LSBs — matching the tolerance the Amiga Devices
+    /// Manual cites for Fibonacci-delta.
+    #[test]
+    fn fibonacci_roundtrip_smooth_sine() {
+        // Pure sine at ~120 Hz / 8 kHz, amplitude 100. Step ≈ 9.4 per
+        // sample at the zero-crossing, which fits the table comfortably.
+        let samples: Vec<i8> = (0..512)
+            .map(|i| {
+                let v = (100.0 * (i as f64 * std::f64::consts::TAU * 120.0 / 8000.0).sin()).round();
+                v as i8
+            })
+            .collect();
+        let encoded = fibonacci_encode_channel(&samples);
+        let decoded = fibonacci_decode_channel(&encoded).unwrap();
+        assert!(decoded.len() >= samples.len());
+        for (i, (&orig, &dec)) in samples.iter().zip(decoded.iter()).enumerate() {
+            let err = (orig as i32 - dec as i32).abs();
+            assert!(err <= 2, "sample {i}: orig={orig} dec={dec} err={err}");
+        }
+    }
+
+    /// The initial sample is stored verbatim in byte 1 of the
+    /// Fibonacci-encoded stream.
+    #[test]
+    fn fibonacci_preserves_initial_sample() {
+        let samples: Vec<i8> = vec![42, 40, 38, 36];
+        let encoded = fibonacci_encode_channel(&samples);
+        assert_eq!(encoded[0], 0, "pad byte");
+        assert_eq!(encoded[1] as i8, 42, "initial sample");
+        let decoded = fibonacci_decode_channel(&encoded).unwrap();
+        assert_eq!(decoded[0], 42);
+    }
+
+    /// A single zero-delta nibble (index 8) must keep the sample flat.
+    #[test]
+    fn fibonacci_flat_signal() {
+        let samples: Vec<i8> = vec![5; 32];
+        let encoded = fibonacci_encode_channel(&samples);
+        let decoded = fibonacci_decode_channel(&encoded).unwrap();
+        for (i, &v) in decoded.iter().take(samples.len()).enumerate() {
+            assert_eq!(v, 5, "sample {i}");
+        }
     }
 }
