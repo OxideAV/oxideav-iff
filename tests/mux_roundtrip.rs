@@ -86,7 +86,9 @@ fn mux_roundtrip_200ms_sawtooth() {
 
     // Demux and compare the BODY bytes.
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes.clone()));
-    let mut dmx = reg.open_demuxer("iff_8svx", rs).unwrap();
+    let mut dmx = reg
+        .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
+        .unwrap();
     assert_eq!(dmx.format_name(), "iff_8svx");
     let s = &dmx.streams()[0];
     assert_eq!(s.params.codec_id, CodecId::new("pcm_s8"));
@@ -156,7 +158,9 @@ fn mux_roundtrip_with_name_chunk() {
 
     let reg = registry();
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut dmx = reg.open_demuxer("iff_8svx", rs).unwrap();
+    let mut dmx = reg
+        .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
+        .unwrap();
     let md = dmx.metadata();
     assert!(
         md.iter().any(|(k, v)| k == "title" && v == "test"),
@@ -202,7 +206,9 @@ fn mux_roundtrip_odd_length_adds_pad_byte() {
 
     let reg = registry();
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut dmx = reg.open_demuxer("iff_8svx", rs).unwrap();
+    let mut dmx = reg
+        .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
+        .unwrap();
     let mut got = Vec::<u8>::new();
     loop {
         match dmx.next_packet() {
@@ -299,7 +305,9 @@ fn mux_roundtrip_stereo_pcm_bit_exact() {
 
     // Demux and compare interleaved bytes exactly.
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut dmx = reg.open_demuxer("iff_8svx", rs).unwrap();
+    let mut dmx = reg
+        .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
+        .unwrap();
     let s = &dmx.streams()[0];
     assert_eq!(s.params.channels, Some(2));
     assert_eq!(s.duration, Some(frames as i64));
@@ -343,7 +351,9 @@ fn mux_roundtrip_mono_fibonacci_within_2_lsb() {
 
     let reg = registry();
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut dmx = reg.open_demuxer("iff_8svx", rs).unwrap();
+    let mut dmx = reg
+        .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
+        .unwrap();
     let s = &dmx.streams()[0];
     assert_eq!(s.params.channels, Some(1));
 
@@ -406,7 +416,9 @@ fn mux_roundtrip_stereo_fibonacci_within_2_lsb() {
 
     let reg = registry();
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut dmx = reg.open_demuxer("iff_8svx", rs).unwrap();
+    let mut dmx = reg
+        .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
+        .unwrap();
     let s = &dmx.streams()[0];
     assert_eq!(s.params.channels, Some(2));
     assert_eq!(s.duration, Some(frames as i64));
@@ -478,7 +490,9 @@ fn mux_roundtrip_all_string_chunks() {
 
     let reg = registry();
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut dmx = reg.open_demuxer("iff_8svx", rs).unwrap();
+    let mut dmx = reg
+        .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
+        .unwrap();
     let md: std::collections::HashMap<_, _> = dmx.metadata().iter().cloned().collect();
     assert_eq!(md.get("title").map(String::as_str), Some("voice-01"));
     assert_eq!(md.get("artist").map(String::as_str), Some("anon"));

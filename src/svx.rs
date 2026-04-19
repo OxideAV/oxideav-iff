@@ -33,7 +33,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use oxideav_container::{ContainerRegistry, Demuxer, Muxer, ReadSeek, WriteSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, Error, MediaType, Packet, Result, SampleFormat, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat,
+    StreamInfo, TimeBase,
 };
 
 use crate::chunk::{
@@ -299,7 +300,7 @@ fn parse_vhdr(body: &[u8]) -> Result<Vhdr> {
 
 // --- Demuxer --------------------------------------------------------------
 
-fn open(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     // Outer FORM.
     let hdr = read_chunk_header(&mut *input)?.ok_or_else(|| Error::invalid("8SVX: empty file"))?;
     if hdr.id != GROUP_FORM {
@@ -886,7 +887,7 @@ mod tests {
     fn demux_minimal_8svx() {
         let bytes = make_fixture();
         let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-        let mut dmx = open(rs).unwrap();
+        let mut dmx = open(rs, &oxideav_core::NullCodecResolver).unwrap();
         assert_eq!(dmx.format_name(), "iff_8svx");
         let s = &dmx.streams()[0];
         assert_eq!(s.params.codec_id.as_str(), "pcm_s8");
