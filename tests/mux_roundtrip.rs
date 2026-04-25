@@ -5,10 +5,10 @@
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use oxideav_container::{ContainerRegistry, Muxer, ReadSeek, WriteSeek};
 use oxideav_core::{
     CodecId, CodecParameters, Error, MediaType, Packet, SampleFormat, StreamInfo, TimeBase,
 };
+use oxideav_core::{ContainerRegistry, Muxer, ReadSeek, WriteSeek};
 
 use oxideav_iff::svx::{Compression, SvxMuxer};
 

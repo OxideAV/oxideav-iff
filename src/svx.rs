@@ -31,11 +31,11 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use oxideav_container::{ContainerRegistry, Demuxer, Muxer, ReadSeek, WriteSeek};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat,
     StreamInfo, TimeBase,
 };
+use oxideav_core::{ContainerRegistry, Demuxer, Muxer, ReadSeek, WriteSeek};
 
 use crate::chunk::{
     read_body, read_chunk_header, read_form_type, skip_chunk_body, ChunkHeader, GROUP_FORM,
@@ -50,7 +50,7 @@ pub fn register(reg: &mut ContainerRegistry) {
 }
 
 /// `FORM....8SVX` — IFF group chunk with the 8SVX form type.
-fn probe(p: &oxideav_container::ProbeData) -> u8 {
+fn probe(p: &oxideav_core::ProbeData) -> u8 {
     if p.buf.len() >= 12 && &p.buf[0..4] == b"FORM" && &p.buf[8..12] == b"8SVX" {
         100
     } else {

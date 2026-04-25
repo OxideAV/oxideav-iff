@@ -15,7 +15,7 @@
 pub mod chunk;
 pub mod svx;
 
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 
 /// Register all IFF-family demuxers with the container registry.
 pub fn register(reg: &mut ContainerRegistry) {
