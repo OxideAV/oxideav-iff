@@ -36,9 +36,16 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 /// crate exposes. The nested `svx::register` / `ilbm::register` helpers
 /// remain `&mut ContainerRegistry`-shaped because they are internal
 /// per-form installers and not part of the framework-facing surface.
+///
+/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
+/// [`oxideav_core::register!`] macro below so consumers calling
+/// [`oxideav_core::RuntimeContext::with_all_features`] pick the IFF
+/// family up without any explicit umbrella plumbing.
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     register_containers(&mut ctx.containers);
 }
+
+oxideav_core::register!("iff", register);
 
 #[cfg(test)]
 mod tests {
