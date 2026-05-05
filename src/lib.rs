@@ -14,6 +14,7 @@
 //! decompression. The same chunk reader and `Form` walker are
 //! reusable for future AIFF / SMUS support without restructuring.
 
+pub mod anim;
 pub mod chunk;
 pub mod ilbm;
 pub mod svx;
@@ -24,6 +25,7 @@ use oxideav_core::ContainerRegistry;
 pub fn register_containers(reg: &mut ContainerRegistry) {
     svx::register(reg);
     ilbm::register(reg);
+    anim::register(reg);
 }
 
 /// Install every IFF-family container into a

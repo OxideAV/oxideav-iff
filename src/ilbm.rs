@@ -40,6 +40,12 @@
 //! and Jerry Morrison's **ILBM IFF Interleaved Bitmap** form spec
 //! (1986). No third-party loader code was consulted.
 
+// Bitplane / mask / scanline loops use the index to address parallel
+// row-vec arrays (n bitplanes + optional mask plane × `row_bytes`).
+// Iterators would require zip()s plus per-step state; the explicit
+// index form keeps the spec correspondence obvious.
+#![allow(clippy::needless_range_loop)]
+
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use oxideav_core::{
@@ -59,8 +65,11 @@ pub fn register(reg: &mut ContainerRegistry) {
 }
 
 fn probe(p: &oxideav_core::ProbeData) -> u8 {
-    if p.buf.len() >= 12 && &p.buf[0..4] == b"FORM" && &p.buf[8..12] == b"ILBM" {
-        100
+    if p.buf.len() >= 12 && &p.buf[0..4] == b"FORM" {
+        match &p.buf[8..12] {
+            b"ILBM" | b"PBM " => 100,
+            _ => 0,
+        }
     } else {
         0
     }
@@ -245,6 +254,271 @@ impl Camg {
     }
     pub fn to_be_bytes(self) -> [u8; 4] {
         self.raw.to_be_bytes()
+    }
+}
+
+// ───────────────────── GRAB ─────────────────────
+
+/// `GRAB` chunk — mouse-pointer hotspot for sprite use. Two big-endian
+/// signed 16-bit coordinates relative to the image's top-left.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Grab {
+    pub x: i16,
+    pub y: i16,
+}
+
+impl Grab {
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 4 {
+            return Err(Error::invalid(format!(
+                "ILBM GRAB: need 4 bytes, got {}",
+                body.len()
+            )));
+        }
+        Ok(Self {
+            x: i16::from_be_bytes([body[0], body[1]]),
+            y: i16::from_be_bytes([body[2], body[3]]),
+        })
+    }
+    pub fn write(&self) -> [u8; 4] {
+        let mut out = [0u8; 4];
+        out[0..2].copy_from_slice(&self.x.to_be_bytes());
+        out[2..4].copy_from_slice(&self.y.to_be_bytes());
+        out
+    }
+}
+
+// ───────────────────── SHAM (Sliced HAM) ─────────────────────
+
+/// `SHAM` — Sliced-HAM extension. After a 16-bit version word the
+/// chunk carries one 16-entry palette per scanline; each entry is a
+/// big-endian Amiga-style 12-bit colour packed as `0x0RGB` in a `u16`
+/// (low nibble of each byte ignored / treated as zero on read). The
+/// SHAM palette overrides `CMAP` per row when decoding HAM6.
+///
+/// On-disk layout (for `version == 0`):
+/// `[u16 version][height × 16 × u16 RGB444]` — `2 + height*32` bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Sham {
+    pub version: u16,
+    /// One 16-entry palette per scanline; each entry is RGB at 8-bit.
+    pub palettes: Vec<Vec<[u8; 3]>>,
+}
+
+impl Sham {
+    /// Parse a SHAM chunk. `expected_height` lets the parser tolerate
+    /// chunks slightly shorter than `2 + height*32` (some encoders only
+    /// store palettes up to the last *changed* row); missing rows are
+    /// padded by repeating the previous palette.
+    pub fn parse(body: &[u8], expected_height: u32) -> Result<Self> {
+        if body.len() < 2 {
+            return Err(Error::invalid(format!(
+                "ILBM SHAM: need at least 2 bytes, got {}",
+                body.len()
+            )));
+        }
+        let version = u16::from_be_bytes([body[0], body[1]]);
+        let mut palettes = Vec::with_capacity(expected_height as usize);
+        let stride = 32usize;
+        let mut off = 2usize;
+        let mut last: Vec<[u8; 3]> = vec![[0, 0, 0]; 16];
+        for _ in 0..expected_height {
+            if off + stride <= body.len() {
+                let mut pal = Vec::with_capacity(16);
+                for i in 0..16 {
+                    let hi = body[off + i * 2];
+                    let lo = body[off + i * 2 + 1];
+                    // RGB444 (Amiga): 0x0RGB → expand 4-bit → 8-bit
+                    // by replicating each nibble (`n*0x11`).
+                    let r4 = hi & 0x0F;
+                    let g4 = (lo >> 4) & 0x0F;
+                    let b4 = lo & 0x0F;
+                    pal.push([r4 * 0x11, g4 * 0x11, b4 * 0x11]);
+                }
+                last = pal.clone();
+                palettes.push(pal);
+                off += stride;
+            } else {
+                palettes.push(last.clone());
+            }
+        }
+        Ok(Self { version, palettes })
+    }
+
+    /// Serialise for round-trip: `[u16 version][n × 16 × u16 RGB444]`.
+    pub fn write(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + self.palettes.len() * 32);
+        out.extend_from_slice(&self.version.to_be_bytes());
+        for pal in &self.palettes {
+            for i in 0..16 {
+                let entry = pal.get(i).copied().unwrap_or([0, 0, 0]);
+                let r4 = entry[0] >> 4;
+                let g4 = entry[1] >> 4;
+                let b4 = entry[2] >> 4;
+                out.push(r4 & 0x0F);
+                out.push(((g4 & 0x0F) << 4) | (b4 & 0x0F));
+            }
+        }
+        out
+    }
+}
+
+// ───────────────────── PCHG (Palette CHanGe) ─────────────────────
+
+/// One palette entry change at a given index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PchgChange {
+    /// Palette index whose RGB to overwrite (0..=255).
+    pub index: u16,
+    pub rgb: [u8; 3],
+}
+
+/// All changes to apply at the start of a given scanline.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PchgLine {
+    pub line: u32,
+    pub changes: Vec<PchgChange>,
+}
+
+/// `PCHG` — Palette CHanGe list (Sebastiano Vigna). Per-scanline CMAP
+/// overrides; supports two formats encoded in a 12-bit "small/big"
+/// flag:
+///
+/// * **SmallLineChanges** (flag bit `1`) — 12-bit channel palette,
+///   1 byte index + 2 bytes RGB444 per change.
+/// * **BigLineChanges** (flag bit `2`) — 24-bit channel palette,
+///   2 bytes index + 3 bytes RGB888 per change.
+///
+/// We parse both and surface the cumulative-state palette per line as
+/// 8-bit RGB in [`Pchg::lines`]. The original wire bytes are kept in
+/// [`Pchg::raw`] for byte-exact round-trip.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pchg {
+    pub raw: Vec<u8>,
+    /// Per-affected-line list of palette overrides (in line order).
+    pub lines: Vec<PchgLine>,
+}
+
+impl Pchg {
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        // Header layout per the PCHG IFF Annex (Sebastiano Vigna 1994):
+        // u16 Compression; u16 Flags; i16 StartLine; u16 LineCount;
+        // u16 ChangedLines; u16 MinReg; u16 MaxReg; u16 MaxChanges;
+        // u32 TotalChanges;
+        if body.len() < 20 {
+            return Err(Error::invalid(format!(
+                "ILBM PCHG: header needs 20 bytes, got {}",
+                body.len()
+            )));
+        }
+        let _comp = u16::from_be_bytes([body[0], body[1]]);
+        let flags = u16::from_be_bytes([body[2], body[3]]);
+        let start_line = i16::from_be_bytes([body[4], body[5]]);
+        let line_count = u16::from_be_bytes([body[6], body[7]]) as usize;
+        let _changed_lines = u16::from_be_bytes([body[8], body[9]]);
+        let _min_reg = u16::from_be_bytes([body[10], body[11]]);
+        let _max_reg = u16::from_be_bytes([body[12], body[13]]);
+        let _max_changes = u16::from_be_bytes([body[14], body[15]]);
+        let total_changes = u32::from_be_bytes([body[16], body[17], body[18], body[19]]) as usize;
+
+        let big = flags & 2 != 0;
+        let small = flags & 1 != 0;
+        if big && small {
+            return Err(Error::invalid(
+                "ILBM PCHG: both Small and Big flag bits set",
+            ));
+        }
+
+        // Compression byte 0 = uncompressed; we don't yet support
+        // compressed (Compression == 1, Huffman). The spec calls for
+        // a separate sub-chunk header with tree data we don't
+        // implement on round 1. Surface the raw bytes regardless so
+        // round-trip preserves the chunk verbatim.
+        let mut out_lines: Vec<PchgLine> = Vec::new();
+
+        // Small / default format: ChangeStructure begins after the
+        // 20-byte header. For each line in [start_line, start_line +
+        // line_count) we read a u8 ChangeCount, then ChangeCount
+        // entries of (u8 RegisterIndex, u16 RGB444 BE).
+        // Big format: u16 ChangeCount, then (u16 RegisterIndex, 3
+        // bytes RGB888).
+        // Lines with ChangeCount == 0 are emitted nowhere in our
+        // out_lines list.
+        let mut cur = 20usize;
+        let mut total_seen = 0usize;
+        if !big {
+            for li in 0..line_count {
+                if cur >= body.len() {
+                    break;
+                }
+                let cc = body[cur] as usize;
+                cur += 1;
+                if cc > 0 {
+                    let mut entries = Vec::with_capacity(cc);
+                    for _ in 0..cc {
+                        if cur + 3 > body.len() {
+                            break;
+                        }
+                        let reg = body[cur] as u16;
+                        let hi = body[cur + 1];
+                        let lo = body[cur + 2];
+                        cur += 3;
+                        let r4 = hi & 0x0F;
+                        let g4 = (lo >> 4) & 0x0F;
+                        let b4 = lo & 0x0F;
+                        entries.push(PchgChange {
+                            index: reg,
+                            rgb: [r4 * 0x11, g4 * 0x11, b4 * 0x11],
+                        });
+                        total_seen += 1;
+                    }
+                    let line = (start_line as i32 + li as i32).max(0) as u32;
+                    out_lines.push(PchgLine {
+                        line,
+                        changes: entries,
+                    });
+                }
+            }
+        } else {
+            for li in 0..line_count {
+                if cur + 2 > body.len() {
+                    break;
+                }
+                let cc = u16::from_be_bytes([body[cur], body[cur + 1]]) as usize;
+                cur += 2;
+                if cc > 0 {
+                    let mut entries = Vec::with_capacity(cc);
+                    for _ in 0..cc {
+                        if cur + 5 > body.len() {
+                            break;
+                        }
+                        let reg = u16::from_be_bytes([body[cur], body[cur + 1]]);
+                        let r = body[cur + 2];
+                        let g = body[cur + 3];
+                        let b = body[cur + 4];
+                        cur += 5;
+                        entries.push(PchgChange {
+                            index: reg,
+                            rgb: [r, g, b],
+                        });
+                        total_seen += 1;
+                    }
+                    let line = (start_line as i32 + li as i32).max(0) as u32;
+                    out_lines.push(PchgLine {
+                        line,
+                        changes: entries,
+                    });
+                }
+            }
+        }
+        // Tolerant: total_changes mismatch is just a header hint.
+        let _ = total_changes;
+        let _ = total_seen;
+
+        Ok(Self {
+            raw: body.to_vec(),
+            lines: out_lines,
+        })
     }
 }
 
@@ -489,8 +763,50 @@ pub struct IlbmImage {
     pub palette: Vec<[u8; 3]>,
     /// CAMG flags (0 if absent in the source).
     pub camg: Camg,
+    /// Outer FORM type: `b"ILBM"` (planar) or `b"PBM "` (chunky 8-bit
+    /// per pixel — DPaint II / Brilliance variant).
+    pub form_type: [u8; 4],
+    /// Optional `GRAB` hotspot (mouse-pointer anchor for sprites).
+    pub grab: Option<Grab>,
+    /// Optional `SHAM` Sliced-HAM payload (one 16-entry RGB444 palette
+    /// per scanline). Only meaningful when `camg.is_ham()` and
+    /// `bmhd.n_planes == 6`.
+    pub sham: Option<Sham>,
+    /// Optional `PCHG` palette-change list (per-line CMAP overrides).
+    pub pchg: Option<Pchg>,
     /// Packed RGBA bytes, row-major, top-to-bottom, 4 bytes/pixel.
     pub rgba: Vec<u8>,
+}
+
+impl Default for IlbmImage {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            bmhd: Bmhd {
+                width: 0,
+                height: 0,
+                x_origin: 0,
+                y_origin: 0,
+                n_planes: 0,
+                masking: Masking::None,
+                compression: Compression::None,
+                pad: 0,
+                transparent_color: 0,
+                x_aspect: 1,
+                y_aspect: 1,
+                page_width: 0,
+                page_height: 0,
+            },
+            palette: Vec::new(),
+            camg: Camg::default(),
+            form_type: *b"ILBM",
+            grab: None,
+            sham: None,
+            pchg: None,
+            rgba: Vec::new(),
+        }
+    }
 }
 
 // ───────────────────── parse_ilbm ─────────────────────
@@ -508,8 +824,14 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
     if &bytes[0..4] != b"FORM" {
         return Err(Error::invalid("ILBM: missing FORM signature"));
     }
-    if &bytes[8..12] != b"ILBM" {
-        return Err(Error::invalid("ILBM: outer form type is not ILBM"));
+    let form_type = [bytes[8], bytes[9], bytes[10], bytes[11]];
+    let is_ilbm = &form_type == b"ILBM";
+    let is_pbm = &form_type == b"PBM ";
+    if !is_ilbm && !is_pbm {
+        return Err(Error::invalid(format!(
+            "ILBM: outer form type is {:?} (expected ILBM or PBM)",
+            std::str::from_utf8(&form_type).unwrap_or("????")
+        )));
     }
     let total = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
     let body_end = (8 + total).min(bytes.len());
@@ -518,6 +840,9 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
     let mut palette: Vec<[u8; 3]> = Vec::new();
     let mut camg = Camg::default();
     let mut body_data: Option<Vec<u8>> = None;
+    let mut grab: Option<Grab> = None;
+    let mut sham_raw: Option<Vec<u8>> = None;
+    let mut pchg: Option<Pchg> = None;
 
     let mut cursor = 12usize;
     while cursor + 8 <= body_end {
@@ -554,7 +879,10 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
             }
             b"CAMG" => camg = Camg::parse(payload)?,
             b"BODY" => body_data = Some(payload.to_vec()),
-            _ => { /* skip unknown chunks (CRNG, DPI, GRAB, ...) */ }
+            b"GRAB" => grab = Some(Grab::parse(payload)?),
+            b"SHAM" => sham_raw = Some(payload.to_vec()),
+            b"PCHG" => pchg = Some(Pchg::parse(payload)?),
+            _ => { /* skip unknown chunks (CRNG, DPI, ...) */ }
         }
         let padded = size + (size & 1);
         cursor = payload_start + padded;
@@ -562,7 +890,87 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
 
     let bmhd = bmhd.ok_or_else(|| Error::invalid("ILBM: missing BMHD chunk"))?;
     let body = body_data.ok_or_else(|| Error::invalid("ILBM: missing BODY chunk"))?;
+    let sham = sham_raw
+        .as_deref()
+        .map(|raw| Sham::parse(raw, bmhd.height as u32))
+        .transpose()?;
 
+    let width = bmhd.width as u32;
+    let height = bmhd.height as u32;
+    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+
+    if is_pbm {
+        // Chunky variant: BODY is `width` (rounded up to even) bytes
+        // per row, each byte = a palette index. No bitplanes, no
+        // mask plane, no HAM. Compression follows BMHD.compression.
+        if camg.is_ham() {
+            return Err(Error::unsupported(
+                "PBM: HAM viewport on chunky form is not supported",
+            ));
+        }
+        let stride = (bmhd.width as usize + 1) & !1;
+        let mut indices_all: Vec<u8> = Vec::with_capacity(stride * bmhd.height as usize);
+        match bmhd.compression {
+            Compression::None => {
+                let needed = stride * bmhd.height as usize;
+                if body.len() < needed {
+                    return Err(Error::invalid(format!(
+                        "PBM uncompressed BODY: need {needed} bytes, got {}",
+                        body.len()
+                    )));
+                }
+                indices_all.extend_from_slice(&body[..needed]);
+            }
+            Compression::ByteRun1 => {
+                let mut input = &body[..];
+                for _ in 0..bmhd.height {
+                    let consumed = byterun1_decode_row(input, stride, &mut indices_all)?;
+                    input = &input[consumed..];
+                }
+            }
+        }
+        let effective_palette: Vec<[u8; 3]> = if camg.is_ehb() && palette.len() <= 32 {
+            expand_ehb_palette(&palette)
+        } else {
+            palette.clone()
+        };
+        for y in 0..bmhd.height as usize {
+            for x in 0..bmhd.width as usize {
+                let idx = indices_all[y * stride + x] as usize;
+                let dst = (y * bmhd.width as usize + x) * 4;
+                let p = if idx < effective_palette.len() {
+                    effective_palette[idx]
+                } else {
+                    [0, 0, 0]
+                };
+                rgba[dst] = p[0];
+                rgba[dst + 1] = p[1];
+                rgba[dst + 2] = p[2];
+                let alpha = if bmhd.masking == Masking::HasTransparentColor
+                    && (idx as u16) == bmhd.transparent_color
+                {
+                    0
+                } else {
+                    0xFF
+                };
+                rgba[dst + 3] = alpha;
+            }
+        }
+        return Ok(IlbmImage {
+            width,
+            height,
+            bmhd,
+            palette,
+            camg,
+            form_type,
+            grab,
+            sham,
+            pchg,
+            rgba,
+        });
+    }
+
+    // Planar ILBM path (existing behaviour).
     let n_planes = bmhd.n_planes as usize;
     if n_planes == 0 || n_planes > 8 {
         return Err(Error::unsupported(format!(
@@ -603,17 +1011,44 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
         }
     }
 
-    // Decide effective palette (EHB-expanded if requested).
-    let effective_palette: Vec<[u8; 3]> = if camg.is_ehb() && palette.len() <= 32 {
+    // Decide effective default palette (EHB-expanded if requested).
+    let default_palette: Vec<[u8; 3]> = if camg.is_ehb() && palette.len() <= 32 {
         expand_ehb_palette(&palette)
     } else {
         palette.clone()
     };
 
-    // Build packed RGBA output row-by-row.
-    let width = bmhd.width as u32;
-    let height = bmhd.height as u32;
-    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+    // PCHG: build per-line palette overlays. Start from `default_palette`
+    // and apply changes cumulatively in line order.
+    let line_palettes: Option<Vec<Vec<[u8; 3]>>> = if let Some(pchg) = &pchg {
+        let mut cur_pal = default_palette.clone();
+        if cur_pal.len() < 256 {
+            cur_pal.resize(256, [0, 0, 0]);
+        }
+        let mut iter = pchg.lines.iter().peekable();
+        let mut out: Vec<Vec<[u8; 3]>> = Vec::with_capacity(bmhd.height as usize);
+        for y in 0..bmhd.height as u32 {
+            while let Some(line) = iter.peek() {
+                if line.line == y {
+                    for ch in &line.changes {
+                        let i = ch.index as usize;
+                        if i < cur_pal.len() {
+                            cur_pal[i] = ch.rgb;
+                        }
+                    }
+                    iter.next();
+                } else if line.line < y {
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
+            out.push(cur_pal.clone());
+        }
+        Some(out)
+    } else {
+        None
+    };
 
     for y in 0..bmhd.height as usize {
         let row_base = y * planes_per_row;
@@ -623,6 +1058,16 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
         let indices = planar_row_to_indices(&plane_refs, bmhd.width);
 
         // Resolve to RGB.
+        let row_palette: &[[u8; 3]] = if let Some(sham) = &sham {
+            sham.palettes
+                .get(y)
+                .map(|p| p.as_slice())
+                .unwrap_or(&default_palette)
+        } else if let Some(lp) = &line_palettes {
+            lp[y].as_slice()
+        } else {
+            &default_palette
+        };
         let rgb_row: Vec<[u8; 3]> = if camg.is_ham() {
             let bits = match n_planes {
                 6 => 4u8, // HAM6
@@ -633,14 +1078,14 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
                     )))
                 }
             };
-            expand_ham_row(&indices, &effective_palette, bits)
+            expand_ham_row(&indices, row_palette, bits)
         } else {
             indices
                 .iter()
                 .map(|&i| {
                     let i = i as usize;
-                    if i < effective_palette.len() {
-                        effective_palette[i]
+                    if i < row_palette.len() {
+                        row_palette[i]
                     } else {
                         [0, 0, 0]
                     }
@@ -687,103 +1132,67 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
         bmhd,
         palette,
         camg,
+        form_type,
+        grab,
+        sham,
+        pchg,
         rgba,
     })
 }
 
 // ───────────────────── encode_ilbm ─────────────────────
 
-/// Encode an [`IlbmImage`] back into a FORM/ILBM byte stream.
-/// Round 1 emits an indexed-colour file when `palette` is non-empty
-/// (using as many bitplanes as the palette requires) and a 24-bit
-/// "deep ILBM" when the palette is empty (`n_planes = 24`, three
-/// bytes per pixel split across 24 bitplanes). HAM / EHB encoding is
-/// not implemented — those writes use the indexed path with the
-/// matching CAMG flag preserved on round-trip but with a literal
-/// palette lookup.
+/// Encode an [`IlbmImage`] back into a FORM/ILBM (or FORM/PBM ) byte
+/// stream.
 ///
-/// Compression follows `image.bmhd.compression`. Any unknown CAMG
-/// flag bits are passed through verbatim.
+/// Output form selection:
+/// * `image.form_type == b"PBM "` → chunky 8-bit-per-pixel BODY
+///   (DPaint II / Brilliance). Requires `bmhd.n_planes == 8` and a
+///   non-empty palette.
+/// * everything else → planar `FORM/ILBM`. Three sub-paths:
+///   * `camg.is_ham()` with `n_planes == 6` (HAM6) or `n_planes == 8`
+///     (HAM8) — runs the per-row HAM state-machine encoder.
+///   * `camg.is_ehb()` — quantises against a 64-entry EHB-expanded
+///     palette and writes 6 bitplanes regardless of the input
+///     palette length.
+///   * otherwise — straight indexed encode (1..=8 bitplanes).
+///
+/// Optional sub-chunks `GRAB`, `SHAM`, `PCHG` are emitted when present
+/// on `image`. Compression follows `image.bmhd.compression`.
 pub fn encode_ilbm(image: &IlbmImage) -> Result<Vec<u8>> {
     let bmhd = image.bmhd;
     if bmhd.width == 0 || bmhd.height == 0 {
         return Err(Error::invalid("ILBM encode: zero-dimension image"));
     }
-    let n_planes = bmhd.n_planes as usize;
-    if n_planes == 0 || n_planes > 8 {
-        return Err(Error::unsupported(format!(
-            "ILBM encode: round 1 supports 1..=8 bitplanes (got {n_planes})"
-        )));
-    }
-    let row_bytes = bmhd.row_bytes();
-    let has_mask_plane = bmhd.masking == Masking::HasMask;
-    let planes_per_row = n_planes + if has_mask_plane { 1 } else { 0 };
-
-    // Convert RGBA to per-row plane data. For an indexed image the
-    // caller is responsible for having already quantised pixels to
-    // palette indices encoded in the R channel — that mirrors the
-    // round-trip the decoder produces when re-feeding parse_ilbm
-    // output through `IlbmImage::from_indexed`.
     if image.palette.is_empty() {
         return Err(Error::unsupported(
-            "ILBM encode: round 1 requires an indexed palette (no true-colour writer yet)",
+            "ILBM encode: requires an indexed palette",
         ));
     }
-
-    // Planar BODY (uncompressed first; ByteRun1 wraps it).
-    let mut planar_rows: Vec<Vec<u8>> = Vec::with_capacity(bmhd.height as usize * planes_per_row);
-    for y in 0..bmhd.height as usize {
-        let mut indices = vec![0u8; bmhd.width as usize];
-        let mut mask = vec![0u8; row_bytes];
-        for (x, idx_slot) in indices.iter_mut().enumerate() {
-            let src = (y * bmhd.width as usize + x) * 4;
-            let r = image.rgba[src];
-            let g = image.rgba[src + 1];
-            let b = image.rgba[src + 2];
-            let a = image.rgba[src + 3];
-            // Find nearest palette index by squared distance.
-            let mut best = 0usize;
-            let mut best_d = i32::MAX;
-            for (i, p) in image.palette.iter().enumerate() {
-                let dr = r as i32 - p[0] as i32;
-                let dg = g as i32 - p[1] as i32;
-                let db = b as i32 - p[2] as i32;
-                let d = dr * dr + dg * dg + db * db;
-                if d < best_d {
-                    best_d = d;
-                    best = i;
-                }
-            }
-            *idx_slot = best as u8;
-            if a >= 0x80 {
-                let bi = x / 8;
-                let bit = 7 - (x % 8);
-                mask[bi] |= 1 << bit;
-            }
-        }
-        let plane_rows = indices_to_planar_row(&indices, bmhd.n_planes, row_bytes);
-        for pr in plane_rows {
-            planar_rows.push(pr);
-        }
-        if has_mask_plane {
-            planar_rows.push(mask);
-        }
+    let is_pbm = &image.form_type == b"PBM ";
+    if is_pbm && bmhd.n_planes != 8 {
+        return Err(Error::invalid(format!(
+            "PBM encode: requires n_planes=8 (got {})",
+            bmhd.n_planes
+        )));
     }
 
-    // Encode BODY (with ByteRun1 if requested).
-    let body_bytes: Vec<u8> = match bmhd.compression {
-        Compression::None => planar_rows.into_iter().flatten().collect(),
-        Compression::ByteRun1 => planar_rows
-            .iter()
-            .flat_map(|row| byterun1_encode_row(row))
-            .collect(),
+    // Build BODY bytes per branch.
+    let body_bytes: Vec<u8> = if is_pbm {
+        encode_pbm_body(image)?
+    } else if image.camg.is_ham() {
+        encode_ham_body(image)?
+    } else if image.camg.is_ehb() {
+        encode_ehb_body(image)?
+    } else {
+        encode_indexed_body(image)?
     };
 
-    // Assemble FORM/ILBM with BMHD, CMAP, optional CAMG, BODY.
+    // Assemble FORM/ILBM (or FORM/PBM ).
     let mut out = Vec::new();
     out.extend_from_slice(b"FORM");
     out.extend_from_slice(&0u32.to_be_bytes()); // size patched below
-    out.extend_from_slice(b"ILBM");
+    out.extend_from_slice(&image.form_type);
 
     // BMHD
     out.extend_from_slice(b"BMHD");
@@ -808,6 +1217,36 @@ pub fn encode_ilbm(image: &IlbmImage) -> Result<Vec<u8>> {
         out.extend_from_slice(&image.camg.to_be_bytes());
     }
 
+    // GRAB
+    if let Some(g) = image.grab {
+        out.extend_from_slice(b"GRAB");
+        out.extend_from_slice(&4u32.to_be_bytes());
+        out.extend_from_slice(&g.write());
+    }
+
+    // SHAM (Sliced HAM per-line palette table)
+    if let Some(s) = &image.sham {
+        let payload = s.write();
+        let sz = payload.len() as u32;
+        out.extend_from_slice(b"SHAM");
+        out.extend_from_slice(&sz.to_be_bytes());
+        out.extend_from_slice(&payload);
+        if sz & 1 == 1 {
+            out.push(0);
+        }
+    }
+
+    // PCHG (palette-change list — round-trip the raw bytes verbatim)
+    if let Some(p) = &image.pchg {
+        let sz = p.raw.len() as u32;
+        out.extend_from_slice(b"PCHG");
+        out.extend_from_slice(&sz.to_be_bytes());
+        out.extend_from_slice(&p.raw);
+        if sz & 1 == 1 {
+            out.push(0);
+        }
+    }
+
     // BODY
     let body_size = body_bytes.len() as u32;
     out.extend_from_slice(b"BODY");
@@ -823,6 +1262,356 @@ pub fn encode_ilbm(image: &IlbmImage) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Best-fit palette match by squared Euclidean distance.
+fn nearest_index(palette: &[[u8; 3]], r: u8, g: u8, b: u8) -> usize {
+    let mut best = 0usize;
+    let mut best_d = i32::MAX;
+    for (i, p) in palette.iter().enumerate() {
+        let dr = r as i32 - p[0] as i32;
+        let dg = g as i32 - p[1] as i32;
+        let db = b as i32 - p[2] as i32;
+        let d = dr * dr + dg * dg + db * db;
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Apply the per-plane row encoding for a list of palette indices.
+/// Pushes the resulting rows (`n_planes` then optional mask) onto
+/// `planar_rows`. `mask_bits` is `Some(row)` for HasMask, else `None`.
+fn push_planar_row(
+    planar_rows: &mut Vec<Vec<u8>>,
+    indices: &[u8],
+    n_planes: u8,
+    row_bytes: usize,
+    mask_bits: Option<&[u8]>,
+) {
+    let plane_rows = indices_to_planar_row(indices, n_planes, row_bytes);
+    for pr in plane_rows {
+        planar_rows.push(pr);
+    }
+    if let Some(m) = mask_bits {
+        planar_rows.push(m.to_vec());
+    }
+}
+
+/// Pack BODY rows (with optional ByteRun1 compression) into a single
+/// byte stream.
+fn pack_body(planar_rows: Vec<Vec<u8>>, compression: Compression) -> Vec<u8> {
+    match compression {
+        Compression::None => planar_rows.into_iter().flatten().collect(),
+        Compression::ByteRun1 => planar_rows
+            .iter()
+            .flat_map(|row| byterun1_encode_row(row))
+            .collect(),
+    }
+}
+
+/// Indexed (non-HAM, non-EHB) BODY encoder. Up to 8 bitplanes. When
+/// `image.pchg` is `Some`, each row's palette is the cumulative state
+/// at that scanline (start = `image.palette`, then PCHG entries
+/// applied in line order).
+fn encode_indexed_body(image: &IlbmImage) -> Result<Vec<u8>> {
+    let bmhd = image.bmhd;
+    let n_planes = bmhd.n_planes as usize;
+    if !(1..=8).contains(&n_planes) {
+        return Err(Error::unsupported(format!(
+            "ILBM encode: 1..=8 bitplanes for indexed (got {n_planes})"
+        )));
+    }
+    let row_bytes = bmhd.row_bytes();
+    let has_mask_plane = bmhd.masking == Masking::HasMask;
+    let mut planar_rows: Vec<Vec<u8>> =
+        Vec::with_capacity(bmhd.height as usize * (n_planes + has_mask_plane as usize));
+
+    // Pre-compute per-row palette if PCHG is in play.
+    let line_palettes: Option<Vec<Vec<[u8; 3]>>> = image.pchg.as_ref().map(|pchg| {
+        let mut cur_pal = image.palette.clone();
+        if cur_pal.len() < 256 {
+            cur_pal.resize(256, [0, 0, 0]);
+        }
+        let mut iter = pchg.lines.iter().peekable();
+        let mut out: Vec<Vec<[u8; 3]>> = Vec::with_capacity(bmhd.height as usize);
+        for y in 0..bmhd.height as u32 {
+            while let Some(line) = iter.peek() {
+                if line.line == y {
+                    for ch in &line.changes {
+                        let i = ch.index as usize;
+                        if i < cur_pal.len() {
+                            cur_pal[i] = ch.rgb;
+                        }
+                    }
+                    iter.next();
+                } else if line.line < y {
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
+            out.push(cur_pal.clone());
+        }
+        out
+    });
+
+    for y in 0..bmhd.height as usize {
+        let palette: &[[u8; 3]] = if let Some(lp) = &line_palettes {
+            lp[y].as_slice()
+        } else {
+            image.palette.as_slice()
+        };
+        let mut indices = vec![0u8; bmhd.width as usize];
+        let mut mask = vec![0u8; row_bytes];
+        for (x, idx_slot) in indices.iter_mut().enumerate() {
+            let src = (y * bmhd.width as usize + x) * 4;
+            let r = image.rgba[src];
+            let g = image.rgba[src + 1];
+            let b = image.rgba[src + 2];
+            let a = image.rgba[src + 3];
+            *idx_slot = nearest_index(palette, r, g, b) as u8;
+            if a >= 0x80 {
+                let bi = x / 8;
+                let bit = 7 - (x % 8);
+                mask[bi] |= 1 << bit;
+            }
+        }
+        push_planar_row(
+            &mut planar_rows,
+            &indices,
+            bmhd.n_planes,
+            row_bytes,
+            if has_mask_plane { Some(&mask) } else { None },
+        );
+    }
+    Ok(pack_body(planar_rows, bmhd.compression))
+}
+
+/// EHB (Extra-Half-Brite) BODY encoder. Output is 6 bitplanes; the
+/// expanded 64-entry palette is `[pal[0..32], pal[i].halved...]`. We
+/// quantise against the full 64-entry table per pixel, then encode
+/// the chosen index 0..=63 in 6 bitplanes.
+fn encode_ehb_body(image: &IlbmImage) -> Result<Vec<u8>> {
+    let bmhd = image.bmhd;
+    if bmhd.n_planes != 6 {
+        return Err(Error::invalid(format!(
+            "EHB encode: requires n_planes=6 (got {})",
+            bmhd.n_planes
+        )));
+    }
+    let expanded = expand_ehb_palette(&image.palette);
+    let row_bytes = bmhd.row_bytes();
+    let has_mask_plane = bmhd.masking == Masking::HasMask;
+    let mut planar_rows: Vec<Vec<u8>> =
+        Vec::with_capacity(bmhd.height as usize * (6 + has_mask_plane as usize));
+    for y in 0..bmhd.height as usize {
+        let mut indices = vec![0u8; bmhd.width as usize];
+        let mut mask = vec![0u8; row_bytes];
+        for (x, idx_slot) in indices.iter_mut().enumerate() {
+            let src = (y * bmhd.width as usize + x) * 4;
+            let r = image.rgba[src];
+            let g = image.rgba[src + 1];
+            let b = image.rgba[src + 2];
+            let a = image.rgba[src + 3];
+            *idx_slot = nearest_index(&expanded, r, g, b) as u8;
+            if a >= 0x80 {
+                let bi = x / 8;
+                let bit = 7 - (x % 8);
+                mask[bi] |= 1 << bit;
+            }
+        }
+        push_planar_row(
+            &mut planar_rows,
+            &indices,
+            6,
+            row_bytes,
+            if has_mask_plane { Some(&mask) } else { None },
+        );
+    }
+    Ok(pack_body(planar_rows, bmhd.compression))
+}
+
+/// HAM6 / HAM8 BODY encoder. For each pixel we cost four candidate
+/// ops (palette lookup + modify-R/G/B) against the running channel
+/// state and emit the cheapest by squared distance to the source.
+///
+/// Selection rules per spec:
+/// * op `0b00 val=v` — palette[v]; cost = |target − palette[v]|^2.
+/// * op `0b01 val=v` — modify B = widen(v); R/G held; cost vs
+///   target keeping the same R/G.
+/// * op `0b10 val=v` — modify R = widen(v); G/B held.
+/// * op `0b11 val=v` — modify G = widen(v); R/B held.
+///
+/// The widening function matches the decoder: HAM6 (`bits == 4`)
+/// replicates the nibble; HAM8 (`bits == 6`) shifts left by 2 and
+/// fills the bottom 2 bits with the top of the value.
+fn encode_ham_body(image: &IlbmImage) -> Result<Vec<u8>> {
+    let bmhd = image.bmhd;
+    let bits = match bmhd.n_planes {
+        6 => 4u8,
+        8 => 6u8,
+        other => {
+            return Err(Error::invalid(format!(
+                "HAM encode: n_planes must be 6 (HAM6) or 8 (HAM8), got {other}"
+            )))
+        }
+    };
+    let value_mask: u8 = (1u8 << bits) - 1;
+    let widen = |val: u8| -> u8 {
+        match bits {
+            4 => (val << 4) | val,
+            6 => (val << 2) | (val >> 4),
+            _ => val,
+        }
+    };
+    // Pre-compute every widened channel value once.
+    let mut widened = [0u8; 64];
+    for v in 0..=value_mask {
+        widened[v as usize] = widen(v);
+    }
+    let cost = |a: u8, b: u8| -> i32 {
+        let d = a as i32 - b as i32;
+        d * d
+    };
+    let row_bytes = bmhd.row_bytes();
+    let has_mask_plane = bmhd.masking == Masking::HasMask;
+    let mut planar_rows: Vec<Vec<u8>> = Vec::with_capacity(
+        bmhd.height as usize * (bmhd.n_planes as usize + has_mask_plane as usize),
+    );
+    for y in 0..bmhd.height as usize {
+        // Per-row palette: SHAM overrides if present.
+        let row_palette: Vec<[u8; 3]> = if let Some(s) = &image.sham {
+            if let Some(p) = s.palettes.get(y) {
+                p.clone()
+            } else {
+                image.palette.clone()
+            }
+        } else {
+            image.palette.clone()
+        };
+        let mut indices = vec![0u8; bmhd.width as usize];
+        let mut mask = vec![0u8; row_bytes];
+        // HAM state starts from black at the start of every row.
+        let mut r: u8 = 0;
+        let mut g: u8 = 0;
+        let mut b: u8 = 0;
+        for (x, idx_slot) in indices.iter_mut().enumerate() {
+            let src = (y * bmhd.width as usize + x) * 4;
+            let tr = image.rgba[src];
+            let tg = image.rgba[src + 1];
+            let tb = image.rgba[src + 2];
+            let ta = image.rgba[src + 3];
+
+            // Candidate 1: palette lookup.
+            let pal_max = (1u8 << bits) as usize;
+            let pal_search = row_palette.len().min(pal_max);
+            let mut best_op: u8 = 0;
+            let mut best_val: u8 = 0;
+            let mut best_cost: i32 = i32::MAX;
+            let mut best_rgb = [r, g, b];
+            for (i, p) in row_palette.iter().take(pal_search).enumerate() {
+                let c = cost(tr, p[0]) + cost(tg, p[1]) + cost(tb, p[2]);
+                if c < best_cost {
+                    best_cost = c;
+                    best_op = 0b00;
+                    best_val = i as u8;
+                    best_rgb = [p[0], p[1], p[2]];
+                }
+            }
+            // Candidates 2–4: modify B / R / G holding the other two.
+            // Search the channel that is being modified for the
+            // closest widened value.
+            // Modify B (op = 0b01): R/G held, B varies.
+            for v in 0..=value_mask {
+                let nb = widened[v as usize];
+                let c = cost(tr, r) + cost(tg, g) + cost(tb, nb);
+                if c < best_cost {
+                    best_cost = c;
+                    best_op = 0b01;
+                    best_val = v;
+                    best_rgb = [r, g, nb];
+                }
+            }
+            // Modify R (op = 0b10): G/B held, R varies.
+            for v in 0..=value_mask {
+                let nr = widened[v as usize];
+                let c = cost(tr, nr) + cost(tg, g) + cost(tb, b);
+                if c < best_cost {
+                    best_cost = c;
+                    best_op = 0b10;
+                    best_val = v;
+                    best_rgb = [nr, g, b];
+                }
+            }
+            // Modify G (op = 0b11): R/B held, G varies.
+            for v in 0..=value_mask {
+                let ng = widened[v as usize];
+                let c = cost(tr, r) + cost(tg, ng) + cost(tb, b);
+                if c < best_cost {
+                    best_cost = c;
+                    best_op = 0b11;
+                    best_val = v;
+                    best_rgb = [r, ng, b];
+                }
+            }
+
+            *idx_slot = (best_op << bits) | (best_val & value_mask);
+            r = best_rgb[0];
+            g = best_rgb[1];
+            b = best_rgb[2];
+            if ta >= 0x80 {
+                let bi = x / 8;
+                let bit = 7 - (x % 8);
+                mask[bi] |= 1 << bit;
+            }
+        }
+        push_planar_row(
+            &mut planar_rows,
+            &indices,
+            bmhd.n_planes,
+            row_bytes,
+            if has_mask_plane { Some(&mask) } else { None },
+        );
+    }
+    Ok(pack_body(planar_rows, bmhd.compression))
+}
+
+/// PBM chunky BODY encoder. One palette-index byte per pixel, padded
+/// to an even-byte row stride.
+fn encode_pbm_body(image: &IlbmImage) -> Result<Vec<u8>> {
+    let bmhd = image.bmhd;
+    let stride = (bmhd.width as usize + 1) & !1;
+    let mut indices_all: Vec<u8> = Vec::with_capacity(stride * bmhd.height as usize);
+    let pal: Vec<[u8; 3]> = if image.camg.is_ehb() && image.palette.len() <= 32 {
+        expand_ehb_palette(&image.palette)
+    } else {
+        image.palette.clone()
+    };
+    for y in 0..bmhd.height as usize {
+        let mut row = vec![0u8; stride];
+        for x in 0..bmhd.width as usize {
+            let src = (y * bmhd.width as usize + x) * 4;
+            let r = image.rgba[src];
+            let g = image.rgba[src + 1];
+            let b = image.rgba[src + 2];
+            row[x] = nearest_index(&pal, r, g, b) as u8;
+        }
+        indices_all.extend_from_slice(&row);
+    }
+    match bmhd.compression {
+        Compression::None => Ok(indices_all),
+        Compression::ByteRun1 => {
+            // PBM ByteRun1: each row encoded independently.
+            let mut out = Vec::new();
+            for chunk in indices_all.chunks_exact(stride) {
+                out.extend(byterun1_encode_row(chunk));
+            }
+            Ok(out)
+        }
+    }
+}
+
 // ───────────────────── Demuxer ─────────────────────
 
 fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
@@ -835,9 +1624,9 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
         )));
     }
     let form_type = read_form_type(&mut *input)?;
-    if &form_type != b"ILBM" {
+    if &form_type != b"ILBM" && &form_type != b"PBM " {
         return Err(Error::invalid(format!(
-            "IFF: not an ILBM file (form type {:?})",
+            "IFF: not an ILBM/PBM file (form type {:?})",
             std::str::from_utf8(&form_type).unwrap_or("????")
         )));
     }
@@ -853,7 +1642,7 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     let mut full = Vec::with_capacity(8 + 4 + form_body.len());
     full.extend_from_slice(b"FORM");
     full.extend_from_slice(&hdr.size.to_be_bytes());
-    full.extend_from_slice(b"ILBM");
+    full.extend_from_slice(&form_type);
     full.extend_from_slice(&form_body);
 
     let image = parse_ilbm(&full)?;
@@ -1062,6 +1851,7 @@ impl Muxer for IlbmMuxer {
             palette,
             camg: Camg::default(),
             rgba: std::mem::take(&mut self.pending),
+            ..IlbmImage::default()
         };
         let bytes = encode_ilbm(&img)?;
         self.output.write_all(&bytes)?;
@@ -1143,6 +1933,7 @@ mod tests {
             palette,
             camg: Camg::default(),
             rgba,
+            ..IlbmImage::default()
         }
     }
 
