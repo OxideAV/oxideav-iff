@@ -41,7 +41,7 @@ fn build_stream(sr: u32) -> StreamInfo {
 /// Build a registry populated with the iff crate's demuxer/muxer.
 fn registry() -> ContainerRegistry {
     let mut reg = ContainerRegistry::new();
-    oxideav_iff::register(&mut reg);
+    oxideav_iff::register_containers(&mut reg);
     reg
 }
 

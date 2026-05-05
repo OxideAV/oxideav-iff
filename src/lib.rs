@@ -21,7 +21,41 @@ pub mod svx;
 use oxideav_core::ContainerRegistry;
 
 /// Register all IFF-family demuxers with the container registry.
-pub fn register(reg: &mut ContainerRegistry) {
+pub fn register_containers(reg: &mut ContainerRegistry) {
     svx::register(reg);
     ilbm::register(reg);
+}
+
+/// Install every IFF-family container into a
+/// [`oxideav_core::RuntimeContext`].
+///
+/// Convenience wrapper around [`register_containers`] that matches the
+/// uniform `register(&mut RuntimeContext)` entry point every sibling
+/// crate exposes. The nested `svx::register` / `ilbm::register` helpers
+/// remain `&mut ContainerRegistry`-shaped because they are internal
+/// per-form installers and not part of the framework-facing surface.
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_containers(&mut ctx.containers);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_container() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        // 8SVX (Amiga audio) extension is registered by svx::register
+        // and ILBM (Amiga picture) by ilbm::register; both should be
+        // wired through the unified entry point.
+        assert_eq!(
+            ctx.containers.container_for_extension("8svx"),
+            Some("iff_8svx")
+        );
+        assert_eq!(
+            ctx.containers.container_for_extension("ilbm"),
+            Some("iff_ilbm")
+        );
+    }
 }
