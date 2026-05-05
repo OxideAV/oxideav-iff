@@ -119,14 +119,22 @@ impl Masking {
 }
 
 /// `BMHD.compression` — `0` = uncompressed, `1` = ByteRun1 (PackBits).
+///
+/// The encoder-only [`Compression::Auto`] variant is not a valid BMHD byte;
+/// it instructs [`encode_ilbm`] to try both modes and emit the shorter
+/// output, writing the winning mode into BMHD before assembly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Compression {
     /// BODY is a literal stack of bitplane rows.
-    #[default]
     None,
     /// Each plane-row is ByteRun1 (PackBits) compressed independently.
     /// Decoder side: see [`byterun1_decode_row`].
+    #[default]
     ByteRun1,
+    /// Encoder-only: try both `None` and `ByteRun1` and emit whichever
+    /// produces fewer bytes. The winning mode is written into the BMHD
+    /// `compression` field in the output.
+    Auto,
 }
 
 impl Compression {
@@ -146,6 +154,8 @@ impl Compression {
         match self {
             Self::None => 0,
             Self::ByteRun1 => 1,
+            // Auto is resolved before writing; should never reach here.
+            Self::Auto => 1,
         }
     }
 }
@@ -928,6 +938,14 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
                     input = &input[consumed..];
                 }
             }
+            // Auto is encoder-only; it is always resolved to None or
+            // ByteRun1 before the BMHD byte is written, so it should
+            // never appear in a file being decoded.
+            Compression::Auto => {
+                return Err(Error::unsupported(
+                    "ILBM BMHD: compression byte 'Auto' is encoder-only, not a valid file value",
+                ))
+            }
         }
         let effective_palette: Vec<[u8; 3]> = if camg.is_ehb() && palette.len() <= 32 {
             expand_ehb_palette(&palette)
@@ -1008,6 +1026,11 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
                     rows_planar.push(row);
                 }
             }
+        }
+        Compression::Auto => {
+            return Err(Error::unsupported(
+                "ILBM BMHD: compression byte 'Auto' is encoder-only, not a valid file value",
+            ))
         }
     }
 
@@ -1177,16 +1200,23 @@ pub fn encode_ilbm(image: &IlbmImage) -> Result<Vec<u8>> {
         )));
     }
 
-    // Build BODY bytes per branch.
-    let body_bytes: Vec<u8> = if is_pbm {
-        encode_pbm_body(image)?
+    // Build BODY bytes per branch. When compression is Auto the body
+    // encoder returns the winning bytes; we must also learn which mode
+    // won so we can write the correct byte into BMHD.
+    let (body_bytes, resolved_compression): (Vec<u8>, Compression) = if is_pbm {
+        encode_pbm_body_resolving(image)?
     } else if image.camg.is_ham() {
-        encode_ham_body(image)?
+        encode_ham_body_resolving(image)?
     } else if image.camg.is_ehb() {
-        encode_ehb_body(image)?
+        encode_ehb_body_resolving(image)?
     } else {
-        encode_indexed_body(image)?
+        encode_indexed_body_resolving(image)?
     };
+
+    // Build BMHD with the resolved compression mode so the BMHD byte on
+    // disk always matches the actual encoding of BODY.
+    let mut bmhd_out = bmhd;
+    bmhd_out.compression = resolved_compression;
 
     // Assemble FORM/ILBM (or FORM/PBM ).
     let mut out = Vec::new();
@@ -1197,7 +1227,7 @@ pub fn encode_ilbm(image: &IlbmImage) -> Result<Vec<u8>> {
     // BMHD
     out.extend_from_slice(b"BMHD");
     out.extend_from_slice(&20u32.to_be_bytes());
-    out.extend_from_slice(&bmhd.write());
+    out.extend_from_slice(&bmhd_out.write());
 
     // CMAP
     let cmap_size = (image.palette.len() * 3) as u32;
@@ -1299,7 +1329,8 @@ fn push_planar_row(
 }
 
 /// Pack BODY rows (with optional ByteRun1 compression) into a single
-/// byte stream.
+/// byte stream. `Compression::Auto` tries both modes and returns the
+/// shorter result together with the winning [`Compression`] variant.
 fn pack_body(planar_rows: Vec<Vec<u8>>, compression: Compression) -> Vec<u8> {
     match compression {
         Compression::None => planar_rows.into_iter().flatten().collect(),
@@ -1307,6 +1338,43 @@ fn pack_body(planar_rows: Vec<Vec<u8>>, compression: Compression) -> Vec<u8> {
             .iter()
             .flat_map(|row| byterun1_encode_row(row))
             .collect(),
+        Compression::Auto => {
+            let rle: Vec<u8> = planar_rows
+                .iter()
+                .flat_map(|row| byterun1_encode_row(row))
+                .collect();
+            let raw_len: usize = planar_rows.iter().map(|r| r.len()).sum();
+            if rle.len() < raw_len {
+                rle
+            } else {
+                planar_rows.into_iter().flatten().collect()
+            }
+        }
+    }
+}
+
+/// Like [`pack_body`] but also returns the resolved [`Compression`]
+/// mode that was actually used. For `Auto`, returns `ByteRun1` when
+/// RLE wins, `None` otherwise; for explicit modes returns the mode as-is.
+fn pack_body_resolving(
+    planar_rows: Vec<Vec<u8>>,
+    compression: Compression,
+) -> (Vec<u8>, Compression) {
+    match compression {
+        Compression::Auto => {
+            let rle: Vec<u8> = planar_rows
+                .iter()
+                .flat_map(|row| byterun1_encode_row(row))
+                .collect();
+            let raw_len: usize = planar_rows.iter().map(|r| r.len()).sum();
+            if rle.len() < raw_len {
+                (rle, Compression::ByteRun1)
+            } else {
+                let raw: Vec<u8> = planar_rows.into_iter().flatten().collect();
+                (raw, Compression::None)
+            }
+        }
+        other => (pack_body(planar_rows, other), other),
     }
 }
 
@@ -1314,7 +1382,16 @@ fn pack_body(planar_rows: Vec<Vec<u8>>, compression: Compression) -> Vec<u8> {
 /// `image.pchg` is `Some`, each row's palette is the cumulative state
 /// at that scanline (start = `image.palette`, then PCHG entries
 /// applied in line order).
-fn encode_indexed_body(image: &IlbmImage) -> Result<Vec<u8>> {
+///
+/// Returns body bytes plus the resolved [`Compression`] mode actually
+/// used (important when `bmhd.compression == Auto`).
+fn encode_indexed_body_resolving(image: &IlbmImage) -> Result<(Vec<u8>, Compression)> {
+    let rows = encode_indexed_planar_rows(image)?;
+    Ok(pack_body_resolving(rows, image.bmhd.compression))
+}
+
+/// Build raw planar rows for indexed (non-HAM, non-EHB) body encoding.
+fn encode_indexed_planar_rows(image: &IlbmImage) -> Result<Vec<Vec<u8>>> {
     let bmhd = image.bmhd;
     let n_planes = bmhd.n_planes as usize;
     if !(1..=8).contains(&n_planes) {
@@ -1385,14 +1462,14 @@ fn encode_indexed_body(image: &IlbmImage) -> Result<Vec<u8>> {
             if has_mask_plane { Some(&mask) } else { None },
         );
     }
-    Ok(pack_body(planar_rows, bmhd.compression))
+    Ok(planar_rows)
 }
 
 /// EHB (Extra-Half-Brite) BODY encoder. Output is 6 bitplanes; the
 /// expanded 64-entry palette is `[pal[0..32], pal[i].halved...]`. We
 /// quantise against the full 64-entry table per pixel, then encode
 /// the chosen index 0..=63 in 6 bitplanes.
-fn encode_ehb_body(image: &IlbmImage) -> Result<Vec<u8>> {
+fn encode_ehb_planar_rows(image: &IlbmImage) -> Result<Vec<Vec<u8>>> {
     let bmhd = image.bmhd;
     if bmhd.n_planes != 6 {
         return Err(Error::invalid(format!(
@@ -1429,7 +1506,12 @@ fn encode_ehb_body(image: &IlbmImage) -> Result<Vec<u8>> {
             if has_mask_plane { Some(&mask) } else { None },
         );
     }
-    Ok(pack_body(planar_rows, bmhd.compression))
+    Ok(planar_rows)
+}
+
+fn encode_ehb_body_resolving(image: &IlbmImage) -> Result<(Vec<u8>, Compression)> {
+    let rows = encode_ehb_planar_rows(image)?;
+    Ok(pack_body_resolving(rows, image.bmhd.compression))
 }
 
 /// HAM6 / HAM8 BODY encoder. For each pixel we cost four candidate
@@ -1446,7 +1528,12 @@ fn encode_ehb_body(image: &IlbmImage) -> Result<Vec<u8>> {
 /// The widening function matches the decoder: HAM6 (`bits == 4`)
 /// replicates the nibble; HAM8 (`bits == 6`) shifts left by 2 and
 /// fills the bottom 2 bits with the top of the value.
-fn encode_ham_body(image: &IlbmImage) -> Result<Vec<u8>> {
+fn encode_ham_body_resolving(image: &IlbmImage) -> Result<(Vec<u8>, Compression)> {
+    let rows = encode_ham_planar_rows(image)?;
+    Ok(pack_body_resolving(rows, image.bmhd.compression))
+}
+
+fn encode_ham_planar_rows(image: &IlbmImage) -> Result<Vec<Vec<u8>>> {
     let bmhd = image.bmhd;
     let bits = match bmhd.n_planes {
         6 => 4u8,
@@ -1574,12 +1661,12 @@ fn encode_ham_body(image: &IlbmImage) -> Result<Vec<u8>> {
             if has_mask_plane { Some(&mask) } else { None },
         );
     }
-    Ok(pack_body(planar_rows, bmhd.compression))
+    Ok(planar_rows)
 }
 
 /// PBM chunky BODY encoder. One palette-index byte per pixel, padded
-/// to an even-byte row stride.
-fn encode_pbm_body(image: &IlbmImage) -> Result<Vec<u8>> {
+/// to an even-byte row stride. Returns body bytes plus resolved compression.
+fn encode_pbm_body_resolving(image: &IlbmImage) -> Result<(Vec<u8>, Compression)> {
     let bmhd = image.bmhd;
     let stride = (bmhd.width as usize + 1) & !1;
     let mut indices_all: Vec<u8> = Vec::with_capacity(stride * bmhd.height as usize);
@@ -1599,17 +1686,12 @@ fn encode_pbm_body(image: &IlbmImage) -> Result<Vec<u8>> {
         }
         indices_all.extend_from_slice(&row);
     }
-    match bmhd.compression {
-        Compression::None => Ok(indices_all),
-        Compression::ByteRun1 => {
-            // PBM ByteRun1: each row encoded independently.
-            let mut out = Vec::new();
-            for chunk in indices_all.chunks_exact(stride) {
-                out.extend(byterun1_encode_row(chunk));
-            }
-            Ok(out)
-        }
-    }
+    // Build row slices so pack_body_resolving can try both modes.
+    let rows: Vec<Vec<u8>> = indices_all
+        .chunks_exact(stride)
+        .map(|c| c.to_vec())
+        .collect();
+    Ok(pack_body_resolving(rows, bmhd.compression))
 }
 
 // ───────────────────── Demuxer ─────────────────────
@@ -1742,13 +1824,14 @@ impl IlbmMuxer {
             output,
             width,
             height,
-            compression: Compression::ByteRun1,
+            compression: Compression::Auto,
             written: false,
             pending: Vec::new(),
         })
     }
 
-    /// Choose a compression mode (default: `ByteRun1`).
+    /// Choose a compression mode (default: `Auto` — tries both and
+    /// emits the shorter result).
     pub fn with_compression(mut self, c: Compression) -> Self {
         self.compression = c;
         self

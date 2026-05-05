@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ilbm` round-3 features:
+  - **`Compression::Auto`** — encoder-only variant. `encode_ilbm` tries
+    both uncompressed and ByteRun1 BODY for each image and emits the
+    shorter result, writing the resolved mode into BMHD. `IlbmMuxer`
+    now defaults to `Auto` instead of `ByteRun1`. Picks ByteRun1 for
+    solid-colour / gradient images (typical >50 % savings) and raw for
+    fully-random bitplane data.
+  - `pack_body_resolving` internal helper — returns `(Vec<u8>, Compression)`
+    so the BMHD compression byte always matches the actual encoding.
+  - All BODY-encoder branches (`indexed`, `ehb`, `ham`, `pbm`) refactored
+    into a planar-row builder + a resolving packer so `Auto` propagates
+    through every encode path.
+  - 8 new tests in `tests/ilbm_round3.rs`: Auto selects RLE for solid
+    colour, Auto selects raw for pseudo-random data, HAM6/HAM8/EHB
+    self-roundtrip under Auto compression, byte-savings sanity check,
+    CAMG emission guard, IlbmMuxer end-to-end with Auto.
+
 - `ilbm` round-2 features:
   - **PBM** chunky variant (`FORM / PBM `) — DPaint II / Brilliance
     8-bit-per-pixel sibling of ILBM. Read + write under the

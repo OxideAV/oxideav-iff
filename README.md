@@ -6,7 +6,7 @@ InterLeaved BitMap pictures), PBM (DPaint II / Brilliance chunky
 sibling), ANIM (animated ILBM), AIFF, SMUS, and friends. Today this
 crate ships a full read/write implementation of FORM/8SVX, a
 read-and-round-trip implementation of FORM/ILBM and FORM/PBM (1..=8
-bitplanes, ByteRun1 compression, EHB, HAM6, HAM8, HasMask,
+bitplanes, ByteRun1 / Auto compression, EHB, HAM6, HAM8, HasMask,
 transparent-colour keying, GRAB hotspot, SHAM per-line palette, PCHG
 small-format palette change list), and a read-only FORM/ANIM
 implementation (op-0 literal + op-5 byte-vertical delta). The shared
@@ -116,6 +116,7 @@ Read + round-trip support for `FORM / ILBM`:
 | `CAMG` viewport flags (HAM, EHB)         |  Y   |   Y   |
 | `BODY` uncompressed planar               |  Y   |   Y   |
 | `BODY` ByteRun1 (PackBits) compression   |  Y   |   Y   |
+| `BODY` Auto-picker (RDO, picks shorter)  |  -   |   Y   |
 | 1..=8 bitplane indexed colour            |  Y   |   Y   |
 | EHB — extra-half-brite (32 → 64 entries) |  Y   |   Y   |
 | HAM6 (6-plane Hold-And-Modify, 4-bit ch) |  Y   |   Y   |
@@ -145,6 +146,11 @@ list).
   the running channel state. EHB encode quantises against a 64-entry
   expanded palette and emits 6 bitplanes regardless of input palette
   length.
+- `Compression::Auto` (the muxer default) tries both `None` and
+  `ByteRun1` and emits whichever produces fewer bytes; the winning
+  mode is recorded in BMHD so the file always self-describes correctly.
+  Solid-colour and gradient images typically save >50 % over raw;
+  pseudo-random images fall back to uncompressed.
 
 ### PBM — DPaint II / Brilliance chunky sibling
 
