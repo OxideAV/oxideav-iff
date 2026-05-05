@@ -1,9 +1,12 @@
 # oxideav-iff
 
 Pure-Rust EA IFF 85 container support for oxideav — the chunk reader
-that underlies 8SVX (Amiga 8-bit sampled voice), ILBM, AIFF, SMUS, and
-friends. Today this crate ships a full read/write implementation of
-FORM/8SVX; the shared chunk walker is reusable as ILBM / AIFF / SMUS
+that underlies 8SVX (Amiga 8-bit sampled voice), ILBM (Amiga
+InterLeaved BitMap pictures), AIFF, SMUS, and friends. Today this
+crate ships a full read/write implementation of FORM/8SVX plus a
+read-and-roundtrip implementation of FORM/ILBM (1..=8 bitplanes,
+ByteRun1 compression, EHB, HAM6, HAM8, HasMask, transparent-colour
+keying). The shared chunk walker is reusable as AIFF / SMUS / ANIM
 support is added. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
@@ -98,11 +101,52 @@ mux.write_trailer()?;
   `.iff` by extension.
 - Codec (inside the stream): `"pcm_s8"`.
 
+### ILBM — Amiga InterLeaved BitMap
+
+Read + round-trip support for `FORM / ILBM`:
+
+| Feature                                  | Read | Write |
+|------------------------------------------|:----:|:-----:|
+| `BMHD` bitmap header (20 bytes)          |  Y   |   Y   |
+| `CMAP` palette (R, G, B triples)         |  Y   |   Y   |
+| `CAMG` viewport flags (HAM, EHB)         |  Y   |   Y   |
+| `BODY` uncompressed planar               |  Y   |   Y   |
+| `BODY` ByteRun1 (PackBits) compression   |  Y   |   Y   |
+| 1..=8 bitplane indexed colour            |  Y   |   Y   |
+| EHB — extra-half-brite (32 → 64 entries) |  Y   |   N   |
+| HAM6 (6-plane Hold-And-Modify, 4-bit ch) |  Y   |   N   |
+| HAM8 (8-plane Hold-And-Modify, 6-bit ch) |  Y   |   N   |
+| `Masking::HasMask` plane → alpha         |  Y   |   Y   |
+| `Masking::HasTransparentColor` keying    |  Y   |   N   |
+| Output pixel format                      | RGBA |  -    |
+
+- Public API: [`ilbm::parse_ilbm`], [`ilbm::encode_ilbm`],
+  [`ilbm::IlbmImage`], [`ilbm::Bmhd`], [`ilbm::Camg`],
+  [`ilbm::byterun1_decode_row`] / [`ilbm::byterun1_encode_row`],
+  [`ilbm::expand_ham_row`], [`ilbm::expand_ehb_palette`].
+- Container id: `"iff_ilbm"`, probes `FORM....ILBM` and matches
+  `.ilbm` / `.lbm` by extension. Single-stream `rawvideo` / `Rgba`.
+- Round 1 omits HAM / EHB encode (the writer emits indexed colour
+  through up to 8 bitplanes regardless of CAMG flags) and the
+  `CRNG` / `CCRT` colour-cycling chunks.
+
+#### Read an ILBM picture
+
+```rust
+let bytes = std::fs::read("picture.ilbm")?;
+let img = oxideav_iff::ilbm::parse_ilbm(&bytes)?;
+println!("{}x{} → {} bytes RGBA", img.width, img.height, img.rgba.len());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ## Roadmap
 
-The chunk walker (`chunk.rs`) is format-agnostic; ILBM (still image),
-ANIM (animated ILBM), AIFF (Apple audio), SMUS (music score) and MAUD
-are natural follow-ons that reuse the same FORM/LIST/CAT reader.
+The chunk walker (`chunk.rs`) is format-agnostic; ANIM (animated
+ILBM), AIFF (Apple audio), SMUS (music score) and MAUD are natural
+follow-ons that reuse the same FORM/LIST/CAT reader. PBM (an 8-bit
+chunky sibling of ILBM under the same outer envelope), the GRAB chunk
+(hotspot) and SHAM / PCHG (per-scanline palette changes) are also
+natural ILBM-side extensions.
 
 ## License
 

@@ -8,11 +8,14 @@
 //! and so on.
 //!
 //! Today this crate handles **8SVX audio** end-to-end (identifies the
-//! stream, exposes its PCM-S8 samples as packets). The same chunk reader
-//! and `Form` walker are reusable for future ILBM / AIFF / SMUS support
-//! without restructuring.
+//! stream, exposes its PCM-S8 samples as packets) and **ILBM**
+//! (InterLeaved BitMap, the Amiga IFF picture form) for indexed,
+//! EHB and HAM6/HAM8 images including ByteRun1 (PackBits)
+//! decompression. The same chunk reader and `Form` walker are
+//! reusable for future AIFF / SMUS support without restructuring.
 
 pub mod chunk;
+pub mod ilbm;
 pub mod svx;
 
 use oxideav_core::ContainerRegistry;
@@ -20,4 +23,5 @@ use oxideav_core::ContainerRegistry;
 /// Register all IFF-family demuxers with the container registry.
 pub fn register(reg: &mut ContainerRegistry) {
     svx::register(reg);
+    ilbm::register(reg);
 }

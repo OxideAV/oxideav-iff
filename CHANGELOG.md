@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ilbm` module: read/round-trip support for FORM/ILBM (Amiga
+  InterLeaved BitMap, 1986 Jerry Morrison spec). BMHD / CMAP / CAMG /
+  BODY chunks; uncompressed and ByteRun1 (PackBits) BODY; 1..=8
+  colour bitplanes; EHB (32→64-entry palette mirroring); HAM6 and HAM8
+  with running-state channel modify ops; `Masking::HasMask` plane and
+  `Masking::HasTransparentColor` alpha. Public API:
+  `parse_ilbm` / `encode_ilbm` / `IlbmImage` / `Bmhd` / `Camg` /
+  `byterun1_{decode,encode}_row` / `expand_ham_row` /
+  `expand_ehb_palette`.
+- New container registration `"iff_ilbm"` with `.ilbm` / `.lbm`
+  extensions and a `FORM....ILBM` probe; demuxer emits one keyframe
+  packet of RGBA pixels through a `rawvideo` stream.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-iff/compare/v0.0.4...v0.0.5) - 2026-04-25
 
 ### Other
