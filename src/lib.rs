@@ -37,10 +37,8 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 /// remain `&mut ContainerRegistry`-shaped because they are internal
 /// per-form installers and not part of the framework-facing surface.
 ///
-/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
-/// [`oxideav_core::register!`] macro below so consumers calling
-/// [`oxideav_core::RuntimeContext::with_all_features`] pick the IFF
-/// family up without any explicit umbrella plumbing.
+/// Also wired into [`oxideav_meta::register_all`] via the
+/// [`oxideav_core::register!`] macro below.
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     register_containers(&mut ctx.containers);
 }
