@@ -127,6 +127,7 @@ Read + round-trip support for `FORM / ILBM`:
 | `SHAM` Sliced HAM (per-line 16×RGB444)   |  Y   |   Y   |
 | `PCHG` palette change list (small fmt)   |  Y   |   Y   |
 | `PCHG` palette change list (big fmt)     |  Y   |   N*  |
+| `IlbmMuxer` mode select (HAM/EHB/PBM)    |  -   |   Y   |
 | Output pixel format                      | RGBA |  -    |
 
 `*` PCHG big-format chunks are decoded but the writer round-trips
@@ -137,7 +138,10 @@ list).
   [`ilbm::IlbmImage`], [`ilbm::Bmhd`], [`ilbm::Camg`],
   [`ilbm::Grab`], [`ilbm::Sham`], [`ilbm::Pchg`],
   [`ilbm::byterun1_decode_row`] / [`ilbm::byterun1_encode_row`],
-  [`ilbm::expand_ham_row`], [`ilbm::expand_ehb_palette`].
+  [`ilbm::expand_ham_row`], [`ilbm::expand_ehb_palette`],
+  [`ilbm::IlbmMuxer`] (with [`ilbm::MuxerMode`] selecting indexed /
+  HAM6 / HAM8 / EHB / PBM and [`ilbm::IlbmMuxer::with_masking`]
+  selecting `HasMask` / `HasTransparentColor`).
 - Container id: `"iff_ilbm"`, probes `FORM....ILBM` (and
   `FORM....PBM `) and matches `.ilbm` / `.lbm` by extension.
   Single-stream `rawvideo` / `Rgba`.
@@ -151,6 +155,17 @@ list).
   mode is recorded in BMHD so the file always self-describes correctly.
   Solid-colour and gradient images typically save >50 % over raw;
   pseudo-random images fall back to uncompressed.
+- The `IlbmMuxer` streaming API exposes every encoder mode the
+  one-shot `encode_ilbm` supports: pick `MuxerMode::IndexedAuto`
+  (default — 1..=8 bitplanes, palette greedy-built from the first
+  packet), `MuxerMode::Ham6` / `MuxerMode::Ham8` (CAMG-flagged Hold-
+  And-Modify), `MuxerMode::Ehb` (32→64 EHB palette mirror), or
+  `MuxerMode::Pbm` (chunky `FORM/PBM `).
+- Cross-validated end-to-end against ImageMagick's `magick convert`
+  (delegate `ilbmtoppm` → PPM → pixel-compare). Set
+  `OXIDEAV_IFF_MAGICK_CROSS=1` to enable the cross-decode tests; they
+  silently skip when the binary or its delegate isn't installed so CI
+  stays green on hosts without ImageMagick.
 
 ### PBM — DPaint II / Brilliance chunky sibling
 

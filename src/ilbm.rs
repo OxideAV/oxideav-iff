@@ -1439,6 +1439,7 @@ fn encode_indexed_planar_rows(image: &IlbmImage) -> Result<Vec<Vec<u8>>> {
         } else {
             image.palette.as_slice()
         };
+        let use_transparent_key = bmhd.masking == Masking::HasTransparentColor;
         let mut indices = vec![0u8; bmhd.width as usize];
         let mut mask = vec![0u8; row_bytes];
         for (x, idx_slot) in indices.iter_mut().enumerate() {
@@ -1447,7 +1448,14 @@ fn encode_indexed_planar_rows(image: &IlbmImage) -> Result<Vec<Vec<u8>>> {
             let g = image.rgba[src + 1];
             let b = image.rgba[src + 2];
             let a = image.rgba[src + 3];
-            *idx_slot = nearest_index(palette, r, g, b) as u8;
+            // Transparent-colour key: pixels whose alpha is below
+            // 0x80 are written as the BMHD-declared transparent
+            // index (the decoder zeros them on read).
+            *idx_slot = if use_transparent_key && a < 0x80 {
+                bmhd.transparent_color as u8
+            } else {
+                nearest_index(palette, r, g, b) as u8
+            };
             if a >= 0x80 {
                 let bi = x / 8;
                 let bit = 7 - (x % 8);
@@ -1675,6 +1683,7 @@ fn encode_pbm_body_resolving(image: &IlbmImage) -> Result<(Vec<u8>, Compression)
     } else {
         image.palette.clone()
     };
+    let use_transparent_key = bmhd.masking == Masking::HasTransparentColor;
     for y in 0..bmhd.height as usize {
         let mut row = vec![0u8; stride];
         for x in 0..bmhd.width as usize {
@@ -1682,7 +1691,12 @@ fn encode_pbm_body_resolving(image: &IlbmImage) -> Result<(Vec<u8>, Compression)
             let r = image.rgba[src];
             let g = image.rgba[src + 1];
             let b = image.rgba[src + 2];
-            row[x] = nearest_index(&pal, r, g, b) as u8;
+            let a = image.rgba[src + 3];
+            row[x] = if use_transparent_key && a < 0x80 {
+                bmhd.transparent_color as u8
+            } else {
+                nearest_index(&pal, r, g, b) as u8
+            };
         }
         indices_all.extend_from_slice(&row);
     }
@@ -1784,16 +1798,47 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
     Ok(Box::new(IlbmMuxer::new(output, streams)?))
 }
 
-/// Container-level ILBM muxer. Accepts a single `rawvideo` stream
-/// with `PixelFormat::Rgba`. The emitted file uses an 8-bitplane
-/// indexed palette built greedily from the first `write_packet` (see
-/// [`build_palette`]). Compression follows the `compression`
-/// constructor argument (default ByteRun1).
+/// Encoder mode picked by [`IlbmMuxer`] when assembling the BODY.
+///
+/// The muxer's default is [`MuxerMode::IndexedAuto`] — it greedily
+/// builds an indexed palette from the first frame and emits 1..=8
+/// bitplanes plus a `CMAP`. Switch to [`MuxerMode::Ham6`] /
+/// [`MuxerMode::Ham8`] / [`MuxerMode::Ehb`] / [`MuxerMode::Pbm`] for
+/// the matching ILBM viewport / form variant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MuxerMode {
+    /// Indexed planar `FORM/ILBM`. Plane count = ceil(log2(palette))
+    /// clamped to 1..=8. CAMG omitted unless the caller sets one.
+    #[default]
+    IndexedAuto,
+    /// HAM6 — 6 bitplanes, CAMG=HAM. Palette is the 16-entry table
+    /// built from the first `write_packet`. The encoder picks per-pixel
+    /// op codes to approximate the source RGBA.
+    Ham6,
+    /// HAM8 — 8 bitplanes, CAMG=HAM. Palette is the first 64 unique
+    /// RGB triples seen in the source.
+    Ham8,
+    /// EHB — 6 bitplanes, CAMG=EHB. Palette is 32 unique entries
+    /// expanded to 64 by halving each channel.
+    Ehb,
+    /// Chunky `FORM/PBM ` (DPaint II / Brilliance). 8 bits per pixel,
+    /// 1 byte per pixel BODY. Caller's palette must fit in 256 entries.
+    Pbm,
+}
+
+/// Container-level ILBM / PBM muxer. Accepts a single `rawvideo`
+/// stream with `PixelFormat::Rgba`. The emitted file's encoder mode
+/// follows [`MuxerMode`] (default [`MuxerMode::IndexedAuto`]) and
+/// compression follows [`Compression`] (default
+/// [`Compression::Auto`]).
 pub struct IlbmMuxer {
     output: Box<dyn WriteSeek>,
     width: u32,
     height: u32,
     compression: Compression,
+    mode: MuxerMode,
+    masking: Masking,
+    transparent_color: u16,
     written: bool,
     pending: Vec<u8>,
 }
@@ -1825,6 +1870,9 @@ impl IlbmMuxer {
             width,
             height,
             compression: Compression::Auto,
+            mode: MuxerMode::IndexedAuto,
+            masking: Masking::None,
+            transparent_color: 0,
             written: false,
             pending: Vec::new(),
         })
@@ -1836,6 +1884,38 @@ impl IlbmMuxer {
         self.compression = c;
         self
     }
+
+    /// Choose the encoder mode (default: indexed planar).
+    pub fn with_mode(mut self, m: MuxerMode) -> Self {
+        self.mode = m;
+        self
+    }
+
+    /// Configure how alpha / transparency is encoded into the BODY.
+    /// `Masking::HasMask` writes an extra bit-plane per row;
+    /// `Masking::HasTransparentColor` reserves a palette index keyed
+    /// by `transparent_color` for fully-transparent pixels.
+    /// Has no effect in [`MuxerMode::Pbm`] (chunky variant doesn't
+    /// support a mask plane).
+    pub fn with_masking(mut self, masking: Masking, transparent_color: u16) -> Self {
+        self.masking = masking;
+        self.transparent_color = transparent_color;
+        self
+    }
+}
+
+/// Build an RGBA→indexed quantiser keyed by exact RGB equality first,
+/// then by nearest-neighbour squared-distance. Used by HAM/EHB/PBM
+/// muxer paths where the palette size cap is prescribed (16/64/32/256).
+fn build_palette_capped(rgba: &[u8], cap: usize) -> Vec<[u8; 3]> {
+    let mut palette: Vec<[u8; 3]> = Vec::new();
+    for px in rgba.chunks_exact(4) {
+        let triple = [px[0], px[1], px[2]];
+        if !palette.contains(&triple) && palette.len() < cap {
+            palette.push(triple);
+        }
+    }
+    palette
 }
 
 /// Build a ≤256-entry palette by collecting unique RGB triples in the
@@ -1902,26 +1982,65 @@ impl Muxer for IlbmMuxer {
                 expected
             )));
         }
-        let (palette, _idx) = build_palette(&self.pending);
-        // Pick the smallest plane count that covers the palette.
-        let n_planes = if palette.len() <= 1 {
-            1
-        } else {
-            let bits = (palette.len() as u32 - 1)
-                .next_power_of_two()
-                .trailing_zeros();
-            bits.max(1) as u8
+
+        // Plane count, palette, CAMG flags + form type are mode-driven.
+        let (palette, n_planes, camg, form_type) = match self.mode {
+            MuxerMode::IndexedAuto => {
+                let (pal, _) = build_palette(&self.pending);
+                let np = if pal.len() <= 1 {
+                    1
+                } else {
+                    let bits = (pal.len() as u32 - 1).next_power_of_two().trailing_zeros();
+                    bits.max(1) as u8
+                };
+                (pal, np, Camg::default(), *b"ILBM")
+            }
+            MuxerMode::Ham6 => {
+                // HAM6: 6 bitplanes, palette serves the op-0b00 lookup
+                // (16 entries max for the 4-bit value field).
+                let pal = build_palette_capped(&self.pending, 16);
+                (pal, 6u8, Camg { raw: CAMG_HAM }, *b"ILBM")
+            }
+            MuxerMode::Ham8 => {
+                // HAM8: 8 bitplanes, up to 64 palette entries.
+                let pal = build_palette_capped(&self.pending, 64);
+                (pal, 8u8, Camg { raw: CAMG_HAM }, *b"ILBM")
+            }
+            MuxerMode::Ehb => {
+                // EHB: 32-entry palette mirrored to 64 by halving;
+                // 6 bitplanes total.
+                let pal = build_palette_capped(&self.pending, 32);
+                (pal, 6u8, Camg { raw: CAMG_EHB }, *b"ILBM")
+            }
+            MuxerMode::Pbm => {
+                let pal = build_palette_capped(&self.pending, 256);
+                // PBM mandates 8 bits per pixel; n_planes = 8 even
+                // when the palette is smaller, since the BODY is one
+                // byte per pixel.
+                (pal, 8u8, Camg::default(), *b"PBM ")
+            }
         };
+
+        if palette.is_empty() {
+            return Err(Error::invalid("ILBM muxer: empty input palette"));
+        }
+        // PBM disallows HasMask plane (no bitplane interleave).
+        let masking = if self.mode == MuxerMode::Pbm && self.masking == Masking::HasMask {
+            Masking::None
+        } else {
+            self.masking
+        };
+
         let bmhd = Bmhd {
             width: self.width as u16,
             height: self.height as u16,
             x_origin: 0,
             y_origin: 0,
             n_planes,
-            masking: Masking::None,
+            masking,
             compression: self.compression,
             pad: 0,
-            transparent_color: 0,
+            transparent_color: self.transparent_color,
             x_aspect: 1,
             y_aspect: 1,
             page_width: self.width as i16,
@@ -1932,7 +2051,8 @@ impl Muxer for IlbmMuxer {
             height: self.height,
             bmhd,
             palette,
-            camg: Camg::default(),
+            camg,
+            form_type,
             rgba: std::mem::take(&mut self.pending),
             ..IlbmImage::default()
         };

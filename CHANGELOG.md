@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ilbm` round-4 features:
+  - **`IlbmMuxer::with_mode`** — new `MuxerMode` enum
+    (`IndexedAuto` / `Ham6` / `Ham8` / `Ehb` / `Pbm`) lets callers
+    request any of the five encoder modes through the streaming
+    container API. Previously only indexed planar was reachable;
+    HAM/EHB/PBM were `encode_ilbm`-only. The muxer auto-builds the
+    correct CAMG flags + plane count + palette cap (16 / 64 / 32 /
+    256) for each mode and rejects illegal combinations (e.g. PBM
+    with `HasMask` plane).
+  - **`IlbmMuxer::with_masking`** — set `Masking::HasMask` or
+    `Masking::HasTransparentColor` plus the keyed transparent index
+    on muxer-side encodes.
+  - **Indexed + PBM `HasTransparentColor` encode path** — when
+    `bmhd.masking == HasTransparentColor` and a source pixel's
+    alpha is `< 0x80`, the encoder writes `bmhd.transparent_color`
+    directly instead of nearest-palette-matching the source RGB,
+    so the decoder produces alpha-0 for those indices on read.
+  - 13 new tests in `tests/ilbm_round4.rs`: 5 mux-mode round-trips
+    (HAM6 grey, HAM8 grey, HAM6 colour gradient, EHB exact, PBM
+    lossless uncompressed and ByteRun1), explicit HasMask +
+    HasTransparentColor encoder round-trips, PBM RLE-vs-raw
+    byte-savings, mode-emits-CAMG sanity, and three optional
+    ImageMagick `magick convert` cross-decode tests (indexed + HAM6
+    + PBM, gated by `OXIDEAV_IFF_MAGICK_CROSS=1`, silent skip when
+    the binary or its `ilbmtoppm` delegate is unavailable). Indexed
+    ByteRun1 and PBM cross-decoded pixels are bit-exact against
+    `magick`'s output; HAM6 only checks dimensions agree.
+
 - `ilbm` round-3 features:
   - **`Compression::Auto`** — encoder-only variant. `encode_ilbm` tries
     both uncompressed and ByteRun1 BODY for each image and emits the
