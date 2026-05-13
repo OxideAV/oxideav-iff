@@ -40,10 +40,17 @@ Full read and write support for `FORM / 8SVX`:
 | Mono (no `CHAN` chunk, or `CHAN = 2`)    |  Y   |   Y   |
 | Stereo (`CHAN = 6`, concatenated halves) |  Y   |   Y   |
 | `NAME` / `AUTH` / `ANNO` / `(c) ` / `CHRS` tags | Y | Y |
+| Sample-exact seek (`Demuxer::seek_to`)    |  Y   |  —   |
 
 - The exposed codec id is `pcm_s8`; Fibonacci-delta compression is
   transparent — decoded on demux, encoded on mux when the caller picks
   `Compression::Fibonacci`.
+- `seek_to(0, pts)` is sample-exact: 8SVX is keyframe-only PCM and the
+  whole BODY is expanded into a flat interleaved frame buffer on
+  `open()`, so seek is a constant-time cursor reset. Out-of-range
+  targets clamp to `[0, total_frames]`. Works uniformly across raw and
+  Fibonacci-delta bodies because the cursor indexes the decoded
+  buffer, not compressed bytes.
 - Stereo BODY layout follows the common AmigaOS convention: the LEFT
   channel in full, then the RIGHT channel in full. For Fibonacci
   stereo each half carries its own `[pad, initial_sample, nibbles...]`

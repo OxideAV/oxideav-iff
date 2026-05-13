@@ -510,6 +510,33 @@ impl Demuxer for SvxDemuxer {
         Ok(pkt)
     }
 
+    /// Seek to the per-channel frame at `pts`. 8SVX is keyframe-only
+    /// PCM (raw `pcm_s8` after Fibonacci decompression on open), so the
+    /// returned pts equals `pts.clamp(0, total_frames)` — no keyframe
+    /// quantisation, no decode reset needed. The whole BODY was already
+    /// expanded into an interleaved frame buffer at open-time, so the
+    /// seek is a pure cursor reset: `cursor = target * channels`. The
+    /// next packet's `pts` will equal the returned value.
+    fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        if stream_index != 0 {
+            return Err(Error::invalid(format!(
+                "8SVX: stream index {stream_index} out of range"
+            )));
+        }
+        let bytes_per_frame = self.channels as usize;
+        // `decoded` is interleaved frames of `pcm_s8` (1 byte/sample),
+        // so total_frames = decoded.len() / channels.
+        let total_frames = (self.decoded.len() / bytes_per_frame) as i64;
+        let target = pts.max(0).min(total_frames);
+        let new_cursor = (target as usize)
+            .checked_mul(bytes_per_frame)
+            .ok_or_else(|| Error::invalid("8SVX seek: cursor overflow"))?;
+        debug_assert!(new_cursor <= self.decoded.len());
+        self.cursor = new_cursor;
+        self.frames_emitted = target;
+        Ok(target)
+    }
+
     fn metadata(&self) -> &[(String, String)] {
         &self.metadata
     }

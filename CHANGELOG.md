@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `SvxDemuxer::seek_to(stream_index, pts)` — sample-exact seek across
+  `FORM / 8SVX` bodies. 8SVX is keyframe-only `pcm_s8` (Fibonacci-delta
+  is decompressed at `open()`), so seek is a constant-time cursor
+  reset over the in-memory interleaved frame buffer; the returned pts
+  equals `pts.clamp(0, total_frames)` with no keyframe quantisation.
+  Works uniformly across raw and Fibonacci-compressed bodies.
+  Integration tests in `tests/seek.rs` cover seek-to-zero, half-second
+  exact landing, past-EOF clamping, invalid stream index, and seek
+  through a Fibonacci body against the demuxer-decoded reference.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-iff/compare/v0.0.6...v0.0.7) - 2026-05-07
 
 ### Other
