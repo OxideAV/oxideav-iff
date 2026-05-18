@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `anim::encode_anim_op5(frames)` and `anim::encode_op5_body(prev,
+  cur, bmhd)` — ANIM op-5 (Byte Vertical Delta) encoder. Walks each
+  plane's columns top-to-bottom; emits skip ops (1..=0x7F rows
+  unchanged), repeat ops (`0x80, cnt, v` for 3..=0xFF same bytes), or
+  literal ops (`0x80 | cnt`, then `cnt` bytes for 1..=0x7F differing
+  bytes), splitting at run-length caps. Pointer table populates only
+  the plane slots that actually carry deltas; identical frames yield
+  a 32-byte BODY (just the empty table). Tested in
+  `tests/anim_op5_encode.rs` (10 tests): identical-frame trivial
+  case, sparse 4×4-corner delta round-trip, sparse-delta byte-count
+  beats op-0 by ≥ 20 % on 64×64, long skip-run (300 rows) crosses
+  the 0x7F cap correctly, long repeat-run (300 rows) crosses the
+  0xFF cap correctly, 2-bitplane indexed round-trip, 4-frame
+  bouncing-dot sequence pixel-exact, `encode_op5_body` pointer-table
+  has slot 0 = 32 + slots 1..=7 = 0 when only plane 0 dirty,
+  `encode_op5_body` rejects > 8 colour planes with `Unsupported`.
+
 - `SvxDemuxer::seek_to(stream_index, pts)` — sample-exact seek across
   `FORM / 8SVX` bodies. 8SVX is keyframe-only `pcm_s8` (Fibonacci-delta
   is decompressed at `open()`), so seek is a constant-time cursor

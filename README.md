@@ -184,23 +184,27 @@ not legal in PBM and are rejected on encode/decode.
 
 ### ANIM — animated ILBM
 
-Read-only support for `FORM / ANIM` (Aegis Animator / DPaint III):
+Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
 
 | Feature                                  | Read | Write |
 |------------------------------------------|:----:|:-----:|
 | `ANHD` Animation Header (40 bytes)       |  Y   |   Y   |
 | Op 0 — full literal BODY                 |  Y   |   Y   |
-| Op 5 — Byte Vertical Delta (DPaint III)  |  Y   |   N   |
+| Op 5 — Byte Vertical Delta (DPaint III)  |  Y   |   Y   |
 | Op 7 / 8 — short / long vertical deltas  |  N   |   N   |
 
 - Public API: [`anim::parse_anim`], [`anim::encode_anim_op0`],
+  [`anim::encode_anim_op5`], [`anim::encode_op5_body`],
   [`anim::AnimImage`], [`anim::Anhd`].
 - Container id: `"iff_anim"`, probes `FORM....ANIM` and matches
   `.anim` by extension. Multi-frame `rawvideo` / `Rgba` stream;
   every frame is emitted as a keyframe packet.
-- The op-0 muxer is used by the test suite to round-trip multi-frame
-  ANIM through the public encoder; production-quality op-5 encode is
-  not yet implemented.
+- Op-0 (full literal BODY) and op-5 (Byte Vertical Delta) round-trip
+  through the public encoder. Op-5 emits the canonical
+  pointer-table + per-plane column op-stream: each column's run-
+  length encoder picks repeat (3 bytes) for runs ≥ 3 same bytes and
+  literal (1 + cnt bytes) otherwise; skip-runs (≤ 0x7F) and
+  repeat-runs (≤ 0xFF) split on cap.
 
 #### Read an ILBM picture
 
@@ -215,9 +219,9 @@ println!("{}x{} → {} bytes RGBA", img.width, img.height, img.rgba.len());
 
 The chunk walker (`chunk.rs`) is format-agnostic; AIFF (Apple audio),
 SMUS (music score) and MAUD are natural follow-ons that reuse the
-same FORM/LIST/CAT reader. ANIM op-5 encode and ANIM op-7/op-8
-decode are open ILBM-side extensions, as are CRNG / CCRT colour-
-cycling chunks.
+same FORM/LIST/CAT reader. ANIM op-7/op-8 (short / long vertical
+delta) decode are open ILBM-side extensions, as are CRNG / CCRT
+colour-cycling chunks.
 
 ## License
 

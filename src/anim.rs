@@ -668,13 +668,300 @@ fn apply_op5(planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -> Result<()> {
     Ok(())
 }
 
+/// Encode a single op-5 (Byte Vertical Delta) BODY payload from a
+/// previous and current planar frame.
+///
+/// `prev_planar` and `cur_planar` are the row-major flat arrays of
+/// bitplane rows in IFF order (`planes_per_row = n_planes + mask_plane`),
+/// each row being `row_bytes` long, in the same shape used by the
+/// decoder ([`apply_op5`]). They must agree in dimensions and in the
+/// number of stored colour planes.
+///
+/// The output is the bytes of the `BODY` chunk: a 32-byte pointer
+/// table (8 × u32 BE) followed by per-plane data lists. Plane slots
+/// that aren't dirty get a `0` pointer. Per the in-tree decoder
+/// description, each data list walks columns 0..`row_bytes`
+/// left-to-right; each column is a sequence of ops walking rows
+/// top-to-bottom, where:
+///
+/// * `op = 0` — column terminator;
+/// * `op in 1..=0x7F` — skip `op` rows (cursor += op);
+/// * `op = 0x80` — next byte = `cnt`, next byte = `v`; write `v` to
+///   the next `cnt` rows (cursor += cnt);
+/// * `op in 0x81..=0xFF` — literal: low 7 bits = `cnt`, then `cnt`
+///   bytes written one-per-row (cursor += cnt).
+///
+/// The encoder walks each plane column-by-column, emitting one of
+/// (skip, repeat, literal) for each delta run; the chosen op for a
+/// run minimises the byte cost (`repeat` = 3 bytes, `literal` = 1 +
+/// `cnt` bytes). Run-length is capped at 127 for literals (short op
+/// space) and 255 for repeats (`cnt` is a u8); longer runs split.
+///
+/// Used by [`encode_anim_op5`] but exposed publicly so callers driving
+/// the lower-level container can build their own ANIM5 streams.
+pub fn encode_op5_body(
+    prev_planar: &[Vec<u8>],
+    cur_planar: &[Vec<u8>],
+    bmhd: &Bmhd,
+) -> Result<Vec<u8>> {
+    let n_planes = bmhd.n_planes as usize;
+    let has_mask = bmhd.masking == Masking::HasMask;
+    let planes_per_row = n_planes + has_mask as usize;
+    let row_bytes = bmhd.row_bytes();
+    let height = bmhd.height as usize;
+    let expected = height * planes_per_row;
+    if prev_planar.len() != expected || cur_planar.len() != expected {
+        return Err(Error::invalid(format!(
+            "ANIM op 5 encode: planar buffers have {} / {} rows, expected {expected}",
+            prev_planar.len(),
+            cur_planar.len()
+        )));
+    }
+    if n_planes > 8 {
+        // op-5 pointer table is 8 slots (one u32 per colour plane);
+        // formats with > 8 planes can't address every plane via op-5
+        // and must use op-7/op-8 (short / long vertical delta).
+        return Err(Error::unsupported(format!(
+            "ANIM op 5 encode: requires ≤ 8 colour planes (got {n_planes})"
+        )));
+    }
+
+    // Build the per-plane data lists.
+    let mut plane_data: Vec<Vec<u8>> = vec![Vec::new(); 8];
+    let mut plane_dirty = [false; 8];
+    for p in 0..n_planes {
+        let mut list = Vec::new();
+        let mut any_change = false;
+        for col in 0..row_bytes {
+            encode_op5_column(
+                &mut list,
+                prev_planar,
+                cur_planar,
+                p,
+                col,
+                planes_per_row,
+                row_bytes,
+                height,
+                &mut any_change,
+            );
+            // Terminator: cap each column's op-stream with 0x00.
+            list.push(0);
+        }
+        if any_change {
+            plane_data[p] = list;
+            plane_dirty[p] = true;
+        }
+    }
+
+    // Assemble: 32-byte pointer table + concatenated data lists.
+    // Plane pointers are absolute offsets from the start of the BODY.
+    let mut out = vec![0u8; 32];
+    for (slot, data) in plane_data.iter_mut().enumerate().take(8) {
+        if !plane_dirty[slot] {
+            continue;
+        }
+        let offset = out.len() as u32;
+        out[slot * 4..slot * 4 + 4].copy_from_slice(&offset.to_be_bytes());
+        out.append(data);
+    }
+    Ok(out)
+}
+
+/// Walk a single column of plane `p`, emitting skip / repeat / literal
+/// ops into `out`. Updates `any_change` if at least one delta byte
+/// differs in this column.
+#[allow(clippy::too_many_arguments)]
+fn encode_op5_column(
+    out: &mut Vec<u8>,
+    prev: &[Vec<u8>],
+    cur: &[Vec<u8>],
+    plane: usize,
+    col: usize,
+    planes_per_row: usize,
+    _row_bytes: usize,
+    height: usize,
+    any_change: &mut bool,
+) {
+    // Build the byte-vertical column values for prev / cur, then walk
+    // the column row-by-row. Each row contributes one delta byte.
+    let mut row = 0usize;
+    while row < height {
+        let prev_byte = prev[row * planes_per_row + plane][col];
+        let cur_byte = cur[row * planes_per_row + plane][col];
+        if prev_byte == cur_byte {
+            // Count contiguous unchanged rows starting at `row`.
+            let mut skip = 0usize;
+            while row + skip < height {
+                let pb = prev[(row + skip) * planes_per_row + plane][col];
+                let cb = cur[(row + skip) * planes_per_row + plane][col];
+                if pb != cb {
+                    break;
+                }
+                skip += 1;
+            }
+            // Skip runs are u7 (op space 1..=0x7F); split if longer.
+            let mut remaining = skip;
+            while remaining > 0 {
+                let chunk = remaining.min(0x7F);
+                out.push(chunk as u8);
+                remaining -= chunk;
+            }
+            row += skip;
+        } else {
+            // Find the contiguous changed run starting at `row`.
+            let mut end = row + 1;
+            while end < height {
+                let pb = prev[end * planes_per_row + plane][col];
+                let cb = cur[end * planes_per_row + plane][col];
+                if pb == cb {
+                    break;
+                }
+                end += 1;
+            }
+            // Emit the run by picking repeat vs literal greedily,
+            // splitting at run-length caps.
+            let mut i = row;
+            while i < end {
+                // Look for a maximal repeat of the same byte at i.
+                let v = cur[i * planes_per_row + plane][col];
+                let mut rep_end = i + 1;
+                while rep_end < end
+                    && cur[rep_end * planes_per_row + plane][col] == v
+                    && rep_end - i < 0xFF
+                {
+                    rep_end += 1;
+                }
+                let rep_len = rep_end - i;
+                // Repeat costs 3 bytes (0x80, cnt, v); literal of length
+                // L costs 1 + L bytes. Use repeat only if it's cheaper
+                // *and* legal: rep_len ≥ 3 makes 3 ≤ 1 + L = 1 + rep_len,
+                // i.e. rep_len ≥ 2 means literal is 1+2=3 — same cost,
+                // prefer literal. rep_len ≥ 3 means repeat is strictly
+                // cheaper.
+                if rep_len >= 3 {
+                    out.push(0x80);
+                    out.push(rep_len as u8);
+                    out.push(v);
+                    i = rep_end;
+                } else {
+                    // Literal run: extend until we hit a usable repeat
+                    // (≥ 3 same bytes ahead) or the end of the changed
+                    // run, capped at 0x7F bytes.
+                    let lit_start = i;
+                    let mut lit_end = i + 1;
+                    while lit_end < end && lit_end - lit_start < 0x7F {
+                        // Peek ahead for a 3-run starting at lit_end.
+                        let lv = cur[lit_end * planes_per_row + plane][col];
+                        let l1 = lit_end + 1 < end
+                            && cur[(lit_end + 1) * planes_per_row + plane][col] == lv;
+                        let l2 = lit_end + 2 < end
+                            && cur[(lit_end + 2) * planes_per_row + plane][col] == lv;
+                        if l1 && l2 {
+                            // Switch to repeat at lit_end; close literal here.
+                            break;
+                        }
+                        lit_end += 1;
+                    }
+                    let lit_len = lit_end - lit_start;
+                    debug_assert!((1..=0x7F).contains(&lit_len));
+                    out.push(0x80 | lit_len as u8);
+                    for r in lit_start..lit_end {
+                        out.push(cur[r * planes_per_row + plane][col]);
+                    }
+                    i = lit_end;
+                }
+            }
+            *any_change = true;
+            row = end;
+        }
+    }
+}
+
+/// Encode a sequence of ILBM frames as a FORM/ANIM file using
+/// `operation = 5` (Byte Vertical Delta) for every delta frame.
+///
+/// The seed frame is the full leading FORM ILBM (same as
+/// [`encode_anim_op0`]); subsequent frames carry an `ANHD` (op = 5)
+/// plus a `BODY` chunk produced by [`encode_op5_body`] from the diff
+/// between the prior and current planar frames. The encoder
+/// reconstructs the planar form via [`rgba_to_planar`] which uses a
+/// palette nearest-fit; HAM frames therefore round-trip pixel-exactly
+/// only when each pixel is already a palette colour. Indexed and EHB
+/// modes round-trip losslessly.
+///
+/// Compatible with the in-tree [`parse_anim`] op-5 decoder; tested via
+/// `tests/anim_op5.rs`.
+pub fn encode_anim_op5(frames: &[IlbmImage]) -> Result<Vec<u8>> {
+    if frames.is_empty() {
+        return Err(Error::invalid(
+            "ANIM op 5 encode: at least one frame required",
+        ));
+    }
+    if frames[0].bmhd.n_planes > 8 {
+        return Err(Error::unsupported(format!(
+            "ANIM op 5 encode: requires ≤ 8 colour planes (got {})",
+            frames[0].bmhd.n_planes
+        )));
+    }
+    let leading = crate::ilbm::encode_ilbm(&frames[0])?;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"FORM");
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(b"ANIM");
+    out.extend_from_slice(&leading);
+    if leading.len() & 1 == 1 {
+        out.push(0);
+    }
+
+    // Track the running planar state. Reconstruct it from the seed
+    // frame's RGBA the same way the decoder does.
+    let mut prev_planar = rgba_to_planar(&frames[0]);
+
+    for frame in &frames[1..] {
+        let cur_planar = rgba_to_planar(frame);
+        let body = encode_op5_body(&prev_planar, &cur_planar, &frame.bmhd)?;
+        let anhd = Anhd {
+            operation: 5,
+            mask: 0,
+            w: frame.bmhd.width,
+            h: frame.bmhd.height,
+            x: frame.bmhd.x_origin,
+            y: frame.bmhd.y_origin,
+            abs_time: 0,
+            rel_time: 1,
+            interleave: 0,
+            pad0: 0,
+            bits: 0,
+        };
+        let anhd_bytes = anhd.write(body.len() as u32);
+        let inner_size = (4 + 8 + 40 + 8 + body.len()) as u32;
+        out.extend_from_slice(b"FORM");
+        out.extend_from_slice(&inner_size.to_be_bytes());
+        out.extend_from_slice(b"ILBM");
+        out.extend_from_slice(b"ANHD");
+        out.extend_from_slice(&40u32.to_be_bytes());
+        out.extend_from_slice(&anhd_bytes);
+        out.extend_from_slice(b"BODY");
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        if body.len() & 1 == 1 {
+            out.push(0);
+        }
+        prev_planar = cur_planar;
+    }
+
+    let form_size = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&form_size.to_be_bytes());
+    Ok(out)
+}
+
 /// Encode a sequence of ILBM frames as a FORM/ANIM file using
 /// `operation = 0` (literal full BODY) for every delta frame. This is
 /// the simplest legal ANIM the spec allows; players (DPaint III etc.)
 /// must handle op 0 since it's the fallback.
 ///
 /// Use this for round-tripping in tests; production-quality ANIM5
-/// encode (op-5 byte-vertical delta) is deferred to a later round.
+/// encode (op-5 byte-vertical delta) lives in [`encode_anim_op5`].
 pub fn encode_anim_op0(frames: &[IlbmImage]) -> Result<Vec<u8>> {
     if frames.is_empty() {
         return Err(Error::invalid("ANIM encode: at least one frame required"));
