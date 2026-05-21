@@ -714,6 +714,193 @@ impl Ccrt {
     }
 }
 
+// ───────────────────── DRNG (DPaint IV Extended Range Cycling) ─────────────────────
+
+/// A true-colour cell inside a [`Drng`] descriptor: at the given
+/// palette-index `cell` the cycling sequence inserts the explicit RGB
+/// triple `(r, g, b)` rather than re-using the current `CMAP` entry.
+///
+/// Per the public DeluxePaint IV manual / EA IFF 85 supplement, true-
+/// colour cells let an extended range cycle through colours that have
+/// no permanent home in the 32-entry palette.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DrngTrueCell {
+    pub cell: u8,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+/// A palette-register cell inside a [`Drng`] descriptor: at the given
+/// `cell` slot the cycle uses the current contents of `CMAP[index]`
+/// (i.e. follows that palette register's live value, rather than a
+/// frozen RGB triple).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DrngRegCell {
+    pub cell: u8,
+    pub index: u8,
+}
+
+/// `DRNG` — DeluxePaint IV Extended Range Cycling. A super-set of
+/// [`Crng`] that lets the cycling range insert *true-colour* RGB
+/// samples and/or *follow* live palette registers at arbitrary
+/// positions inside the `[min, max]` index window.
+///
+/// Layout (variable-length, per the public EA IFF 85 DPaint IV
+/// supplement / DeluxePaint IV manual):
+///
+/// ```text
+/// u8  min          (low palette index of the cycle, inclusive)
+/// u8  max          (high palette index of the cycle, inclusive)
+/// i16 rate         (palette-rotation rate; one step every
+///                   16384 / rate vertical-blank ticks at 60 Hz)
+/// i16 flags        (bit 0 = active, bit 2 = DP_RGB    (has true cells),
+///                                  bit 3 = DP_REGS   (has register cells))
+/// u8  ntrue        (number of DrngTrueCell entries that follow)
+/// u8  nregs        (number of DrngRegCell  entries that follow)
+/// DrngTrueCell × ntrue        (each 4 bytes: cell, r, g, b)
+/// DrngRegCell  × nregs        (each 2 bytes: cell, index)
+/// ```
+///
+/// The chunk is therefore `8 + 4*ntrue + 2*nregs` bytes; the parser
+/// validates that the payload length matches `ntrue` / `nregs`.
+///
+/// As with [`Crng`] and [`Ccrt`], this crate does *not* animate; the
+/// cycle descriptor is preserved verbatim so consumers can render
+/// their own palette walks against `image.palette`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Drng {
+    pub min: u8,
+    pub max: u8,
+    pub rate: i16,
+    pub flags: i16,
+    pub trues: Vec<DrngTrueCell>,
+    pub regs: Vec<DrngRegCell>,
+}
+
+impl Drng {
+    /// DRNG flag bit: range is active (cycling enabled).
+    pub const FLAG_ACTIVE: i16 = 0x0001;
+    /// DRNG flag bit: range carries true-colour `DrngTrueCell` entries.
+    pub const FLAG_DP_RGB: i16 = 0x0004;
+    /// DRNG flag bit: range carries palette-register `DrngRegCell`
+    /// entries.
+    pub const FLAG_DP_REGS: i16 = 0x0008;
+
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 8 {
+            return Err(Error::invalid(format!(
+                "ILBM DRNG: need 8-byte header, got {}",
+                body.len()
+            )));
+        }
+        let min = body[0];
+        let max = body[1];
+        let rate = i16::from_be_bytes([body[2], body[3]]);
+        let flags = i16::from_be_bytes([body[4], body[5]]);
+        let ntrue = body[6] as usize;
+        let nregs = body[7] as usize;
+        let need = 8 + 4 * ntrue + 2 * nregs;
+        if body.len() < need {
+            return Err(Error::invalid(format!(
+                "ILBM DRNG: need {need} bytes for ntrue={ntrue} nregs={nregs}, got {}",
+                body.len()
+            )));
+        }
+        let mut trues = Vec::with_capacity(ntrue);
+        let mut cursor = 8;
+        for _ in 0..ntrue {
+            trues.push(DrngTrueCell {
+                cell: body[cursor],
+                r: body[cursor + 1],
+                g: body[cursor + 2],
+                b: body[cursor + 3],
+            });
+            cursor += 4;
+        }
+        let mut regs = Vec::with_capacity(nregs);
+        for _ in 0..nregs {
+            regs.push(DrngRegCell {
+                cell: body[cursor],
+                index: body[cursor + 1],
+            });
+            cursor += 2;
+        }
+        Ok(Self {
+            min,
+            max,
+            rate,
+            flags,
+            trues,
+            regs,
+        })
+    }
+
+    /// Serialise this `DRNG` into its on-disk byte form (no chunk
+    /// header — just the payload).
+    pub fn write(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 4 * self.trues.len() + 2 * self.regs.len());
+        out.push(self.min);
+        out.push(self.max);
+        out.extend_from_slice(&self.rate.to_be_bytes());
+        out.extend_from_slice(&self.flags.to_be_bytes());
+        // ntrue / nregs are u8 — DPaint IV manual caps each list at 255
+        // entries (a 6-bit cell index can address at most 64 slots in
+        // practice).  Clamp defensively rather than truncate.
+        out.push(self.trues.len().min(u8::MAX as usize) as u8);
+        out.push(self.regs.len().min(u8::MAX as usize) as u8);
+        for c in &self.trues {
+            out.push(c.cell);
+            out.push(c.r);
+            out.push(c.g);
+            out.push(c.b);
+        }
+        for c in &self.regs {
+            out.push(c.cell);
+            out.push(c.index);
+        }
+        out
+    }
+
+    /// True if the cycling range is enabled (`flags & FLAG_ACTIVE`).
+    pub fn is_active(&self) -> bool {
+        self.flags & Self::FLAG_ACTIVE != 0
+    }
+
+    /// True if the descriptor advertises at least one `DrngTrueCell`.
+    /// Matches the `DP_RGB` flag bit but is also robust against
+    /// generators that set the flag without writing any cells (or
+    /// vice-versa).
+    pub fn has_true_cells(&self) -> bool {
+        !self.trues.is_empty() || (self.flags & Self::FLAG_DP_RGB != 0)
+    }
+
+    /// True if the descriptor advertises at least one `DrngRegCell`.
+    pub fn has_reg_cells(&self) -> bool {
+        !self.regs.is_empty() || (self.flags & Self::FLAG_DP_REGS != 0)
+    }
+
+    /// Cycle rate in steps per second on a 60 Hz vertical-blank tick
+    /// (mirrors [`Crng::cycles_per_second`]).
+    pub fn cycles_per_second(&self) -> f32 {
+        if self.rate <= 0 {
+            0.0
+        } else {
+            60.0 * (self.rate as f32) / 16384.0
+        }
+    }
+
+    /// Number of palette entries spanned by the cycle (inclusive of
+    /// both ends). Returns 0 if `min > max`.
+    pub fn range_len(&self) -> u16 {
+        if self.min > self.max {
+            0
+        } else {
+            (self.max - self.min) as u16 + 1
+        }
+    }
+}
+
 // ───────────────────── ByteRun1 (PackBits) ─────────────────────
 
 /// Decode one ByteRun1-compressed plane-row into `out`. Reads from
@@ -972,6 +1159,9 @@ pub struct IlbmImage {
     /// `CCRT` colour-range cycling descriptors (Graphicraft variant).
     /// Order is preserved so round-trip is byte-stable.
     pub ccrts: Vec<Ccrt>,
+    /// `DRNG` extended-range cycling descriptors (DeluxePaint IV).
+    /// Order is preserved so round-trip is byte-stable.
+    pub drngs: Vec<Drng>,
     /// Packed RGBA bytes, row-major, top-to-bottom, 4 bytes/pixel.
     pub rgba: Vec<u8>,
 }
@@ -1004,6 +1194,7 @@ impl Default for IlbmImage {
             pchg: None,
             crngs: Vec::new(),
             ccrts: Vec::new(),
+            drngs: Vec::new(),
             rgba: Vec::new(),
         }
     }
@@ -1045,6 +1236,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
     let mut pchg: Option<Pchg> = None;
     let mut crngs: Vec<Crng> = Vec::new();
     let mut ccrts: Vec<Ccrt> = Vec::new();
+    let mut drngs: Vec<Drng> = Vec::new();
 
     let mut cursor = 12usize;
     while cursor + 8 <= body_end {
@@ -1086,6 +1278,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
             b"PCHG" => pchg = Some(Pchg::parse(payload)?),
             b"CRNG" => crngs.push(Crng::parse(payload)?),
             b"CCRT" => ccrts.push(Ccrt::parse(payload)?),
+            b"DRNG" => drngs.push(Drng::parse(payload)?),
             _ => { /* skip unknown chunks (DPI, DPPS, AUTH, ...) */ }
         }
         let padded = size + (size & 1);
@@ -1180,6 +1373,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
             pchg,
             crngs,
             ccrts,
+            drngs,
             rgba,
         });
     }
@@ -1357,6 +1551,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
         pchg,
         crngs,
         ccrts,
+        drngs,
         rgba,
     })
 }
@@ -1491,6 +1686,21 @@ pub fn encode_ilbm(image: &IlbmImage) -> Result<Vec<u8>> {
         out.extend_from_slice(b"CCRT");
         out.extend_from_slice(&14u32.to_be_bytes());
         out.extend_from_slice(&c.write());
+    }
+
+    // DRNG (DPaint IV extended-range cycling — variable length:
+    // 8-byte header + 4*ntrue + 2*nregs cell bytes. With nregs odd the
+    // payload is odd-length and needs a pad byte). Emitted in
+    // `image.drngs` order so a parse → encode round-trip is byte-stable.
+    for d in &image.drngs {
+        let payload = d.write();
+        let sz = payload.len() as u32;
+        out.extend_from_slice(b"DRNG");
+        out.extend_from_slice(&sz.to_be_bytes());
+        out.extend_from_slice(&payload);
+        if sz & 1 == 1 {
+            out.push(0);
+        }
     }
 
     // BODY

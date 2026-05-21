@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ilbm::Drng` (DeluxePaint IV extended range cycling, variable-length
+  chunk: 8-byte header `min, max, rate, flags, ntrue, nregs` followed
+  by `ntrue` × `DrngTrueCell` (`cell, r, g, b`) and `nregs` ×
+  `DrngRegCell` (`cell, index`)). A super-set of `CRNG` that lets the
+  cycle window step through true-colour RGB samples and/or follow live
+  palette registers at arbitrary positions inside `[min, max]`.
+  `parse_ilbm` collects every `DRNG` chunk into `IlbmImage::drngs`
+  (order preserved); `encode_ilbm` re-emits them right after the
+  `CCRT` block so a parse → encode is byte-stable. Accessors:
+  `Drng::cycles_per_second()` (same `rate / 16384 × 60` Hz as `Crng`),
+  `Drng::is_active()`, `Drng::has_true_cells()` /
+  `Drng::has_reg_cells()` (honour both the cell list and the `DP_RGB`
+  / `DP_REGS` flag bits — robust against generators that set the flag
+  without writing any cells), `Drng::range_len()`. Cell-list lengths
+  are clamped to `u8::MAX` on encode; the parser rejects truncated
+  payloads and short headers (`< 8` bytes) rather than tolerating
+  malformed input. Tested in `tests/ilbm_drng.rs` (13 tests): empty
+  cell lists, true-cell-only, reg-cell-only, both lists together,
+  multi-chunk order preservation, byte-stable re-encode, accessor
+  corner cases (inactive, zero rate, inverted range, flag-without-
+  cells), short / truncated payload rejection, and a mixed
+  CRNG + CCRT + DRNG single-file round-trip.
+
 - `ilbm::Crng` (DeluxePaint colour-range cycling, 8-byte chunk:
   `pad1, rate, flags, low, high`) and `ilbm::Ccrt` (Commodore
   Graphicraft colour-cycling timing, 14-byte chunk: `direction,
