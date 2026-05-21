@@ -8,10 +8,10 @@ crate ships a full read/write implementation of FORM/8SVX, a
 read-and-round-trip implementation of FORM/ILBM and FORM/PBM (1..=8
 bitplanes, ByteRun1 / Auto compression, EHB, HAM6, HAM8, HasMask,
 transparent-colour keying, GRAB hotspot, SHAM per-line palette, PCHG
-small-format palette change list), and a read-only FORM/ANIM
-implementation (op-0 literal + op-5 byte-vertical delta). The shared
-chunk walker is reusable as AIFF / SMUS support is added. Zero C
-dependencies.
+small-format palette change list, CRNG / CCRT colour-cycling
+descriptors), and a read-only FORM/ANIM implementation (op-0 literal
++ op-5 byte-vertical delta). The shared chunk walker is reusable as
+AIFF / SMUS support is added. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -134,6 +134,8 @@ Read + round-trip support for `FORM / ILBM`:
 | `SHAM` Sliced HAM (per-line 16×RGB444)   |  Y   |   Y   |
 | `PCHG` palette change list (small fmt)   |  Y   |   Y   |
 | `PCHG` palette change list (big fmt)     |  Y   |   N*  |
+| `CRNG` DPaint colour-range cycling       |  Y   |   Y   |
+| `CCRT` Graphicraft colour-cycling timing |  Y   |   Y   |
 | `IlbmMuxer` mode select (HAM/EHB/PBM)    |  -   |   Y   |
 | Output pixel format                      | RGBA |  -    |
 
@@ -143,7 +145,8 @@ list).
 
 - Public API: [`ilbm::parse_ilbm`], [`ilbm::encode_ilbm`],
   [`ilbm::IlbmImage`], [`ilbm::Bmhd`], [`ilbm::Camg`],
-  [`ilbm::Grab`], [`ilbm::Sham`], [`ilbm::Pchg`],
+  [`ilbm::Grab`], [`ilbm::Sham`], [`ilbm::Pchg`], [`ilbm::Crng`],
+  [`ilbm::Ccrt`],
   [`ilbm::byterun1_decode_row`] / [`ilbm::byterun1_encode_row`],
   [`ilbm::expand_ham_row`], [`ilbm::expand_ehb_palette`],
   [`ilbm::IlbmMuxer`] (with [`ilbm::MuxerMode`] selecting indexed /
@@ -215,13 +218,25 @@ println!("{}x{} → {} bytes RGBA", img.width, img.height, img.rgba.len());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+- `CRNG` (DeluxePaint colour-range cycling) and `CCRT` (Graphicraft
+  colour-cycling timing) chunks are parsed and round-tripped
+  byte-stable. Each entry exposes accessors for the spec-documented
+  derived quantities — `Crng::cycles_per_second()` (rate / 16384 × 60
+  Hz), `Crng::is_active()` / `Crng::is_reverse()`, `Crng::range_len()`;
+  `Ccrt::delay_seconds()`, `Ccrt::is_active()` / `Ccrt::is_reverse()`,
+  `Ccrt::range_len()`. Multiple `CRNG` / `CCRT` chunks per file are
+  preserved in document order so a parse → encode produces the same
+  byte stream. The crate does not animate; consumers wanting a
+  rotated palette walk `image.crngs` / `image.ccrts` themselves.
+
 ## Roadmap
 
 The chunk walker (`chunk.rs`) is format-agnostic; AIFF (Apple audio),
 SMUS (music score) and MAUD are natural follow-ons that reuse the
 same FORM/LIST/CAT reader. ANIM op-7/op-8 (short / long vertical
-delta) decode are open ILBM-side extensions, as are CRNG / CCRT
-colour-cycling chunks.
+delta) decode are open ILBM-side extensions; DEEP / TVPP / RGB8 / RGBN
+true-colour IFF chunks and `DRNG` (DPaint extended range cycling) are
+the next ILBM-side decode candidates.
 
 ## License
 

@@ -532,6 +532,188 @@ impl Pchg {
     }
 }
 
+// ───────────────────── CRNG (Color Range) ─────────────────────
+
+/// `CRNG` — DeluxePaint Color Range cycling chunk. A request that a
+/// closed range of palette indices be rotated at a given rate. Layout
+/// (8 bytes per the public EA IFF 85 supplement / DeluxePaint manual):
+///
+/// ```text
+/// i16 pad1   (reserved, written 0)
+/// i16 rate   (palette-rotation rate; one step every 16384/rate
+///             vertical-blank ticks at 60 Hz)
+/// i16 flags  (bit 0 = active, bit 1 = reverse)
+/// u8  low    (low end of cycling range, inclusive)
+/// u8  high   (high end of cycling range, inclusive)
+/// ```
+///
+/// An ILBM may carry many `CRNG` chunks (DeluxePaint allows up to 6).
+/// We preserve them in document order so a round-trip is byte-stable.
+/// We do not animate; consumers may inspect [`Crng::is_active`] and
+/// [`Crng::cycles_per_second`] to apply their own animation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Crng {
+    pub pad1: i16,
+    pub rate: i16,
+    pub flags: i16,
+    pub low: u8,
+    pub high: u8,
+}
+
+impl Crng {
+    /// CRNG flag bit: range is active (cycling enabled).
+    pub const FLAG_ACTIVE: i16 = 1;
+    /// CRNG flag bit: cycle direction reversed (high → low).
+    pub const FLAG_REVERSE: i16 = 2;
+
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 8 {
+            return Err(Error::invalid(format!(
+                "ILBM CRNG: need 8 bytes, got {}",
+                body.len()
+            )));
+        }
+        Ok(Self {
+            pad1: i16::from_be_bytes([body[0], body[1]]),
+            rate: i16::from_be_bytes([body[2], body[3]]),
+            flags: i16::from_be_bytes([body[4], body[5]]),
+            low: body[6],
+            high: body[7],
+        })
+    }
+
+    pub fn write(&self) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[0..2].copy_from_slice(&self.pad1.to_be_bytes());
+        out[2..4].copy_from_slice(&self.rate.to_be_bytes());
+        out[4..6].copy_from_slice(&self.flags.to_be_bytes());
+        out[6] = self.low;
+        out[7] = self.high;
+        out
+    }
+
+    /// True if the cycling range is enabled (`flags & FLAG_ACTIVE`).
+    pub fn is_active(&self) -> bool {
+        self.flags & Self::FLAG_ACTIVE != 0
+    }
+
+    /// True if the range cycles high → low (`flags & FLAG_REVERSE`).
+    pub fn is_reverse(&self) -> bool {
+        self.flags & Self::FLAG_REVERSE != 0
+    }
+
+    /// Cycle rate in steps per second on a 60 Hz vertical-blank tick.
+    /// Per the DeluxePaint manual one cycle step happens every
+    /// `16384 / rate` ticks; with `rate == 16384` that's once per
+    /// tick (~60 steps/s); `rate == 0` means disabled.
+    pub fn cycles_per_second(&self) -> f32 {
+        if self.rate <= 0 {
+            0.0
+        } else {
+            60.0 * (self.rate as f32) / 16384.0
+        }
+    }
+
+    /// Number of palette entries spanned by the cycle (inclusive of
+    /// both ends). Returns 0 if `low > high`.
+    pub fn range_len(&self) -> u16 {
+        if self.low > self.high {
+            0
+        } else {
+            (self.high - self.low) as u16 + 1
+        }
+    }
+}
+
+// ───────────────────── CCRT (Color Cycling Range and Timing) ─────────────────────
+
+/// `CCRT` — Commodore Graphicraft Color Cycling Range and Timing.
+/// The Amiga Graphicraft analogue of CRNG: same intent (rotate a
+/// palette range over time) with a longer / more explicit timing
+/// representation. Layout (14 bytes per the EA IFF 85 supplement):
+///
+/// ```text
+/// i16 direction (-1 = backwards, 0 = inactive, +1 = forwards)
+/// u8  start     (low palette index, inclusive)
+/// u8  end       (high palette index, inclusive)
+/// i32 seconds   (cycle delay seconds component)
+/// i32 micros    (cycle delay microseconds component, 0..1_000_000)
+/// i16 pad       (reserved, written 0)
+/// ```
+///
+/// `seconds + micros / 1_000_000` is the delay between one cycle step
+/// and the next.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ccrt {
+    pub direction: i16,
+    pub start: u8,
+    pub end: u8,
+    pub seconds: i32,
+    pub micros: i32,
+    pub pad: i16,
+}
+
+impl Ccrt {
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 14 {
+            return Err(Error::invalid(format!(
+                "ILBM CCRT: need 14 bytes, got {}",
+                body.len()
+            )));
+        }
+        Ok(Self {
+            direction: i16::from_be_bytes([body[0], body[1]]),
+            start: body[2],
+            end: body[3],
+            seconds: i32::from_be_bytes([body[4], body[5], body[6], body[7]]),
+            micros: i32::from_be_bytes([body[8], body[9], body[10], body[11]]),
+            pad: i16::from_be_bytes([body[12], body[13]]),
+        })
+    }
+
+    pub fn write(&self) -> [u8; 14] {
+        let mut out = [0u8; 14];
+        out[0..2].copy_from_slice(&self.direction.to_be_bytes());
+        out[2] = self.start;
+        out[3] = self.end;
+        out[4..8].copy_from_slice(&self.seconds.to_be_bytes());
+        out[8..12].copy_from_slice(&self.micros.to_be_bytes());
+        out[12..14].copy_from_slice(&self.pad.to_be_bytes());
+        out
+    }
+
+    /// True if `direction` is non-zero (cycling is active in either
+    /// direction).
+    pub fn is_active(&self) -> bool {
+        self.direction != 0
+    }
+
+    /// True if direction is negative (high → low).
+    pub fn is_reverse(&self) -> bool {
+        self.direction < 0
+    }
+
+    /// Cycle delay expressed as a single float in seconds. Returns
+    /// 0.0 for negative inputs (treated as malformed).
+    pub fn delay_seconds(&self) -> f64 {
+        if self.seconds < 0 || self.micros < 0 {
+            0.0
+        } else {
+            self.seconds as f64 + self.micros as f64 / 1_000_000.0
+        }
+    }
+
+    /// Number of palette entries spanned by the cycle (inclusive of
+    /// both ends). Returns 0 if `start > end`.
+    pub fn range_len(&self) -> u16 {
+        if self.start > self.end {
+            0
+        } else {
+            (self.end - self.start) as u16 + 1
+        }
+    }
+}
+
 // ───────────────────── ByteRun1 (PackBits) ─────────────────────
 
 /// Decode one ByteRun1-compressed plane-row into `out`. Reads from
@@ -784,6 +966,12 @@ pub struct IlbmImage {
     pub sham: Option<Sham>,
     /// Optional `PCHG` palette-change list (per-line CMAP overrides).
     pub pchg: Option<Pchg>,
+    /// `CRNG` colour-range cycling descriptors (DeluxePaint). Order
+    /// is preserved so round-trip is byte-stable.
+    pub crngs: Vec<Crng>,
+    /// `CCRT` colour-range cycling descriptors (Graphicraft variant).
+    /// Order is preserved so round-trip is byte-stable.
+    pub ccrts: Vec<Ccrt>,
     /// Packed RGBA bytes, row-major, top-to-bottom, 4 bytes/pixel.
     pub rgba: Vec<u8>,
 }
@@ -814,6 +1002,8 @@ impl Default for IlbmImage {
             grab: None,
             sham: None,
             pchg: None,
+            crngs: Vec::new(),
+            ccrts: Vec::new(),
             rgba: Vec::new(),
         }
     }
@@ -853,6 +1043,8 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
     let mut grab: Option<Grab> = None;
     let mut sham_raw: Option<Vec<u8>> = None;
     let mut pchg: Option<Pchg> = None;
+    let mut crngs: Vec<Crng> = Vec::new();
+    let mut ccrts: Vec<Ccrt> = Vec::new();
 
     let mut cursor = 12usize;
     while cursor + 8 <= body_end {
@@ -892,7 +1084,9 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
             b"GRAB" => grab = Some(Grab::parse(payload)?),
             b"SHAM" => sham_raw = Some(payload.to_vec()),
             b"PCHG" => pchg = Some(Pchg::parse(payload)?),
-            _ => { /* skip unknown chunks (CRNG, DPI, ...) */ }
+            b"CRNG" => crngs.push(Crng::parse(payload)?),
+            b"CCRT" => ccrts.push(Ccrt::parse(payload)?),
+            _ => { /* skip unknown chunks (DPI, DPPS, AUTH, ...) */ }
         }
         let padded = size + (size & 1);
         cursor = payload_start + padded;
@@ -984,6 +1178,8 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
             grab,
             sham,
             pchg,
+            crngs,
+            ccrts,
             rgba,
         });
     }
@@ -1159,6 +1355,8 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
         grab,
         sham,
         pchg,
+        crngs,
+        ccrts,
         rgba,
     })
 }
@@ -1275,6 +1473,24 @@ pub fn encode_ilbm(image: &IlbmImage) -> Result<Vec<u8>> {
         if sz & 1 == 1 {
             out.push(0);
         }
+    }
+
+    // CRNG (DeluxePaint colour-range cycling — 8 bytes each; even-
+    // sized so no pad byte). Emitted in `image.crngs` order so a
+    // parse → encode round-trip is byte-stable.
+    for c in &image.crngs {
+        out.extend_from_slice(b"CRNG");
+        out.extend_from_slice(&8u32.to_be_bytes());
+        out.extend_from_slice(&c.write());
+    }
+
+    // CCRT (Graphicraft colour-cycling timing — 14 bytes each; even-
+    // sized so no pad byte). Emitted in `image.ccrts` order so a
+    // parse → encode round-trip is byte-stable.
+    for c in &image.ccrts {
+        out.extend_from_slice(b"CCRT");
+        out.extend_from_slice(&14u32.to_be_bytes());
+        out.extend_from_slice(&c.write());
     }
 
     // BODY

@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ilbm::Crng` (DeluxePaint colour-range cycling, 8-byte chunk:
+  `pad1, rate, flags, low, high`) and `ilbm::Ccrt` (Commodore
+  Graphicraft colour-cycling timing, 14-byte chunk: `direction,
+  start, end, seconds, micros, pad`) parse/round-trip support.
+  `parse_ilbm` collects every `CRNG` / `CCRT` chunk it sees into
+  `IlbmImage::crngs` / `IlbmImage::ccrts` (order preserved);
+  `encode_ilbm` re-emits them between PCHG and BODY so a parse →
+  encode is byte-stable. Each struct exposes spec-derived accessors
+  — `Crng::cycles_per_second()` (`rate / 16384 × 60` Hz),
+  `Crng::is_active()`, `Crng::is_reverse()`, `Crng::range_len()`;
+  `Ccrt::delay_seconds()` (`seconds + micros/1e6`), `Ccrt::is_active()`,
+  `Ccrt::is_reverse()`, `Ccrt::range_len()`. Inverted ranges
+  (`low > high` / `start > end`) and out-of-spec negative timing
+  components clamp to safe defaults rather than wrap. Tested in
+  `tests/ilbm_crng_ccrt.rs` (13 tests): single-chunk round-trip,
+  multi-chunk order preservation, byte-stable re-encode, inactive /
+  reversed flags, short-payload rejection, mixed CRNG+CCRT,
+  unknown-chunk skipping. No animation is performed; consumers
+  walk `image.crngs` / `image.ccrts` to apply their own palette
+  rotation.
+
 - `anim::encode_anim_op5(frames)` and `anim::encode_op5_body(prev,
   cur, bmhd)` — ANIM op-5 (Byte Vertical Delta) encoder. Walks each
   plane's columns top-to-bottom; emits skip ops (1..=0x7F rows
