@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ILBM palette-cycling step helpers + per-scanline PCHG resolver.**
+  `Crng::cycle_step(palette, steps)`, `Ccrt::cycle_step(palette, steps)`
+  and `Drng::cycle_step(palette, steps)` rotate the closed range
+  (`[low..=high]` for `CRNG`, `[start..=end]` for `CCRT`,
+  `[min..=max]` for `DRNG`) in place by `steps` ticks. `Crng` and
+  `Ccrt` honour their reverse-direction flag (CRNG's `FLAG_REVERSE`,
+  CCRT's `direction < 0`); DRNG cycles forward only (its wire format
+  has no direction flag) and the in-tree DRNG spec material does not
+  define per-tick semantics for the optional `DrngTrueCell` /
+  `DrngRegCell` lists, so the cell list is left untouched and callers
+  layer their own splice on top after the rotation. Each helper takes
+  `steps` modulo the range length so feeding an accumulated tick
+  counter into it is O(range) regardless of how large `steps` grows;
+  inactive cycles, malformed ranges (`low > high`), ranges that extend
+  past the palette tail, single-slot ranges, and `steps == 0 mod
+  range_len` are all no-ops and the helper returns `false` to signal
+  "palette unchanged." `Pchg::palette_at_line(base, y)` returns the
+  cumulative PCHG-overridden palette at the start of scanline `y` by
+  folding every PCHG entry whose `line <= y` over `base`; out-of-range
+  register indices are skipped silently to match the parser's
+  tolerance. A free `palette_for_line(image, y)` convenience wraps the
+  `Option<Pchg>` plumbing so animation consumers can write a uniform
+  per-row "give me the active palette" call without branching on
+  whether the file carried a PCHG chunk. Tested in
+  `tests/ilbm_palette_cycle.rs` (28 tests): forward / reverse single
+  ticks against synthesised palettes, full-revolution identity, large
+  modulo step counts, inactive / single-slot / inverted-range / past-
+  palette no-ops, zero-step no-op, fwd-then-reverse round-trip,
+  CCRT-direction-zero no-op, DRNG cell-list preservation across the
+  rotation, PCHG before-first-override / mid-override / past-image-
+  height resolution, PCHG out-of-range-index tolerance, and an
+  end-to-end "PCHG override + CRNG rotation on top" composition test
+  showing the two helpers compose without interfering.
+
 - **ILBM 24-bit true-colour (literal-RGB) decode + encode.** When
   `BMHD.n_planes == 24` the BODY carries 8 red bitplanes (LSB-first),
   then 8 green, then 8 blue per scanline with no `CMAP` chunk, per the

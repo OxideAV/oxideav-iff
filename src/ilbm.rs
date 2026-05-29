@@ -530,6 +530,36 @@ impl Pchg {
             lines: out_lines,
         })
     }
+
+    /// Return the cumulative palette state at the start of scanline
+    /// `y`, given a starting `base` palette.
+    ///
+    /// Walks every entry in [`Pchg::lines`] whose `line` is `<= y` and
+    /// applies its register overwrites in document order, leaving the
+    /// rest of `base` untouched. Out-of-range indices (`>= base.len()`)
+    /// are skipped silently — same tolerance as the parser, since
+    /// PCHG-generating tools have historically been permissive about
+    /// the upper-bound register count.
+    ///
+    /// Convenience: callers walking every scanline can fold the state
+    /// themselves and avoid re-walking the whole list per `y`; this
+    /// helper is intended for one-off "show me the palette at row N"
+    /// queries from animation viewers.
+    pub fn palette_at_line(&self, base: &[[u8; 3]], y: u32) -> Vec<[u8; 3]> {
+        let mut cur = base.to_vec();
+        for entry in &self.lines {
+            if entry.line > y {
+                break;
+            }
+            for ch in &entry.changes {
+                let i = ch.index as usize;
+                if i < cur.len() {
+                    cur[i] = ch.rgb;
+                }
+            }
+        }
+        cur
+    }
 }
 
 // ───────────────────── CRNG (Color Range) ─────────────────────
@@ -623,6 +653,64 @@ impl Crng {
             (self.high - self.low) as u16 + 1
         }
     }
+
+    /// Apply `steps` palette-cycle ticks to `palette` in place.
+    ///
+    /// Rotates the closed range `[low..=high]` by `steps` slots. Each
+    /// tick moves the *contents* of every slot in the window one
+    /// position forward (or backward when [`is_reverse`] is set):
+    ///
+    /// * Forward: `pal[low+i]` becomes `old_pal[low + (i - 1).mod range_len]`.
+    /// * Reverse: `pal[low+i]` becomes `old_pal[low + (i + 1).mod range_len]`.
+    ///
+    /// Returns `false` (and leaves `palette` unchanged) when the cycle
+    /// has nothing to do — inactive flag, zero-length range, malformed
+    /// `low > high`, range tail past the palette length, or
+    /// `range_len == 1` (one-slot rotation is the identity). Returns
+    /// `true` when the rotation was actually applied.
+    ///
+    /// `steps` is taken modulo `range_len()`, so very large step counts
+    /// reduce to one in-range walk. This makes it cheap to skip ahead by
+    /// arbitrary tick counts without an O(steps) loop.
+    ///
+    /// The caller is responsible for picking how many ticks to apply
+    /// per wall-clock frame; [`cycles_per_second`] gives the
+    /// DPaint-spec rate at 60 Hz vertical blank.
+    ///
+    /// [`is_reverse`]: Self::is_reverse
+    /// [`cycles_per_second`]: Self::cycles_per_second
+    pub fn cycle_step(&self, palette: &mut [[u8; 3]], steps: u32) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        let len = self.range_len() as usize;
+        if len < 2 {
+            return false;
+        }
+        if self.high as usize >= palette.len() {
+            return false;
+        }
+        let lo = self.low as usize;
+        let hi = self.high as usize;
+        let k = (steps as usize) % len;
+        if k == 0 {
+            return false;
+        }
+        // Forward: each value moves +1 slot per tick (so reading the
+        // pre-rotation buffer, slot `lo + i` after one tick should hold
+        // what slot `lo + (i + len - 1) % len` held before — the value
+        // that was one position "behind" it). Reverse is the inverse.
+        let tmp: Vec<[u8; 3]> = palette[lo..=hi].to_vec();
+        for i in 0..len {
+            let src = if self.is_reverse() {
+                (i + k) % len
+            } else {
+                (i + len - k) % len
+            };
+            palette[lo + i] = tmp[src];
+        }
+        true
+    }
 }
 
 // ───────────────────── CCRT (Color Cycling Range and Timing) ─────────────────────
@@ -711,6 +799,57 @@ impl Ccrt {
         } else {
             (self.end - self.start) as u16 + 1
         }
+    }
+
+    /// Apply `steps` palette-cycle ticks to `palette` in place,
+    /// rotating the closed range `[start..=end]` per [`direction`].
+    ///
+    /// Forward (`direction > 0`) moves slot contents toward higher
+    /// indices; reverse (`direction < 0`) moves them toward lower
+    /// indices; `direction == 0` is a no-op (matches [`is_active`] ==
+    /// `false`).
+    ///
+    /// Returns `false` (palette unchanged) when the cycle is inactive,
+    /// the range is malformed (`start > end`), the range tail lies past
+    /// the palette length, the range spans fewer than two slots, or
+    /// `steps` reduces to 0 mod `range_len()`. Returns `true` when the
+    /// rotation actually mutated the palette.
+    ///
+    /// `steps` is taken modulo `range_len()` so callers can pass an
+    /// accumulated tick counter without ever paying an O(steps) cost.
+    /// Use [`delay_seconds`] to convert wall-clock time into a tick
+    /// count for the next frame.
+    ///
+    /// [`direction`]: Self::direction
+    /// [`is_active`]: Self::is_active
+    /// [`delay_seconds`]: Self::delay_seconds
+    pub fn cycle_step(&self, palette: &mut [[u8; 3]], steps: u32) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        let len = self.range_len() as usize;
+        if len < 2 {
+            return false;
+        }
+        if self.end as usize >= palette.len() {
+            return false;
+        }
+        let lo = self.start as usize;
+        let hi = self.end as usize;
+        let k = (steps as usize) % len;
+        if k == 0 {
+            return false;
+        }
+        let tmp: Vec<[u8; 3]> = palette[lo..=hi].to_vec();
+        for i in 0..len {
+            let src = if self.is_reverse() {
+                (i + k) % len
+            } else {
+                (i + len - k) % len
+            };
+            palette[lo + i] = tmp[src];
+        }
+        true
     }
 }
 
@@ -898,6 +1037,58 @@ impl Drng {
         } else {
             (self.max - self.min) as u16 + 1
         }
+    }
+
+    /// Apply `steps` palette-cycle ticks to `palette` in place,
+    /// rotating the closed range `[min..=max]` forward.
+    ///
+    /// DRNG is the DeluxePaint IV super-set of [`Crng`]: in addition to
+    /// rotating the palette slots in `[min..=max]`, it can splice
+    /// *true-colour cells* (frozen RGB values) and *register cells*
+    /// (live mirrors of other palette slots) at arbitrary positions
+    /// inside the range. The cells are *positional* — they describe
+    /// "at cell index `cell` substitute this RGB / this register". The
+    /// in-tree spec material defines the cell list but does not specify
+    /// the per-tick semantics for how cells animate alongside the
+    /// rotation, so this helper does the conservative thing: it rotates
+    /// the contiguous range exactly as [`Crng::cycle_step`] would, and
+    /// leaves the cell list untouched. Callers that want cell-aware
+    /// animation can layer their own splice on top by walking
+    /// [`Drng::trues`] / [`Drng::regs`] after the rotation.
+    ///
+    /// DRNG's wire format has no reverse-direction flag; the rotation is
+    /// always forward (toward higher indices). Returns `false` (and
+    /// leaves the palette untouched) on inactive flag, malformed range
+    /// (`min > max`), range past the palette tail, single-slot range,
+    /// or `steps` reducing to 0 mod `range_len()`. Returns `true` when
+    /// the rotation mutated the palette.
+    ///
+    /// [`Crng::cycle_step`]: Crng::cycle_step
+    /// [`Drng::trues`]: Self::trues
+    /// [`Drng::regs`]: Self::regs
+    pub fn cycle_step(&self, palette: &mut [[u8; 3]], steps: u32) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        let len = self.range_len() as usize;
+        if len < 2 {
+            return false;
+        }
+        if self.max as usize >= palette.len() {
+            return false;
+        }
+        let lo = self.min as usize;
+        let hi = self.max as usize;
+        let k = (steps as usize) % len;
+        if k == 0 {
+            return false;
+        }
+        let tmp: Vec<[u8; 3]> = palette[lo..=hi].to_vec();
+        for i in 0..len {
+            let src = (i + len - k) % len;
+            palette[lo + i] = tmp[src];
+        }
+        true
     }
 }
 
@@ -1165,6 +1356,32 @@ fn encode_truecolor24_row(rgba_row: &[u8], width: u16, row_bytes: usize) -> Vec<
         }
     }
     planes
+}
+
+// ───────────────────── Palette helpers ─────────────────────
+
+/// Resolve the effective palette at the start of scanline `y` for the
+/// given image.
+///
+/// When `image.pchg` is `Some`, the returned palette is the cumulative
+/// PCHG state at `y` — `image.palette` with every PCHG register
+/// override whose `line <= y` applied in document order. When PCHG is
+/// absent the call returns `image.palette` verbatim. EHB / HAM
+/// expansion is *not* applied; this is the raw, pre-expansion CMAP
+/// state suitable as input to [`expand_ehb_palette`] or
+/// [`expand_ham_row`].
+///
+/// `y >= image.height` clamps to the image's last row's state — the
+/// PCHG list is exhausted and every entry has already been folded.
+///
+/// This is a thin convenience wrapper around [`Pchg::palette_at_line`]
+/// that hides the `Option<Pchg>` plumbing; consumers writing a "render
+/// scanline `y` with cycling" path call it once per row.
+pub fn palette_for_line(image: &IlbmImage, y: u32) -> Vec<[u8; 3]> {
+    match &image.pchg {
+        Some(pchg) => pchg.palette_at_line(&image.palette, y),
+        None => image.palette.clone(),
+    }
 }
 
 // ───────────────────── EHB / HAM ─────────────────────

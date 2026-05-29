@@ -148,9 +148,12 @@ list).
 
 - Public API: [`ilbm::parse_ilbm`], [`ilbm::encode_ilbm`],
   [`ilbm::IlbmImage`], [`ilbm::Bmhd`], [`ilbm::Camg`],
-  [`ilbm::Grab`], [`ilbm::Sham`], [`ilbm::Pchg`], [`ilbm::Crng`],
-  [`ilbm::Ccrt`], [`ilbm::Drng`] / [`ilbm::DrngTrueCell`] /
-  [`ilbm::DrngRegCell`],
+  [`ilbm::Grab`], [`ilbm::Sham`], [`ilbm::Pchg`] /
+  [`ilbm::Pchg::palette_at_line`], [`ilbm::Crng`] /
+  [`ilbm::Crng::cycle_step`], [`ilbm::Ccrt`] /
+  [`ilbm::Ccrt::cycle_step`], [`ilbm::Drng`] / [`ilbm::DrngTrueCell`]
+  / [`ilbm::DrngRegCell`] / [`ilbm::Drng::cycle_step`],
+  [`ilbm::palette_for_line`],
   [`ilbm::byterun1_decode_row`] / [`ilbm::byterun1_encode_row`],
   [`ilbm::expand_ham_row`], [`ilbm::expand_ehb_palette`],
   [`ilbm::IlbmMuxer`] (with [`ilbm::MuxerMode`] selecting indexed /
@@ -244,9 +247,21 @@ println!("{}x{} → {} bytes RGBA", img.width, img.height, img.rgba.len());
   `(cell, r, g, b)`, `DrngRegCell` — `(cell, index)`) verbatim and in
   document order. Multiple `CRNG` / `CCRT` / `DRNG` chunks per file
   are preserved in document order so a parse → encode produces the
-  same byte stream. The crate does not animate; consumers wanting a
-  rotated palette walk `image.crngs` / `image.ccrts` / `image.drngs`
-  themselves.
+  same byte stream.
+- Each cycling descriptor now exposes a `cycle_step(palette, steps)`
+  helper that rotates the in-range slots of a caller-owned palette in
+  place: `Crng` and `Ccrt` honour their reverse-direction flag; `Drng`
+  rotates forward only (its wire format has no direction flag) and
+  leaves the positional `DrngTrueCell` / `DrngRegCell` lists untouched
+  for the caller to splice in. `steps` is taken modulo
+  `range_len()` so very large accumulated tick counts are O(range) to
+  apply. Inactive cycles, malformed ranges, ranges past the palette
+  tail and zero-net-step rotations are all silent no-ops returning
+  `false`. `Pchg::palette_at_line(base, y)` (and the free
+  `palette_for_line(image, y)` wrapper that handles the `Option<Pchg>`)
+  fold every PCHG override whose `line <= y` over a starting palette,
+  so animation viewers can compose per-scanline state + per-tick
+  rotation without re-implementing the bookkeeping.
 
 ## Roadmap
 
