@@ -1049,6 +1049,124 @@ pub fn indices_to_planar_row(indices: &[u8], n_planes: u8, row_bytes: usize) -> 
     planes
 }
 
+// ───────────────────── True-colour 24-bit ─────────────────────
+
+/// Decode a `BMHD.n_planes == 24` true-colour ILBM `BODY` into a
+/// pre-allocated `rgba` buffer. Each scanline emits 24 plane-rows of
+/// `bmhd.row_bytes()` bytes: 8 red planes (bit 0 first, LSB-first), then
+/// 8 green planes, then 8 blue planes. ByteRun1 (`Compression::ByteRun1`)
+/// is applied per-plane-per-row exactly as in the indexed planar path.
+///
+/// HasMask / HasTransparentColor are ignored in this mode — alpha is
+/// always written as `0xFF`. The EGFF / fileformat.info ILBM article
+/// states the masking byte is "almost always 0" on true-colour files
+/// because there is no `BMHD.transparent_color` lookup for literal RGB.
+fn decode_truecolor24_into(bmhd: &Bmhd, body: &[u8], rgba: &mut [u8]) -> Result<()> {
+    let row_bytes = bmhd.row_bytes();
+    let width = bmhd.width as usize;
+    let height = bmhd.height as usize;
+    // 24 colour planes; mask plane is illegal for true-colour bodies.
+    if bmhd.masking == Masking::HasMask {
+        return Err(Error::unsupported(
+            "ILBM 24-bit true-colour: HasMask plane is not defined for literal-RGB BODY",
+        ));
+    }
+    let planes_per_row = 24usize;
+
+    let mut rows_planar: Vec<Vec<u8>> = Vec::with_capacity(height * planes_per_row);
+    match bmhd.compression {
+        Compression::None => {
+            let needed = height * planes_per_row * row_bytes;
+            if body.len() < needed {
+                return Err(Error::invalid(format!(
+                    "ILBM 24-bit uncompressed BODY: need {needed} bytes, got {}",
+                    body.len()
+                )));
+            }
+            for chunk in body[..needed].chunks_exact(row_bytes) {
+                rows_planar.push(chunk.to_vec());
+            }
+        }
+        Compression::ByteRun1 => {
+            let mut input = body;
+            for _ in 0..height {
+                for _ in 0..planes_per_row {
+                    let mut row = Vec::with_capacity(row_bytes);
+                    let consumed = byterun1_decode_row(input, row_bytes, &mut row)?;
+                    input = &input[consumed..];
+                    rows_planar.push(row);
+                }
+            }
+        }
+        Compression::Auto => {
+            return Err(Error::unsupported(
+                "ILBM BMHD: compression byte 'Auto' is encoder-only, not a valid file value",
+            ))
+        }
+    }
+
+    for y in 0..height {
+        let row_base = y * planes_per_row;
+        // Three 8-plane groups: red (planes 0..=7), green (8..=15), blue (16..=23).
+        for x in 0..width {
+            let byte_idx = x / 8;
+            let bit = 7 - (x % 8);
+            let mut r: u8 = 0;
+            let mut g: u8 = 0;
+            let mut b: u8 = 0;
+            // Plane k inside a channel contributes bit k (k=0 is LSB).
+            for k in 0..8 {
+                let pr = &rows_planar[row_base + k];
+                let pg = &rows_planar[row_base + 8 + k];
+                let pb = &rows_planar[row_base + 16 + k];
+                if byte_idx < pr.len() && (pr[byte_idx] >> bit) & 1 == 1 {
+                    r |= 1 << k;
+                }
+                if byte_idx < pg.len() && (pg[byte_idx] >> bit) & 1 == 1 {
+                    g |= 1 << k;
+                }
+                if byte_idx < pb.len() && (pb[byte_idx] >> bit) & 1 == 1 {
+                    b |= 1 << k;
+                }
+            }
+            let dst = (y * width + x) * 4;
+            rgba[dst] = r;
+            rgba[dst + 1] = g;
+            rgba[dst + 2] = b;
+            rgba[dst + 3] = 0xFF;
+        }
+    }
+    Ok(())
+}
+
+/// Build the 24 plane-rows for one scanline of a true-colour ILBM
+/// encode. `rgba_row` carries `width * 4` bytes of source RGBA pixels.
+/// Plane layout matches [`decode_truecolor24_into`]: red bit 0 first,
+/// red bit 7 last; then green LSB→MSB; then blue LSB→MSB. Each plane
+/// row is `row_bytes` bytes wide (rounded up to a 16-bit word).
+fn encode_truecolor24_row(rgba_row: &[u8], width: u16, row_bytes: usize) -> Vec<Vec<u8>> {
+    let mut planes: Vec<Vec<u8>> = (0..24).map(|_| vec![0u8; row_bytes]).collect();
+    for x in 0..width as usize {
+        let byte_idx = x / 8;
+        let bit = 7 - (x % 8);
+        let r = rgba_row[x * 4];
+        let g = rgba_row[x * 4 + 1];
+        let b = rgba_row[x * 4 + 2];
+        for k in 0..8 {
+            if (r >> k) & 1 == 1 {
+                planes[k][byte_idx] |= 1 << bit;
+            }
+            if (g >> k) & 1 == 1 {
+                planes[8 + k][byte_idx] |= 1 << bit;
+            }
+            if (b >> k) & 1 == 1 {
+                planes[16 + k][byte_idx] |= 1 << bit;
+            }
+        }
+    }
+    planes
+}
+
 // ───────────────────── EHB / HAM ─────────────────────
 
 /// Mirror a 32-entry palette into the upper 32 entries by halving each
@@ -1378,11 +1496,38 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
         });
     }
 
-    // Planar ILBM path (existing behaviour).
+    // 24-bit literal-RGB ILBM path. fileformat.info / EGFF §3.3.4 (and
+    // Encyclopedia of Graphics File Formats, Murray & vanRyper 1996, ch.
+    // "IFF File Format Summary") specify that when `BMHD.BitPlanes == 24`
+    // and no `CMAP` is present the BODY holds literal RGB pixels with
+    // bitplanes laid out as 8 red planes (LSB first), then 8 green, then
+    // 8 blue per scanline. Mask-plane (HasMask) and transparent-colour
+    // keying are not meaningful in this mode — alpha is always opaque.
+    if bmhd.n_planes == 24 {
+        decode_truecolor24_into(&bmhd, &body, &mut rgba)?;
+        return Ok(IlbmImage {
+            width,
+            height,
+            bmhd,
+            palette,
+            camg,
+            form_type,
+            grab,
+            sham,
+            pchg,
+            crngs,
+            ccrts,
+            drngs,
+            rgba,
+        });
+    }
+
+    // Planar indexed ILBM path (existing behaviour).
     let n_planes = bmhd.n_planes as usize;
     if n_planes == 0 || n_planes > 8 {
         return Err(Error::unsupported(format!(
-            "ILBM: round 1 supports 1..=8 colour bitplanes (got {n_planes})"
+            "ILBM: indexed planar supports 1..=8 colour bitplanes (got {n_planes}); \
+             use n_planes=24 for literal-RGB true-colour"
         )));
     }
     let row_bytes = bmhd.row_bytes();
@@ -1580,17 +1725,24 @@ pub fn encode_ilbm(image: &IlbmImage) -> Result<Vec<u8>> {
     if bmhd.width == 0 || bmhd.height == 0 {
         return Err(Error::invalid("ILBM encode: zero-dimension image"));
     }
-    if image.palette.is_empty() {
+    let is_pbm = &image.form_type == b"PBM ";
+    let is_truecolor24 = !is_pbm && bmhd.n_planes == 24;
+    if !is_truecolor24 && image.palette.is_empty() {
         return Err(Error::unsupported(
-            "ILBM encode: requires an indexed palette",
+            "ILBM encode: indexed paths require a non-empty palette \
+             (use n_planes=24 for literal-RGB true-colour with no CMAP)",
         ));
     }
-    let is_pbm = &image.form_type == b"PBM ";
     if is_pbm && bmhd.n_planes != 8 {
         return Err(Error::invalid(format!(
             "PBM encode: requires n_planes=8 (got {})",
             bmhd.n_planes
         )));
+    }
+    if is_truecolor24 && (image.camg.is_ham() || image.camg.is_ehb()) {
+        return Err(Error::invalid(
+            "ILBM 24-bit true-colour: HAM/EHB CAMG flags are exclusive to indexed planar bodies",
+        ));
     }
 
     // Build BODY bytes per branch. When compression is Auto the body
@@ -1598,6 +1750,8 @@ pub fn encode_ilbm(image: &IlbmImage) -> Result<Vec<u8>> {
     // won so we can write the correct byte into BMHD.
     let (body_bytes, resolved_compression): (Vec<u8>, Compression) = if is_pbm {
         encode_pbm_body_resolving(image)?
+    } else if is_truecolor24 {
+        encode_truecolor24_body_resolving(image)?
     } else if image.camg.is_ham() {
         encode_ham_body_resolving(image)?
     } else if image.camg.is_ehb() {
@@ -1622,15 +1776,18 @@ pub fn encode_ilbm(image: &IlbmImage) -> Result<Vec<u8>> {
     out.extend_from_slice(&20u32.to_be_bytes());
     out.extend_from_slice(&bmhd_out.write());
 
-    // CMAP
-    let cmap_size = (image.palette.len() * 3) as u32;
-    out.extend_from_slice(b"CMAP");
-    out.extend_from_slice(&cmap_size.to_be_bytes());
-    for c in &image.palette {
-        out.extend_from_slice(c);
-    }
-    if cmap_size & 1 == 1 {
-        out.push(0);
+    // CMAP — emit only when a palette is present. True-colour 24-bit
+    // ILBM files normally omit CMAP entirely (literal RGB pixels).
+    if !image.palette.is_empty() {
+        let cmap_size = (image.palette.len() * 3) as u32;
+        out.extend_from_slice(b"CMAP");
+        out.extend_from_slice(&cmap_size.to_be_bytes());
+        for c in &image.palette {
+            out.extend_from_slice(c);
+        }
+        if cmap_size & 1 == 1 {
+            out.push(0);
+        }
     }
 
     // CAMG (only if non-zero — saves bytes on the common path).
@@ -2134,6 +2291,27 @@ fn encode_pbm_body_resolving(image: &IlbmImage) -> Result<(Vec<u8>, Compression)
     Ok(pack_body_resolving(rows, bmhd.compression))
 }
 
+/// 24-bit true-colour planar encoder. Walks the source RGBA buffer
+/// scanline-by-scanline, emits 24 plane-rows per scanline (R LSB→MSB,
+/// G LSB→MSB, B LSB→MSB) and lets [`pack_body_resolving`] apply the
+/// caller-chosen [`Compression`] (including `Auto`, which picks the
+/// shorter of literal vs. ByteRun1 across the whole BODY).
+fn encode_truecolor24_body_resolving(image: &IlbmImage) -> Result<(Vec<u8>, Compression)> {
+    let bmhd = image.bmhd;
+    let row_bytes = bmhd.row_bytes();
+    let width = bmhd.width;
+    let stride = bmhd.width as usize * 4;
+    let mut rows: Vec<Vec<u8>> = Vec::with_capacity(bmhd.height as usize * 24);
+    for y in 0..bmhd.height as usize {
+        let src = &image.rgba[y * stride..(y + 1) * stride];
+        let plane_rows = encode_truecolor24_row(src, width, row_bytes);
+        for pr in plane_rows {
+            rows.push(pr);
+        }
+    }
+    Ok(pack_body_resolving(rows, bmhd.compression))
+}
+
 // ───────────────────── Demuxer ─────────────────────
 
 fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
@@ -2250,6 +2428,12 @@ pub enum MuxerMode {
     /// Chunky `FORM/PBM ` (DPaint II / Brilliance). 8 bits per pixel,
     /// 1 byte per pixel BODY. Caller's palette must fit in 256 entries.
     Pbm,
+    /// True-colour planar `FORM/ILBM` — 24 bitplanes (8 R, 8 G, 8 B),
+    /// no `CMAP`, literal-RGB pixels per fileformat.info / EGFF §3.3.4.
+    /// Output preserves the full source RGB; alpha is dropped because
+    /// 24-bit ILBM has no defined mask-plane or transparent-colour key.
+    /// LightWave 3D / NewTek Toaster IFF24 is the historical producer.
+    TrueColor24,
 }
 
 /// Container-level ILBM / PBM muxer. Accepts a single `rawvideo`
@@ -2445,13 +2629,21 @@ impl Muxer for IlbmMuxer {
                 // byte per pixel.
                 (pal, 8u8, Camg::default(), *b"PBM ")
             }
+            MuxerMode::TrueColor24 => {
+                // No CMAP — literal RGB. 24 bitplanes (8 R, 8 G, 8 B).
+                (Vec::new(), 24u8, Camg::default(), *b"ILBM")
+            }
         };
 
-        if palette.is_empty() {
+        if palette.is_empty() && self.mode != MuxerMode::TrueColor24 {
             return Err(Error::invalid("ILBM muxer: empty input palette"));
         }
-        // PBM disallows HasMask plane (no bitplane interleave).
-        let masking = if self.mode == MuxerMode::Pbm && self.masking == Masking::HasMask {
+        // PBM disallows HasMask plane (no bitplane interleave). True-colour
+        // 24-bit ILBM has no defined mask-plane or transparent-colour key,
+        // so force-None for both flavours of masking on that path.
+        let masking = if (self.mode == MuxerMode::Pbm && self.masking == Masking::HasMask)
+            || self.mode == MuxerMode::TrueColor24
+        {
             Masking::None
         } else {
             self.masking

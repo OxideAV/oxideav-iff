@@ -5,13 +5,14 @@ that underlies 8SVX (Amiga 8-bit sampled voice), ILBM (Amiga
 InterLeaved BitMap pictures), PBM (DPaint II / Brilliance chunky
 sibling), ANIM (animated ILBM), AIFF, SMUS, and friends. Today this
 crate ships a full read/write implementation of FORM/8SVX, a
-read-and-round-trip implementation of FORM/ILBM and FORM/PBM (1..=8
-bitplanes, ByteRun1 / Auto compression, EHB, HAM6, HAM8, HasMask,
+read-and-round-trip implementation of FORM/ILBM (1..=8 indexed
+bitplanes **and 24-bit literal-RGB true-colour**) and FORM/PBM
+(ByteRun1 / Auto compression, EHB, HAM6, HAM8, HasMask,
 transparent-colour keying, GRAB hotspot, SHAM per-line palette, PCHG
 small-format palette change list, CRNG / CCRT / DRNG colour-cycling
-descriptors), and a read-only FORM/ANIM implementation (op-0 literal
-+ op-5 byte-vertical delta). The shared chunk walker is reusable as
-AIFF / SMUS support is added. Zero C dependencies.
+descriptors), and a read/round-trip FORM/ANIM implementation (op-0
+literal + op-5 byte-vertical delta encode + decode). The shared chunk
+walker is reusable as AIFF / SMUS support is added. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -125,6 +126,7 @@ Read + round-trip support for `FORM / ILBM`:
 | `BODY` ByteRun1 (PackBits) compression   |  Y   |   Y   |
 | `BODY` Auto-picker (RDO, picks shorter)  |  -   |   Y   |
 | 1..=8 bitplane indexed colour            |  Y   |   Y   |
+| 24-bit literal-RGB true-colour (no CMAP) |  Y   |   Y   |
 | EHB — extra-half-brite (32 → 64 entries) |  Y   |   Y   |
 | HAM6 (6-plane Hold-And-Modify, 4-bit ch) |  Y   |   Y   |
 | HAM8 (8-plane Hold-And-Modify, 6-bit ch) |  Y   |   Y   |
@@ -171,8 +173,16 @@ list).
   one-shot `encode_ilbm` supports: pick `MuxerMode::IndexedAuto`
   (default — 1..=8 bitplanes, palette greedy-built from the first
   packet), `MuxerMode::Ham6` / `MuxerMode::Ham8` (CAMG-flagged Hold-
-  And-Modify), `MuxerMode::Ehb` (32→64 EHB palette mirror), or
-  `MuxerMode::Pbm` (chunky `FORM/PBM `).
+  And-Modify), `MuxerMode::Ehb` (32→64 EHB palette mirror),
+  `MuxerMode::Pbm` (chunky `FORM/PBM `), or
+  `MuxerMode::TrueColor24` (24-bit literal-RGB ILBM, no CMAP).
+- True-colour ILBM follows the EGFF §3.3.4 layout: `BMHD.n_planes == 24`,
+  no `CMAP`, 8 red bitplanes (LSB→MSB), then 8 green, then 8 blue per
+  scanline. ByteRun1 packs each plane row independently, exactly as in
+  the indexed planar path. `Masking::HasMask` is not defined for
+  literal-RGB BODY and the decoder rejects it; alpha is always
+  `0xFF` on decode and is dropped on encode (24-bit ILBM has no
+  transparent-colour key either).
 - Cross-validated end-to-end against ImageMagick's `magick convert`
   (delegate `ilbmtoppm` → PPM → pixel-compare). Set
   `OXIDEAV_IFF_MAGICK_CROSS=1` to enable the cross-decode tests; they

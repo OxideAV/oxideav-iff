@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ILBM 24-bit true-colour (literal-RGB) decode + encode.** When
+  `BMHD.n_planes == 24` the BODY carries 8 red bitplanes (LSB-first),
+  then 8 green, then 8 blue per scanline with no `CMAP` chunk, per the
+  EGFF / fileformat.info §3.3.4 description of NewTek / LightWave Toaster
+  IFF24 files. Both `Compression::None` and `Compression::ByteRun1` are
+  supported (per-plane-per-row, identical to the indexed planar path);
+  `Compression::Auto` picks the shorter of the two. `Masking::HasMask`
+  is undefined for literal-RGB and is rejected at decode/encode time;
+  the `HAM` / `EHB` CAMG flags are also rejected because they describe
+  6/8-plane indexed viewports. Alpha is dropped on encode (always
+  `0xFF` on decode) — 24-bit ILBM has no transparent-colour key. New
+  `MuxerMode::TrueColor24` reaches the encoder through the streaming
+  `IlbmMuxer` API; the muxer emits a CAMG-free, CMAP-free ILBM file
+  with `n_planes = 24`. Tested in `tests/ilbm_truecolor24.rs`
+  (12 tests): raw + ByteRun1 + Auto round-trips, Auto beats raw on a
+  solid fill, no-CMAP emit, full 256-value sweep per channel,
+  HasMask + n_planes=24 decode rejection, HAM/EHB + n_planes=24 encode
+  rejection, alpha-dropped-to-opaque, redundant-CMAP-tolerated decode,
+  indexed-encode-without-palette still rejected, end-to-end through
+  the streaming muxer.
+
 - `ilbm::Drng` (DeluxePaint IV extended range cycling, variable-length
   chunk: 8-byte header `min, max, rate, flags, ntrue, nregs` followed
   by `ntrue` × `DrngTrueCell` (`cell, r, g, b`) and `nregs` ×
