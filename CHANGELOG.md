@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ANIM op-7 (Short / Long Vertical Delta) decode.** When a delta
+  frame carries `ANHD.operation = 7`, the running planar state is
+  patched in place by walking the DLTA chunk's 16 big-endian u32
+  pointer table (8 opcode-list pointers + 8 data-list pointers, one
+  pair per plane; a `0` pointer marks the plane unchanged). Per plane
+  the bitplane is split into vertical columns of width `data_size`,
+  controlled by `ANHD.bits` bit 0 (`0` = short 2-byte items, `1` =
+  long 4-byte items); column count = `row_bytes / data_size`. Each
+  column starts with an `op_count` byte (0 = column unchanged)
+  followed by `op_count` opcode bytes; the three opcode classes are
+  Skip (hi bit clear, non-zero — forward the dest cursor by N rows,
+  no data consumed), Uniq (hi bit set — copy `byte & 0x7F` data
+  items literally from the data list, one per consecutive row) and
+  Same (`0x00` byte followed by a count byte — copy one data item
+  `count` times to consecutive rows). Advancing one row adds
+  `row_bytes` (NOT `data_size`) to the byte offset within the
+  bitplane. Tested in `tests/anim_op7_decode.rs` (6 tests): short
+  Skip + Uniq + Same exercise across all 4 columns of a 1-plane
+  64×4 image, long-data (4-byte item) exercise across a 1-plane
+  64×3 image, all-zero pointer table leaves state untouched,
+  truncated pointer table errors, out-of-range opcode pointer
+  errors, two-plane independent pointer-pair lookup. Op-7 encode +
+  op-8 decode/encode remain open follow-ups.
+
 - **ILBM palette-cycling step helpers + per-scanline PCHG resolver.**
   `Crng::cycle_step(palette, steps)`, `Ccrt::cycle_step(palette, steps)`
   and `Drng::cycle_step(palette, steps)` rotate the closed range

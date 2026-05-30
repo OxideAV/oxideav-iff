@@ -209,7 +209,8 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
 | `ANHD` Animation Header (40 bytes)       |  Y   |   Y   |
 | Op 0 — full literal BODY                 |  Y   |   Y   |
 | Op 5 — Byte Vertical Delta (DPaint III)  |  Y   |   Y   |
-| Op 7 / 8 — short / long vertical deltas  |  N   |   N   |
+| Op 7 — Short / Long Vertical Delta       |  Y   |   N   |
+| Op 8 — Short / Long Vertical Delta (32b) |  N   |   N   |
 
 - Public API: [`anim::parse_anim`], [`anim::encode_anim_op0`],
   [`anim::encode_anim_op5`], [`anim::encode_op5_body`],
@@ -223,6 +224,21 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
   length encoder picks repeat (3 bytes) for runs ≥ 3 same bytes and
   literal (1 + cnt bytes) otherwise; skip-runs (≤ 0x7F) and
   repeat-runs (≤ 0xFF) split on cap.
+- Op-7 (Short / Long Vertical Delta) is decoded into the running
+  planar state. The DLTA payload begins with 16 big-endian u32
+  pointers — 8 opcode-list pointers followed by 8 data-list pointers,
+  one pair per plane (`0` = plane unchanged). Each plane is split
+  into vertical columns whose width is the data-item size, controlled
+  by `ANHD.bits` bit 0 (`0` = short 2-byte items, `1` = long 4-byte
+  items); column count = `row_bytes / data_size`. Per column an
+  `op_count` byte introduces a list of opcodes; the three classes are
+  Skip (hi bit clear, non-zero — advance dest cursor by N rows; no
+  data consumed), Uniq (hi bit set — copy `byte & 0x7F` data items
+  literally from the data list, one per consecutive row) and Same
+  (`0x00` byte followed by a count byte — copy one data item `count`
+  times to consecutive rows). Advancing one row adds `row_bytes` to
+  the byte offset within the bitplane (not `data_size`). Op-7 encode
+  + op-8 are open follow-ups.
 
 #### Read an ILBM picture
 
@@ -267,9 +283,10 @@ println!("{}x{} → {} bytes RGBA", img.width, img.height, img.rgba.len());
 
 The chunk walker (`chunk.rs`) is format-agnostic; AIFF (Apple audio),
 SMUS (music score) and MAUD are natural follow-ons that reuse the
-same FORM/LIST/CAT reader. ANIM op-7/op-8 (short / long vertical
-delta) decode are open ILBM-side extensions; DEEP / TVPP / RGB8 / RGBN
-true-colour IFF chunks are the next ILBM-side decode candidates.
+same FORM/LIST/CAT reader. ANIM op-7 (short / long vertical delta)
+decode landed in r192; op-7 encode + op-8 decode/encode remain open
+ILBM-side extensions; DEEP / TVPP / RGB8 / RGBN true-colour IFF
+chunks are the next ILBM-side decode candidates.
 
 ## License
 

@@ -12,7 +12,7 @@
 //!   ...
 //! ```
 //!
-//! `ANHD.operation` selects the delta encoder. The two operations
+//! `ANHD.operation` selects the delta encoder. The operations
 //! commonly seen in the wild:
 //!
 //! * **op 0** — full BODY (uncompressed, same shape as the leading
@@ -21,9 +21,23 @@
 //!   list of `width / 8` columns of "ops"; each op is a 1-byte count
 //!   plus N bytes of either repeats (top bit set) or literal columns
 //!   walked top-to-bottom.
+//! * **op 7** — Short/Long Vertical Delta. The bitplane is split into
+//!   vertical columns whose width is the data-item size (2 bytes if
+//!   `ANHD.bits` bit 0 = 0, "short"; 4 bytes if bit 0 = 1, "long").
+//!   The DLTA chunk begins with 16 big-endian u32 pointers (8 opcode
+//!   pointers + 8 data pointers); per plane the opcode and data lists
+//!   live at independent offsets. Each column starts with an
+//!   `op_count` byte, then `op_count` opcode bytes; the three opcode
+//!   classes are Skip (hi bit clear, non-zero — forward dest cursor),
+//!   Uniq (hi bit set — copy `byte & 0x7F` data items literally), and
+//!   Same (`0x00` byte followed by a count byte — copy one data item
+//!   `count` times). The "dest" cursor walks rows by adding
+//!   `row_bytes` (NOT data-item width) per step, and the column starts
+//!   at byte offset `column_index * data_size` within the plane row.
 //!
-//! Round 2 implements op 0 + op 5 (the format DPaint III emits) and
-//! surfaces the rest as `Error::Unsupported` for diagnosability.
+//! Round 2 implements op 0 + op 5 (the format DPaint III emits);
+//! round 192 adds op 7 (short / long vertical delta) decode. Other
+//! operations surface `Error::Unsupported` for diagnosability.
 //!
 //! Source: the public **ANIM IFF Cel Animation** spec (Gary Bonham,
 //! 1988). No third-party loader code consulted.
@@ -237,8 +251,9 @@ pub fn probe(buf: &[u8]) -> u8 {
 
 /// Parse a FORM/ANIM container.
 ///
-/// Currently supports `ANHD.operation = 0` (literal full BODY) and
-/// `ANHD.operation = 5` (Byte Vertical Delta). Other operations
+/// Currently supports `ANHD.operation = 0` (literal full BODY),
+/// `ANHD.operation = 5` (Byte Vertical Delta) and `ANHD.operation = 7`
+/// (Short / Long Vertical Delta — read only). Other operations
 /// return `Error::Unsupported`.
 pub fn parse_anim(bytes: &[u8]) -> Result<AnimImage> {
     if bytes.len() < 12 {
@@ -559,8 +574,14 @@ fn apply_delta(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -
             Ok(())
         }
         5 => apply_op5(planar, delta, bmhd),
+        7 => {
+            // Op 7 honours bit 0 of ANHD.bits: 0 = short data (2 B),
+            // 1 = long data (4 B).
+            let long_data = (anhd.bits & 1) != 0;
+            apply_op7(planar, delta, bmhd, long_data)
+        }
         other => Err(Error::unsupported(format!(
-            "ANIM: ANHD operation {other} not implemented (only 0 and 5 supported)"
+            "ANIM: ANHD operation {other} not implemented (only 0, 5 and 7 supported)"
         ))),
     }
 }
@@ -666,6 +687,168 @@ fn apply_op5(planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Op 7 — Short / Long Vertical Delta.
+///
+/// The DLTA payload begins with 16 big-endian u32 pointers (8 opcode-
+/// list pointers, then 8 data-list pointers). Each pointer is a byte
+/// offset into the *same* DLTA buffer; a zero pointer means the plane
+/// is unchanged from the previous frame.
+///
+/// For each colour plane `p` whose opcode-list pointer is non-zero,
+/// the bitplane is split into vertical columns of `data_size` bytes
+/// (`data_size = 2` for short data, `4` for long data). The column
+/// count is therefore `row_bytes / data_size`. Per column the
+/// encoder emits an `op_count` byte (zero is legal — column unchanged)
+/// followed by `op_count` opcode bytes; the three opcode classes are:
+///
+/// * **Skip** — hi bit clear, non-zero. The byte value is the number
+///   of rows to advance the dest cursor by (no data consumed).
+/// * **Uniq** — hi bit set. `byte & 0x7F` is the number of data items
+///   to copy *literally* from the data list, one per consecutive row.
+/// * **Same** — `0x00` byte followed by a count byte. One data item
+///   is fetched from the data list and copied to `count`
+///   consecutive rows.
+///
+/// "Advance the dest cursor by one row" means add `row_bytes` to the
+/// byte offset within the bitplane (NOT `data_size`). The column's
+/// starting byte offset within each row is `column_index * data_size`.
+///
+/// `long_data = true` selects the long-data variant (bit 0 of
+/// `ANHD.bits` set); `false` selects short data.
+fn apply_op7(planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd, long_data: bool) -> Result<()> {
+    let n_planes = bmhd.n_planes as usize;
+    let has_mask = bmhd.masking == Masking::HasMask;
+    let planes_per_row = n_planes + has_mask as usize;
+    let row_bytes = bmhd.row_bytes();
+    let height = bmhd.height as usize;
+    let data_size = if long_data { 4 } else { 2 };
+
+    if row_bytes % data_size != 0 {
+        return Err(Error::invalid(format!(
+            "ANIM op 7: row_bytes {row_bytes} not a multiple of data size {data_size}"
+        )));
+    }
+    let cols = row_bytes / data_size;
+
+    // 16 big-endian u32 pointers — opcodes then data.
+    if delta.len() < 64 {
+        return Err(Error::invalid("ANIM op 7: pointer table truncated"));
+    }
+    let read_ptr = |slot: usize| -> usize {
+        u32::from_be_bytes([
+            delta[slot * 4],
+            delta[slot * 4 + 1],
+            delta[slot * 4 + 2],
+            delta[slot * 4 + 3],
+        ]) as usize
+    };
+
+    for p in 0..n_planes.min(8) {
+        let op_ptr = read_ptr(p);
+        let data_ptr = read_ptr(8 + p);
+        if op_ptr == 0 {
+            continue; // plane unchanged
+        }
+        if op_ptr >= delta.len() {
+            return Err(Error::invalid("ANIM op 7: opcode pointer out of range"));
+        }
+        if data_ptr >= delta.len() {
+            return Err(Error::invalid("ANIM op 7: data pointer out of range"));
+        }
+        let mut op_cur = op_ptr;
+        let mut data_cur = data_ptr;
+
+        for col in 0..cols {
+            if op_cur >= delta.len() {
+                return Err(Error::invalid(
+                    "ANIM op 7: opcode list truncated at op_count",
+                ));
+            }
+            let op_count = delta[op_cur] as usize;
+            op_cur += 1;
+            if op_count == 0 {
+                continue; // no change in this column
+            }
+            let mut row: usize = 0;
+            let col_byte = col * data_size;
+            for _ in 0..op_count {
+                if op_cur >= delta.len() {
+                    return Err(Error::invalid(
+                        "ANIM op 7: opcode list truncated mid-column",
+                    ));
+                }
+                let op = delta[op_cur];
+                op_cur += 1;
+                if op == 0 {
+                    // Same op: next opcode byte is the row count; copy
+                    // one data item from the data list `cnt` times.
+                    if op_cur >= delta.len() {
+                        return Err(Error::invalid("ANIM op 7: Same op missing count byte"));
+                    }
+                    let cnt = delta[op_cur] as usize;
+                    op_cur += 1;
+                    if data_cur + data_size > delta.len() {
+                        return Err(Error::invalid("ANIM op 7: Same op data item truncated"));
+                    }
+                    let item_start = data_cur;
+                    data_cur += data_size;
+                    for r in 0..cnt {
+                        let abs_row = row + r;
+                        if abs_row >= height {
+                            break;
+                        }
+                        let row_idx = abs_row * planes_per_row + p;
+                        if row_idx < planar.len() && col_byte + data_size <= planar[row_idx].len() {
+                            planar[row_idx][col_byte..col_byte + data_size]
+                                .copy_from_slice(&delta[item_start..item_start + data_size]);
+                        }
+                    }
+                    row += cnt;
+                } else if op & 0x80 == 0 {
+                    // Skip op: forward dest cursor by `op` rows. No
+                    // data consumed.
+                    row += op as usize;
+                } else {
+                    // Uniq op: copy `op & 0x7F` data items, one per
+                    // consecutive row, from the data list.
+                    let cnt = (op & 0x7F) as usize;
+                    if data_cur + cnt * data_size > delta.len() {
+                        return Err(Error::invalid("ANIM op 7: Uniq op data items truncated"));
+                    }
+                    for r in 0..cnt {
+                        let abs_row = row + r;
+                        let item_start = data_cur + r * data_size;
+                        if abs_row < height {
+                            let row_idx = abs_row * planes_per_row + p;
+                            if row_idx < planar.len()
+                                && col_byte + data_size <= planar[row_idx].len()
+                            {
+                                planar[row_idx][col_byte..col_byte + data_size]
+                                    .copy_from_slice(&delta[item_start..item_start + data_size]);
+                            }
+                        }
+                    }
+                    data_cur += cnt * data_size;
+                    row += cnt;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Test-only re-export of [`apply_op7`] so integration tests can
+/// drive the op-7 decoder without rebuilding a full ANIM container.
+#[doc(hidden)]
+pub fn apply_op7_for_test(
+    planar: &mut [Vec<u8>],
+    delta: &[u8],
+    bmhd: &Bmhd,
+    long_data: bool,
+) -> Result<()> {
+    apply_op7(planar, delta, bmhd, long_data)
 }
 
 /// Encode a single op-5 (Byte Vertical Delta) BODY payload from a
