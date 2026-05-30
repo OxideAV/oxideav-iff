@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-iff/compare/v0.0.7...v0.0.8) - 2026-05-30
+
+### Other
+
+- ANIM op-7 (Short / Long Vertical Delta) decode
+- palette-cycling step helpers + per-line PCHG palette resolver
+- 24-bit literal-RGB true-colour decode + encode
+- DRNG DPaint IV extended range cycling chunk
+- CRNG (DPaint colour-range) + CCRT (Graphicraft) chunks
+- ANIM op-5 Byte Vertical Delta encoder
+- add Demuxer::seek_to — sample-exact O(1) cursor reset
+
 ### Added
 
 - **ANIM op-7 (Short / Long Vertical Delta) decode.** When a delta
