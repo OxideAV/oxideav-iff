@@ -6,11 +6,11 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-iff"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust EA IFF 85 container support (8SVX audio, ILBM, …) for oxideav"
+description = "Pure-Rust EA IFF 85 container support (8SVX/ILBM/ANIM Amiga forms + AIFF/AIFC Apple audio) for oxideav"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-iff"
-keywords = ["multimedia", "iff", "riff", "container", "pure-rust"]
+keywords = ["multimedia", "iff", "aiff", "container", "pure-rust"]
 categories = ["multimedia", "parser-implementations"]
 
 [dependencies]

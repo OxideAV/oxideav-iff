@@ -1,18 +1,27 @@
 # oxideav-iff
 
 Pure-Rust EA IFF 85 container support for oxideav — the chunk reader
-that underlies 8SVX (Amiga 8-bit sampled voice), ILBM (Amiga
-InterLeaved BitMap pictures), PBM (DPaint II / Brilliance chunky
-sibling), ANIM (animated ILBM), AIFF, SMUS, and friends. Today this
-crate ships a full read/write implementation of FORM/8SVX, a
-read-and-round-trip implementation of FORM/ILBM (1..=8 indexed
-bitplanes **and 24-bit literal-RGB true-colour**) and FORM/PBM
-(ByteRun1 / Auto compression, EHB, HAM6, HAM8, HasMask,
-transparent-colour keying, GRAB hotspot, SHAM per-line palette, PCHG
-small-format palette change list, CRNG / CCRT / DRNG colour-cycling
-descriptors), and a read/round-trip FORM/ANIM implementation (op-0
-literal + op-5 byte-vertical delta encode + decode). The shared chunk
-walker is reusable as AIFF / SMUS support is added. Zero C dependencies.
+that underlies the entire `FORM / LIST / CAT` family. Today this
+crate ships:
+
+- **FORM/8SVX** — full read/write (Amiga 8-bit sampled voice).
+- **FORM/ILBM** — read+round-trip (1..=8 indexed bitplanes **and
+  24-bit literal-RGB true-colour**, ByteRun1 / Auto compression,
+  EHB, HAM6, HAM8, HasMask, transparent-colour keying, GRAB hotspot,
+  SHAM per-line palette, PCHG small-format palette change list,
+  CRNG / CCRT / DRNG colour-cycling descriptors).
+- **FORM/PBM** — read+round-trip (DPaint II / Brilliance chunky sibling).
+- **FORM/ANIM** — op-0 literal + op-5 byte-vertical delta
+  (encode+decode) + op-7 Short/Long Vertical Delta (decode).
+- **FORM/AIFF and FORM/AIFC** — Apple AIFF / AIFF-C (read):
+  COMM/SSND/FVER walker, 80-bit IEEE-extended sample-rate decode,
+  PCM compression-flavour readers for `NONE` / `twos` / `sowt` /
+  `raw ` / `fl32` / `FL32` / `fl64` / `FL64`. Codec-bearing
+  `compressionType` FourCCs (`ima4`, `ulaw`, `alaw`, …) are
+  recognised in the parser but routed through sibling codec
+  crates rather than decoded here.
+
+Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.

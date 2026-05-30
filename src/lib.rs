@@ -8,12 +8,15 @@
 //! and so on.
 //!
 //! Today this crate handles **8SVX audio** end-to-end (identifies the
-//! stream, exposes its PCM-S8 samples as packets) and **ILBM**
+//! stream, exposes its PCM-S8 samples as packets), **ILBM**
 //! (InterLeaved BitMap, the Amiga IFF picture form) for indexed,
 //! EHB and HAM6/HAM8 images including ByteRun1 (PackBits)
-//! decompression. The same chunk reader and `Form` walker are
-//! reusable for future AIFF / SMUS support without restructuring.
+//! decompression, **ANIM** animations (op-5 and op-7 vertical-delta
+//! decode), and Apple **AIFF / AIFF-C (AIFC)** audio (FORM/COMM/SSND
+//! walker, 80-bit IEEE extended sample-rate decode, NONE/twos/sowt/
+//! raw/fl32/fl64 PCM compression-type readers).
 
+pub mod aiff;
 pub mod anim;
 pub mod chunk;
 pub mod ilbm;
@@ -26,6 +29,11 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
     svx::register(reg);
     ilbm::register(reg);
     anim::register(reg);
+    // aiff's sibling-form helper is `register_containers` (the
+    // public `aiff::register` takes a full `RuntimeContext` because
+    // it was the standalone-crate entry point; here we want only the
+    // container half).
+    aiff::demuxer::register_containers(reg);
 }
 
 /// Install every IFF-family container into a
@@ -53,9 +61,10 @@ mod tests {
     fn register_via_runtime_context_installs_container() {
         let mut ctx = oxideav_core::RuntimeContext::new();
         register(&mut ctx);
-        // 8SVX (Amiga audio) extension is registered by svx::register
-        // and ILBM (Amiga picture) by ilbm::register; both should be
-        // wired through the unified entry point.
+        // 8SVX (Amiga audio) extension is registered by svx::register,
+        // ILBM (Amiga picture) by ilbm::register, and AIFF / AIFC
+        // (Apple audio) by aiff::register; all should be wired through
+        // the unified entry point.
         assert_eq!(
             ctx.containers.container_for_extension("8svx"),
             Some("iff_8svx")
@@ -64,5 +73,9 @@ mod tests {
             ctx.containers.container_for_extension("ilbm"),
             Some("iff_ilbm")
         );
+        // The aiff sub-module installs itself under FORMAT_NAME =
+        // "aiff" and claims `.aif` / `.aiff` / `.aifc` extensions.
+        assert_eq!(ctx.containers.container_for_extension("aiff"), Some("aiff"));
+        assert_eq!(ctx.containers.container_for_extension("aifc"), Some("aiff"));
     }
 }

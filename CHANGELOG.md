@@ -21,6 +21,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AIFF / AIFF-C (AIFC) container** support folded in from the
+  retired `oxideav-aiff` crate (which was published only at v0.0.1).
+  The full surface — `Chunk` / `ChunkIter` slice-based walker,
+  80-bit IEEE-extended sample-rate decode, `CommonChunk` /
+  `parse_common`, FORM walker (`parse` / `Form` / `SoundData`),
+  PCM compression-flavour readers (`decode_pcm`,
+  `is_pcm_compression`, `PcmSamples`), and the
+  `AiffDemuxer` factory — is now available under the
+  `oxideav_iff::aiff::*` module. The registry installs the demuxer
+  under codec id `"aiff"` and claims `.aif` / `.aiff` / `.aifc`
+  extensions.
+
+  Migration: `oxideav_aiff::*` → `oxideav_iff::aiff::*`. The
+  `default-features = false` standalone-build capability that
+  `oxideav-aiff` exposed is intentionally not preserved here;
+  `oxideav-iff` has a hard `oxideav-core` dep.
+
 - **ANIM op-7 (Short / Long Vertical Delta) decode.** When a delta
   frame carries `ANHD.operation = 7`, the running planar state is
   patched in place by walking the DLTA chunk's 16 big-endian u32
