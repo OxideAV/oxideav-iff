@@ -49,16 +49,22 @@
 //! callers can dispatch cleanly.
 //!
 //! The optional text chunks (`NAME`, `AUTH`, `(c) `, `ANNO`, `COMT`),
-//! marker / instrument chunks (`MARK`, `INST`), and the MIDI / AESD /
-//! APPL chunks are recognised by the chunk walker and skipped silently
-//! by the FORM-level parser; later rounds will surface them as
-//! structured fields.
+//! the instrument chunk (`INST`), and the MIDI / AESD / APPL chunks
+//! are recognised by the chunk walker and skipped silently by the
+//! FORM-level parser; later rounds will surface them as structured
+//! fields.
+//!
+//! The `MARK` (marker) chunk is parsed into a structured
+//! [`MarkerChunk`] (id / sample-frame position / pstring name per
+//! marker) and surfaced through [`Form::markers`]. Multiple MARK
+//! chunks inside the same FORM are rejected per §6.0 of the spec.
 
 pub mod chunk;
 pub mod common;
 pub mod error;
 pub mod extended;
 pub mod form;
+pub mod marker;
 pub mod pcm;
 
 pub mod demuxer;
@@ -71,6 +77,7 @@ pub use common::{
 pub use error::{AiffError, Result};
 pub use extended::{decode_extended, decode_sample_rate};
 pub use form::{parse, Form, SoundData};
+pub use marker::{parse_marker_chunk, Marker, MarkerChunk};
 pub use pcm::{decode_pcm, is_pcm_compression, PcmSamples};
 
 pub use demuxer::{make_demuxer, register, AiffDemuxer, FORMAT_NAME};

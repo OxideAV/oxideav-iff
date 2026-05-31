@@ -87,6 +87,20 @@ pub enum AiffError {
         /// `sampleSize`.
         frame_size: usize,
     },
+
+    /// More than one chunk of the same ckID was found inside the
+    /// outer FORM where the spec permits at most one (`MARK`, `INST`,
+    /// …). The associated string is the offending ckID rendered as
+    /// ASCII (always 4 bytes, but cheaper to surface as `&'static
+    /// str` since the FORM walker always knows which chunk-class
+    /// duplicated).
+    DuplicateChunk(&'static str),
+
+    /// Two markers inside the same MARK chunk shared a `MarkerId`,
+    /// which §6.0 of the AIFF-C spec explicitly forbids ("the id can
+    /// be any positive non-zero integer, as long as no other marker
+    /// within the same FORM AIFC has the same id").
+    DuplicateMarkerId(i16),
 }
 
 impl fmt::Display for AiffError {
@@ -138,6 +152,12 @@ impl fmt::Display for AiffError {
                 f,
                 "SSND payload of {payload} bytes is not a multiple of frame_size={frame_size}"
             ),
+            Self::DuplicateChunk(what) => {
+                write!(f, "FORM contains more than one `{what}` chunk")
+            }
+            Self::DuplicateMarkerId(id) => {
+                write!(f, "MARK chunk contains duplicate MarkerId {id}")
+            }
         }
     }
 }

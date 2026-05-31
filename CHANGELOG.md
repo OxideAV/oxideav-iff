@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **AIFF / AIFF-C `MARK` (Marker) chunk parsing.** The FORM walker
+  now decodes the `MARK` chunk into a structured
+  [`aiff::MarkerChunk`] surfaced through [`aiff::Form::markers`].
+  Each [`aiff::Marker`] carries the spec's `id` (big-endian `i16`,
+  > 0, unique within the FORM), `position` (big-endian `u32` sample
+  frame; for compressed AIFF-C streams the spec defines this in
+  expanded-domain frames per §6.0 ¶3), and pstring `name`
+  (length-prefixed with pad-to-even total). The parser enforces
+  every AIFF-C §6.0 invariant — at most one `MARK` chunk per FORM
+  (rejected as `AiffError::DuplicateChunk("MARK")`), positive
+  `MarkerId` (rejected as `AiffError::InvalidValue { what:
+  "MarkerId", ... }`), and unique-id-within-chunk (rejected as
+  `AiffError::DuplicateMarkerId`). Markers are exposed in document
+  order; `MarkerChunk::by_id` provides the typical
+  lookup-by-id needed when the AIFF-C `INST` (instrument) chunk
+  references loop endpoints by marker id. 17 new tests across the
+  `aiff::marker`, `aiff::form` and `tests/aiff_markers.rs`
+  surfaces.
+
+### Changed
+
+- `aiff::Form` gains a `markers: Option<MarkerChunk>` field —
+  `None` when the FORM has no `MARK` chunk, `Some(MarkerChunk{
+  markers: vec![] })` for an empty marker list (the encoder
+  declared markers but had none).
+
+
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-iff/compare/v0.0.7...v0.0.8) - 2026-05-30
 
 ### Other

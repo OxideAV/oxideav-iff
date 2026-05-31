@@ -9,6 +9,7 @@
 use crate::aiff::chunk::ChunkIter;
 use crate::aiff::common::{parse_common, CommonChunk};
 use crate::aiff::error::{AiffError, Result};
+use crate::aiff::marker::{parse_marker_chunk, MarkerChunk};
 
 /// Parsed SSND (Sound Data) chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +45,11 @@ pub struct Form<'a> {
     /// per §3.1; we surface it without insisting on it so files
     /// missing the chunk still parse.
     pub fver_timestamp: Option<u32>,
+    /// Parsed MARK chunk, when present. Per §6.0 of the AIFF-C spec
+    /// only one MARK chunk may appear per FORM (the parser rejects
+    /// duplicates with [`AiffError::DuplicateChunk`]); a FORM with no
+    /// MARK chunk yields `None`.
+    pub markers: Option<MarkerChunk>,
 }
 
 /// Parse a complete AIFF / AIFF-C file. `buf` is the raw file
@@ -82,6 +88,7 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
     let mut common: Option<CommonChunk> = None;
     let mut sound: Option<SoundData<'_>> = None;
     let mut fver_timestamp: Option<u32> = None;
+    let mut markers: Option<MarkerChunk> = None;
 
     for chunk in ChunkIter::new(inner) {
         let chunk = chunk?;
@@ -89,6 +96,15 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
             b"COMM" => {
                 let c = parse_common(chunk.data, form_type)?;
                 common = Some(c);
+            }
+            b"MARK" => {
+                // §6.0: "No more than one Marker Chunk can appear in
+                // a FORM AIFC." Reject a second one rather than
+                // silently dropping the older parse.
+                if markers.is_some() {
+                    return Err(AiffError::DuplicateChunk("MARK"));
+                }
+                markers = Some(parse_marker_chunk(chunk.data)?);
             }
             b"SSND" => {
                 if chunk.data.len() < 8 {
@@ -153,6 +169,7 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
         common,
         sound,
         fver_timestamp,
+        markers,
     })
 }
 
@@ -455,6 +472,143 @@ mod tests {
         assert_eq!(parsed.common.compression_type, Some(*b"NONE"));
         assert_eq!(parsed.sound.as_ref().unwrap().samples, &pcm);
         assert_eq!(parsed.fver_timestamp, Some(0xA280_5140));
+    }
+
+    /// Build a MARK chunk body containing the given marker list.
+    /// Each marker: id + position + pstring (with pad-to-even).
+    fn build_mark_chunk(markers: &[(i16, u32, &str)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(markers.len() as u16).to_be_bytes());
+        for (id, pos, name) in markers {
+            body.extend_from_slice(&id.to_be_bytes());
+            body.extend_from_slice(&pos.to_be_bytes());
+            body.push(name.len() as u8);
+            body.extend_from_slice(name.as_bytes());
+            if (1 + name.len()) % 2 == 1 {
+                body.push(0);
+            }
+        }
+        body
+    }
+
+    #[test]
+    fn parses_form_with_marker_chunk() {
+        // FORM(AIFF) wrapping COMM + MARK + SSND.
+        let pcm = [0x00_u8, 0x01, 0x02, 0x03];
+        let mut comm_body = Vec::new();
+        comm_body.extend_from_slice(&1_i16.to_be_bytes());
+        comm_body.extend_from_slice(&2_u32.to_be_bytes());
+        comm_body.extend_from_slice(&16_i16.to_be_bytes());
+        comm_body.extend_from_slice(&ext(44_100.0));
+
+        let mut ssnd_body = Vec::new();
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&pcm);
+
+        let mark_body = build_mark_chunk(&[(1, 0, "begin"), (2, 1, "end")]);
+
+        let mut inner = Vec::new();
+        inner.extend_from_slice(b"AIFF");
+        inner.extend_from_slice(&pack(b"COMM", &comm_body));
+        inner.extend_from_slice(&pack(b"MARK", &mark_body));
+        inner.extend_from_slice(&pack(b"SSND", &ssnd_body));
+        let mut f = Vec::new();
+        f.extend_from_slice(b"FORM");
+        f.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        f.extend_from_slice(&inner);
+
+        let parsed = parse(&f).unwrap();
+        let marks = parsed.markers.as_ref().unwrap();
+        assert_eq!(marks.markers.len(), 2);
+        assert_eq!(marks.markers[0].id, 1);
+        assert_eq!(marks.markers[0].position, 0);
+        assert_eq!(marks.markers[0].name, "begin");
+        assert_eq!(marks.markers[1].id, 2);
+        assert_eq!(marks.markers[1].position, 1);
+        assert_eq!(marks.markers[1].name, "end");
+        // SSND must still parse alongside MARK.
+        assert_eq!(parsed.sound.as_ref().unwrap().samples, &pcm);
+    }
+
+    #[test]
+    fn rejects_duplicate_mark_chunks() {
+        // §6.0: at most one MARK per FORM.
+        let pcm = [0x00_u8, 0x01];
+        let mut comm_body = Vec::new();
+        comm_body.extend_from_slice(&1_i16.to_be_bytes());
+        comm_body.extend_from_slice(&1_u32.to_be_bytes());
+        comm_body.extend_from_slice(&16_i16.to_be_bytes());
+        comm_body.extend_from_slice(&ext(44_100.0));
+
+        let mut ssnd_body = Vec::new();
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&pcm);
+
+        let mark_body_a = build_mark_chunk(&[(1, 0, "first")]);
+        let mark_body_b = build_mark_chunk(&[(2, 0, "second")]);
+
+        let mut inner = Vec::new();
+        inner.extend_from_slice(b"AIFF");
+        inner.extend_from_slice(&pack(b"COMM", &comm_body));
+        inner.extend_from_slice(&pack(b"MARK", &mark_body_a));
+        inner.extend_from_slice(&pack(b"MARK", &mark_body_b));
+        inner.extend_from_slice(&pack(b"SSND", &ssnd_body));
+        let mut f = Vec::new();
+        f.extend_from_slice(b"FORM");
+        f.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        f.extend_from_slice(&inner);
+
+        assert!(matches!(parse(&f), Err(AiffError::DuplicateChunk("MARK"))));
+    }
+
+    #[test]
+    fn form_without_mark_chunk_has_none_markers() {
+        // Re-uses build_aiff_file's tiny fixture; should produce
+        // `markers: None`.
+        let f = build_aiff_file(1, 1, 16, 44_100.0, &[0x00, 0x01]);
+        let parsed = parse(&f).unwrap();
+        assert!(parsed.markers.is_none());
+    }
+
+    #[test]
+    fn aifc_with_empty_marker_list_yields_some_empty() {
+        // Empty MARK chunk: numMarkers=0, no marker bodies. The
+        // chunk *is* present so `markers` must be `Some` — telling
+        // the caller the encoder declared markers but had none.
+        let pcm = [0x12_u8, 0x34];
+        let mut comm_body = Vec::new();
+        comm_body.extend_from_slice(&1_i16.to_be_bytes());
+        comm_body.extend_from_slice(&1_u32.to_be_bytes());
+        comm_body.extend_from_slice(&16_i16.to_be_bytes());
+        comm_body.extend_from_slice(&ext(44_100.0));
+        comm_body.extend_from_slice(b"NONE");
+        comm_body.push(0);
+        comm_body.push(0);
+
+        let mut ssnd_body = Vec::new();
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&pcm);
+
+        let fver_body = 0xA280_5140_u32.to_be_bytes();
+        let mark_body: Vec<u8> = 0_u16.to_be_bytes().to_vec();
+
+        let mut inner = Vec::new();
+        inner.extend_from_slice(b"AIFC");
+        inner.extend_from_slice(&pack(b"FVER", &fver_body));
+        inner.extend_from_slice(&pack(b"COMM", &comm_body));
+        inner.extend_from_slice(&pack(b"MARK", &mark_body));
+        inner.extend_from_slice(&pack(b"SSND", &ssnd_body));
+        let mut f = Vec::new();
+        f.extend_from_slice(b"FORM");
+        f.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        f.extend_from_slice(&inner);
+
+        let parsed = parse(&f).unwrap();
+        let marks = parsed.markers.as_ref().unwrap();
+        assert!(marks.markers.is_empty());
     }
 
     #[test]

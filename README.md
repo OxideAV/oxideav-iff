@@ -14,9 +14,12 @@ crate ships:
 - **FORM/ANIM** — op-0 literal + op-5 byte-vertical delta
   (encode+decode) + op-7 Short/Long Vertical Delta (decode).
 - **FORM/AIFF and FORM/AIFC** — Apple AIFF / AIFF-C (read):
-  COMM/SSND/FVER walker, 80-bit IEEE-extended sample-rate decode,
-  PCM compression-flavour readers for `NONE` / `twos` / `sowt` /
-  `raw ` / `fl32` / `FL32` / `fl64` / `FL64`. Codec-bearing
+  COMM/SSND/FVER/MARK walker, 80-bit IEEE-extended sample-rate
+  decode, PCM compression-flavour readers for `NONE` / `twos` /
+  `sowt` / `raw ` / `fl32` / `FL32` / `fl64` / `FL64`, and
+  structured `MARK` chunk parsing (`MarkerChunk` → id /
+  sample-frame position / pstring name per marker, with
+  one-per-FORM enforcement and unique-id validation). Codec-bearing
   `compressionType` FourCCs (`ima4`, `ulaw`, `alaw`, …) are
   recognised in the parser but routed through sibling codec
   crates rather than decoded here.
@@ -288,6 +291,34 @@ println!("{}x{} → {} bytes RGBA", img.width, img.height, img.rgba.len());
   so animation viewers can compose per-scanline state + per-tick
   rotation without re-implementing the bookkeeping.
 
+### AIFF / AIFF-C marker chunks
+
+`MARK` chunks are parsed into a structured
+[`aiff::MarkerChunk`] surface exposed via
+[`aiff::Form::markers`]:
+
+| Field            | On-wire                | API                                  |
+|------------------|------------------------|--------------------------------------|
+| numMarkers       | big-endian `u16`       | `markers.len()`                      |
+| `Marker.id`      | big-endian `i16` (>0)  | `Marker::id`                         |
+| `Marker.position`| big-endian `u32` frame | `Marker::position`                   |
+| `Marker.name`    | pstring (len+chars+pad)| `Marker::name` (UTF-8 lossy)         |
+
+The parser enforces every constraint AIFF-C §6.0 imposes:
+
+- At most one `MARK` chunk per FORM ([`AiffError::DuplicateChunk("MARK")`]).
+- Every `MarkerId` strictly positive ([`AiffError::InvalidValue`]).
+- All `MarkerId`s unique inside the chunk ([`AiffError::DuplicateMarkerId`]).
+- pstring `length + chars` rounded up to an even total; missing pad
+  at end-of-chunk is tolerated (mirrors the chunk walker's existing
+  EOF tolerance for the outer ckSize pad byte).
+
+Markers are preserved in document order; spec is explicit that
+"markers need not be ordered in any particular manner" so we don't
+re-sort. `MarkerChunk::by_id(id)` is a convenience lookup that mirrors
+the way the AIFF-C `INST` (instrument) chunk references loop marker
+endpoints by id.
+
 ## Roadmap
 
 The chunk walker (`chunk.rs`) is format-agnostic; AIFF (Apple audio),
@@ -295,7 +326,11 @@ SMUS (music score) and MAUD are natural follow-ons that reuse the
 same FORM/LIST/CAT reader. ANIM op-7 (short / long vertical delta)
 decode landed in r192; op-7 encode + op-8 decode/encode remain open
 ILBM-side extensions; DEEP / TVPP / RGB8 / RGBN true-colour IFF
-chunks are the next ILBM-side decode candidates.
+chunks are the next ILBM-side decode candidates. AIFF-side, the
+`INST` (instrument) chunk — which references the now-parsed MARK
+list by id to encode sampler loop endpoints — is the natural
+follow-up, followed by `COMT` (timestamped comments) and a MARK
+chunk encoder for write-side support.
 
 ## License
 
