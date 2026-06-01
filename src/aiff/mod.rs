@@ -48,22 +48,35 @@
 //! [`error::AiffError::UnsupportedPcmCompression`] for those so
 //! callers can dispatch cleanly.
 //!
-//! The optional text chunks (`NAME`, `AUTH`, `(c) `, `ANNO`, `COMT`),
-//! the instrument chunk (`INST`), and the MIDI / AESD / APPL chunks
-//! are recognised by the chunk walker and skipped silently by the
-//! FORM-level parser; later rounds will surface them as structured
-//! fields.
+//! The optional text chunks (`NAME`, `AUTH`, `(c) `, `ANNO`, `COMT`)
+//! and the MIDI / AESD / APPL chunks are recognised by the chunk
+//! walker and skipped silently by the FORM-level parser; later rounds
+//! will surface them as structured fields.
 //!
 //! The `MARK` (marker) chunk is parsed into a structured
 //! [`MarkerChunk`] (id / sample-frame position / pstring name per
 //! marker) and surfaced through [`Form::markers`]. Multiple MARK
 //! chunks inside the same FORM are rejected per §6.0 of the spec.
+//!
+//! The `INST` (instrument) chunk is parsed into [`InstrumentChunk`]
+//! and surfaced through [`Form::instrument`]. The decoded fields
+//! cover sampler playback parameters (baseNote, detune, low/high
+//! note + velocity ranges, gain) and the two `Loop` substructures
+//! (sustainLoop, releaseLoop). The accompanying
+//! [`InstrumentChunk::resolve_sustain_loop`] /
+//! [`InstrumentChunk::resolve_release_loop`] helpers join the loop
+//! endpoints against the FORM's [`MarkerChunk`] and apply §9's
+//! "begin position must be less than the end position" rule so
+//! callers can ask "what does the spec say to actually play?". At
+//! most one `INST` chunk per FORM is permitted; a second one is
+//! rejected as [`AiffError::DuplicateChunk`].
 
 pub mod chunk;
 pub mod common;
 pub mod error;
 pub mod extended;
 pub mod form;
+pub mod instrument;
 pub mod marker;
 pub mod pcm;
 
@@ -77,6 +90,7 @@ pub use common::{
 pub use error::{AiffError, Result};
 pub use extended::{decode_extended, decode_sample_rate};
 pub use form::{parse, Form, SoundData};
+pub use instrument::{parse_instrument_chunk, InstrumentChunk, Loop, PlayMode, ResolvedLoop};
 pub use marker::{parse_marker_chunk, Marker, MarkerChunk};
 pub use pcm::{decode_pcm, is_pcm_compression, PcmSamples};
 

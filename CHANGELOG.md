@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AIFF / AIFF-C `INST` (Instrument) chunk parsing.** The FORM
+  walker now decodes the `INST` chunk into a structured
+  [`aiff::InstrumentChunk`] surfaced through
+  [`aiff::Form::instrument`]. Every wire field is preserved:
+  `baseNote` / `lowNote` / `highNote` (MIDI 0..=127),
+  `detune` (cents -50..=+50), `lowVelocity` / `highVelocity`
+  (1..=127), signed-dB `gain`, plus the two `Loop`
+  substructures (sustainLoop, releaseLoop) which carry a decoded
+  [`aiff::PlayMode`] (`NoLooping` / `ForwardLooping` /
+  `ForwardBackwardLooping`) and the two `MarkerId`s referencing the
+  FORM's MARK chunk. The parser enforces every §9 invariant — at
+  most one `INST` chunk per FORM (rejected as
+  `AiffError::DuplicateChunk("INST")`), exact 20-byte ckDataSize
+  ("ckDataSize is always 20" — shorter is `Truncated`, longer is
+  `InvalidValue { what: "INST ckSize", ... }`), MIDI-note range,
+  detune range, velocity range, and a known `playMode`. The
+  accompanying [`aiff::InstrumentChunk::resolve_sustain_loop`] /
+  [`aiff::InstrumentChunk::resolve_release_loop`] helpers join the
+  loop endpoints against the FORM's [`aiff::MarkerChunk`] and apply
+  §9 ¶ "beginLoop and endLoop": "The begin position must be less
+  than the end position so the loop segment will have a positive
+  length. [If this is not the case, then ignore this loop segment.
+  No looping takes place.]" — returning `None` whenever
+  `playMode == None`, an endpoint id isn't a positive marker id,
+  either id isn't present in the supplied MARK list, or the begin
+  marker's frame position isn't strictly less than the end marker's.
+  22 new tests across the `aiff::instrument`, `aiff::form` and
+  `tests/aiff_instrument.rs` surfaces.
+
 - **AIFF / AIFF-C `MARK` (Marker) chunk parsing.** The FORM walker
   now decodes the `MARK` chunk into a structured
   [`aiff::MarkerChunk`] surfaced through [`aiff::Form::markers`].
@@ -34,6 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `None` when the FORM has no `MARK` chunk, `Some(MarkerChunk{
   markers: vec![] })` for an empty marker list (the encoder
   declared markers but had none).
+- `aiff::Form` gains an `instrument: Option<InstrumentChunk>`
+  field — `None` when the FORM has no `INST` chunk, `Some(_)`
+  otherwise. New since the previous Unreleased entry.
 
 
 

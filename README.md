@@ -14,15 +14,19 @@ crate ships:
 - **FORM/ANIM** — op-0 literal + op-5 byte-vertical delta
   (encode+decode) + op-7 Short/Long Vertical Delta (decode).
 - **FORM/AIFF and FORM/AIFC** — Apple AIFF / AIFF-C (read):
-  COMM/SSND/FVER/MARK walker, 80-bit IEEE-extended sample-rate
+  COMM/SSND/FVER/MARK/INST walker, 80-bit IEEE-extended sample-rate
   decode, PCM compression-flavour readers for `NONE` / `twos` /
-  `sowt` / `raw ` / `fl32` / `FL32` / `fl64` / `FL64`, and
-  structured `MARK` chunk parsing (`MarkerChunk` → id /
-  sample-frame position / pstring name per marker, with
-  one-per-FORM enforcement and unique-id validation). Codec-bearing
-  `compressionType` FourCCs (`ima4`, `ulaw`, `alaw`, …) are
-  recognised in the parser but routed through sibling codec
-  crates rather than decoded here.
+  `sowt` / `raw ` / `fl32` / `FL32` / `fl64` / `FL64`, structured
+  `MARK` chunk parsing (`MarkerChunk` → id / sample-frame position /
+  pstring name per marker, with one-per-FORM enforcement and
+  unique-id validation), and structured `INST` (instrument) chunk
+  parsing (`InstrumentChunk` → MIDI baseNote/lowNote/highNote +
+  detune + lowVelocity/highVelocity + signed-dB gain +
+  sustainLoop/releaseLoop with `resolve_sustain_loop` /
+  `resolve_release_loop` joining the loop endpoints against the
+  MARK list per §9). Codec-bearing `compressionType` FourCCs
+  (`ima4`, `ulaw`, `alaw`, …) are recognised in the parser but
+  routed through sibling codec crates rather than decoded here.
 
 Zero C dependencies.
 
@@ -315,22 +319,66 @@ The parser enforces every constraint AIFF-C §6.0 imposes:
 
 Markers are preserved in document order; spec is explicit that
 "markers need not be ordered in any particular manner" so we don't
-re-sort. `MarkerChunk::by_id(id)` is a convenience lookup that mirrors
-the way the AIFF-C `INST` (instrument) chunk references loop marker
-endpoints by id.
+re-sort. `MarkerChunk::by_id(id)` is a convenience lookup that
+[`InstrumentChunk::resolve_sustain_loop`] (below) uses internally to
+join the sampler loop endpoints back against this list.
+
+### AIFF / AIFF-C instrument chunk
+
+`INST` chunks are parsed into a structured
+[`aiff::InstrumentChunk`] surface exposed via
+[`aiff::Form::instrument`]:
+
+| Field                     | On-wire                    | API                              |
+|---------------------------|----------------------------|----------------------------------|
+| baseNote                  | `char` (MIDI 0..=127)      | `InstrumentChunk::base_note`     |
+| detune                    | `char` signed (cents -50..+50) | `InstrumentChunk::detune`    |
+| lowNote / highNote        | `char` (MIDI 0..=127)      | `low_note` / `high_note`         |
+| lowVelocity / highVelocity| `char` (1..=127)           | `low_velocity` / `high_velocity` |
+| gain                      | big-endian `i16` (dB)      | `InstrumentChunk::gain`          |
+| sustainLoop / releaseLoop | 6-byte `Loop`              | `sustain_loop` / `release_loop`  |
+
+Each `Loop` exposes the decoded [`aiff::PlayMode`]
+(`NoLooping` / `ForwardLooping` / `ForwardBackwardLooping`) and the
+two `MarkerId`s referencing the FORM's MARK chunk.
+
+The parser enforces every constraint AIFF-C §9 imposes:
+
+- At most one `INST` chunk per FORM ([`AiffError::DuplicateChunk("INST")`]).
+- Exact 20-byte ckDataSize ("ckDataSize is always 20" — shorter is
+  [`AiffError::Truncated`], longer is
+  [`AiffError::InvalidValue { what: "INST ckSize" }`]).
+- MIDI note range `0..=127` on baseNote / lowNote / highNote
+  ([`AiffError::InvalidValue`]).
+- detune cent range `-50..=+50` ([`AiffError::InvalidValue`]).
+- Velocity range `1..=127` on lowVelocity / highVelocity
+  ("1 [lowest velocity] through 127 [highest velocity]").
+- playMode in `0..=2`.
+
+[`InstrumentChunk::resolve_sustain_loop`] /
+[`InstrumentChunk::resolve_release_loop`] join a loop's `MarkerId`
+endpoints against the FORM's [`aiff::MarkerChunk`] and apply §9 ¶
+"beginLoop and endLoop": "The begin position must be less than the
+end position so the loop segment will have a positive length. [If
+this is not the case, then ignore this loop segment. No looping
+takes place.]" Returns `None` whenever `playMode == None`, an
+endpoint id isn't a positive marker id, either id isn't present
+in the supplied MARK list, or the begin marker's frame position
+isn't strictly less than the end marker's — letting the caller
+ask "what does the spec say to actually play?" without
+re-implementing the bookkeeping.
 
 ## Roadmap
 
-The chunk walker (`chunk.rs`) is format-agnostic; AIFF (Apple audio),
-SMUS (music score) and MAUD are natural follow-ons that reuse the
-same FORM/LIST/CAT reader. ANIM op-7 (short / long vertical delta)
-decode landed in r192; op-7 encode + op-8 decode/encode remain open
-ILBM-side extensions; DEEP / TVPP / RGB8 / RGBN true-colour IFF
-chunks are the next ILBM-side decode candidates. AIFF-side, the
-`INST` (instrument) chunk — which references the now-parsed MARK
-list by id to encode sampler loop endpoints — is the natural
-follow-up, followed by `COMT` (timestamped comments) and a MARK
-chunk encoder for write-side support.
+The chunk walker (`chunk.rs`) is format-agnostic; SMUS (music score)
+and MAUD are natural follow-ons that reuse the same FORM/LIST/CAT
+reader. ANIM op-7 (short / long vertical delta) decode landed in
+r192; op-7 encode + op-8 decode/encode remain open ILBM-side
+extensions; DEEP / TVPP / RGB8 / RGBN true-colour IFF chunks are
+the next ILBM-side decode candidates. AIFF-side, `COMT`
+(timestamped comments) and MARK / INST write-side encoders are the
+natural next steps, followed by the AESD (audio recording) and
+APPL (application-specific) chunk surfaces.
 
 ## License
 
