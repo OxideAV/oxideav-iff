@@ -349,15 +349,23 @@ pub fn parse_anim(bytes: &[u8]) -> Result<AnimImage> {
                         }
                         match &cid {
                             b"ANHD" => anhd = Some(Anhd::parse(&bytes[cdata_start..cdata_end])?),
-                            b"BODY" => delta_body = Some(bytes[cdata_start..cdata_end].to_vec()),
+                            // Op-5 / op-0 emit `BODY`; op-7 emits
+                            // `DLTA` (per the Appendix). Both are
+                            // delta payloads from the per-frame
+                            // operation's perspective so we map both
+                            // into `delta_body`.
+                            b"BODY" | b"DLTA" => {
+                                delta_body = Some(bytes[cdata_start..cdata_end].to_vec())
+                            }
                             _ => {} // skip CMAP/DPI/etc on delta frames
                         }
                         sub = cdata_start + csize + (csize & 1);
                     }
                     let anhd =
                         anhd.ok_or_else(|| Error::invalid("ANIM: delta frame missing ANHD chunk"))?;
-                    let delta = delta_body
-                        .ok_or_else(|| Error::invalid("ANIM: delta frame missing BODY chunk"))?;
+                    let delta = delta_body.ok_or_else(|| {
+                        Error::invalid("ANIM: delta frame missing BODY/DLTA chunk")
+                    })?;
                     let mut planar = prev_planar.clone().ok_or_else(|| {
                         Error::invalid("ANIM: delta frame with no prior planar state")
                     })?;
@@ -1128,6 +1136,368 @@ pub fn encode_anim_op5(frames: &[IlbmImage]) -> Result<Vec<u8>> {
         out.extend_from_slice(&(body.len() as u32).to_be_bytes());
         out.extend_from_slice(&body);
         if body.len() & 1 == 1 {
+            out.push(0);
+        }
+        prev_planar = cur_planar;
+    }
+
+    let form_size = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&form_size.to_be_bytes());
+    Ok(out)
+}
+
+/// Encode a single op-7 (Short / Long Vertical Delta) DLTA payload
+/// from a previous and current planar frame.
+///
+/// `prev_planar` and `cur_planar` are the row-major flat arrays of
+/// bitplane rows in IFF order (`planes_per_row = n_planes +
+/// mask_plane`), each row being `row_bytes` long, in the same shape
+/// used by the decoder ([`apply_op7`]). They must agree in
+/// dimensions and in the number of stored colour planes.
+///
+/// `long_data` selects the data-item width: `false` = short (2-byte
+/// items, the typical case) and `true` = long (4-byte items, set
+/// when `ANHD.bits` bit 0 is on). `row_bytes` MUST divide evenly by
+/// the resulting data-item width; mismatched widths are rejected as
+/// [`Error::invalid`].
+///
+/// The output is the DLTA chunk body: a 64-byte pointer table (16 ×
+/// u32 BE — 8 opcode-list pointers, then 8 data-list pointers)
+/// followed by per-plane opcode lists and data lists. Plane slots
+/// that aren't dirty get a `0` opcode pointer; the matching data
+/// pointer is also `0` for consistency (the decoder reads it only
+/// when the opcode pointer is non-zero).
+///
+/// Per `docs/image/iff/anim.txt` Appendix Anim7 §#.# the per-column
+/// op stream is `op_count + ops[]` where each op is one of:
+///
+/// * **Skip** — hi bit clear, non-zero. Advance the dest cursor by
+///   `op` rows. No data consumed.
+/// * **Uniq** — hi bit set. Copy `op & 0x7F` data items literally,
+///   one per consecutive row.
+/// * **Same** — `0x00` followed by a count byte. Copy one data item
+///   to the next `count` rows.
+///
+/// The encoder splits each column into runs of equal-vs-different
+/// data items and picks the cheapest opcode per run, matching the
+/// op-5 encoder's greedy strategy adapted to the per-column op-count
+/// layout (op-7 has an explicit `op_count` byte instead of op-5's
+/// `0x00` column terminator).
+///
+/// Used by [`encode_anim_op7`] but exposed publicly so callers
+/// driving the lower-level container can build their own ANIM7
+/// streams.
+pub fn encode_op7_body(
+    prev_planar: &[Vec<u8>],
+    cur_planar: &[Vec<u8>],
+    bmhd: &Bmhd,
+    long_data: bool,
+) -> Result<Vec<u8>> {
+    let n_planes = bmhd.n_planes as usize;
+    let has_mask = bmhd.masking == Masking::HasMask;
+    let planes_per_row = n_planes + has_mask as usize;
+    let row_bytes = bmhd.row_bytes();
+    let height = bmhd.height as usize;
+    let data_size = if long_data { 4 } else { 2 };
+    let expected = height * planes_per_row;
+    if prev_planar.len() != expected || cur_planar.len() != expected {
+        return Err(Error::invalid(format!(
+            "ANIM op 7 encode: planar buffers have {} / {} rows, expected {expected}",
+            prev_planar.len(),
+            cur_planar.len()
+        )));
+    }
+    if n_planes > 8 {
+        // op-7 pointer table is 8 opcode + 8 data slots; > 8 planes
+        // can't address every plane via op-7.
+        return Err(Error::unsupported(format!(
+            "ANIM op 7 encode: requires ≤ 8 colour planes (got {n_planes})"
+        )));
+    }
+    if row_bytes % data_size != 0 {
+        return Err(Error::invalid(format!(
+            "ANIM op 7 encode: row_bytes {row_bytes} not a multiple of data size {data_size}"
+        )));
+    }
+    let cols = row_bytes / data_size;
+
+    // Per-plane opcode + data lists, plus a dirty flag.
+    let mut plane_op: Vec<Vec<u8>> = vec![Vec::new(); 8];
+    let mut plane_data: Vec<Vec<u8>> = vec![Vec::new(); 8];
+    let mut plane_dirty = [false; 8];
+
+    for p in 0..n_planes {
+        let mut op_list: Vec<u8> = Vec::new();
+        let mut data_list: Vec<u8> = Vec::new();
+        let mut any_change = false;
+        for col in 0..cols {
+            let col_byte = col * data_size;
+            // Collect this column's per-row data items (one slice of
+            // `data_size` bytes per row) for prev and cur. Equality
+            // between items determines skip-vs-write per row.
+            //
+            // `col_ops` holds the byte-serialised opcode stream;
+            // `col_op_count` counts *logical* ops (the value the
+            // op_count prefix byte records — the decoder loops
+            // `op_count` times consuming variable-length opcodes).
+            let mut col_ops: Vec<u8> = Vec::new();
+            let mut col_op_count: usize = 0;
+            let mut col_data: Vec<u8> = Vec::new();
+            let mut row = 0usize;
+            while row < height {
+                // Compare data items.
+                let prev_row = &prev_planar[row * planes_per_row + p];
+                let cur_row = &cur_planar[row * planes_per_row + p];
+                let prev_item = if col_byte + data_size <= prev_row.len() {
+                    &prev_row[col_byte..col_byte + data_size]
+                } else {
+                    &[][..]
+                };
+                let cur_item = if col_byte + data_size <= cur_row.len() {
+                    &cur_row[col_byte..col_byte + data_size]
+                } else {
+                    &[][..]
+                };
+                if prev_item == cur_item && !prev_item.is_empty() {
+                    // Count contiguous unchanged rows from `row`.
+                    let mut skip = 0usize;
+                    while row + skip < height {
+                        let pr = &prev_planar[(row + skip) * planes_per_row + p];
+                        let cr = &cur_planar[(row + skip) * planes_per_row + p];
+                        let pi = if col_byte + data_size <= pr.len() {
+                            &pr[col_byte..col_byte + data_size]
+                        } else {
+                            &[][..]
+                        };
+                        let ci = if col_byte + data_size <= cr.len() {
+                            &cr[col_byte..col_byte + data_size]
+                        } else {
+                            &[][..]
+                        };
+                        if pi != ci || pi.is_empty() {
+                            break;
+                        }
+                        skip += 1;
+                    }
+                    // Skip ops are a single byte with the hi bit
+                    // clear: value 1..=127. Split runs longer than
+                    // 127 into multiple skips. Each skip is one
+                    // logical op.
+                    let mut remaining = skip;
+                    while remaining > 0 {
+                        let chunk = remaining.min(0x7F);
+                        col_ops.push(chunk as u8);
+                        col_op_count += 1;
+                        remaining -= chunk;
+                    }
+                    row += skip;
+                } else {
+                    // Find the contiguous changed run starting at `row`.
+                    let mut end = row + 1;
+                    while end < height {
+                        let pr = &prev_planar[end * planes_per_row + p];
+                        let cr = &cur_planar[end * planes_per_row + p];
+                        let pi = if col_byte + data_size <= pr.len() {
+                            &pr[col_byte..col_byte + data_size]
+                        } else {
+                            &[][..]
+                        };
+                        let ci = if col_byte + data_size <= cr.len() {
+                            &cr[col_byte..col_byte + data_size]
+                        } else {
+                            &[][..]
+                        };
+                        if pi == ci && !pi.is_empty() {
+                            break;
+                        }
+                        end += 1;
+                    }
+                    // Emit the run by picking Same-vs-Uniq per
+                    // sub-run, capping at 127 for Uniq (hi bit
+                    // available) and 255 for Same (count byte).
+                    let mut i = row;
+                    while i < end {
+                        // Look for a maximal repeat of the same
+                        // data item starting at i.
+                        let item_start = i * planes_per_row + p;
+                        let v = &cur_planar[item_start][col_byte..col_byte + data_size];
+                        let mut rep_end = i + 1;
+                        while rep_end < end && rep_end - i < 0xFF {
+                            let cand = &cur_planar[rep_end * planes_per_row + p]
+                                [col_byte..col_byte + data_size];
+                            if cand != v {
+                                break;
+                            }
+                            rep_end += 1;
+                        }
+                        let rep_len = rep_end - i;
+                        // Same op costs 2 bytes (op + cnt) of op
+                        // stream + `data_size` of data; Uniq of
+                        // length L costs 1 byte of op stream + L *
+                        // data_size of data. Same is cheaper when L
+                        // ≥ 2; we use it for runs ≥ 2 (matches the
+                        // op-5 encoder's threshold scaled down for
+                        // the per-column op_count bookkeeping).
+                        if rep_len >= 2 {
+                            col_ops.push(0x00);
+                            col_ops.push(rep_len as u8);
+                            col_op_count += 1;
+                            col_data.extend_from_slice(v);
+                            i = rep_end;
+                        } else {
+                            // Uniq run: extend until we'd switch to a
+                            // Same opcode (2-run ahead) or hit the end
+                            // of the changed run, capped at 0x7F items.
+                            let lit_start = i;
+                            let mut lit_end = i + 1;
+                            while lit_end < end && lit_end - lit_start < 0x7F {
+                                let lv = &cur_planar[lit_end * planes_per_row + p]
+                                    [col_byte..col_byte + data_size];
+                                let next = lit_end + 1 < end
+                                    && &cur_planar[(lit_end + 1) * planes_per_row + p]
+                                        [col_byte..col_byte + data_size]
+                                        == lv;
+                                if next {
+                                    // 2-run ahead — close literal here.
+                                    break;
+                                }
+                                lit_end += 1;
+                            }
+                            let lit_len = lit_end - lit_start;
+                            debug_assert!((1..=0x7F).contains(&lit_len));
+                            col_ops.push(0x80 | lit_len as u8);
+                            col_op_count += 1;
+                            for r in lit_start..lit_end {
+                                let item = &cur_planar[r * planes_per_row + p]
+                                    [col_byte..col_byte + data_size];
+                                col_data.extend_from_slice(item);
+                            }
+                            i = lit_end;
+                        }
+                    }
+                    any_change = true;
+                    row = end;
+                }
+            }
+            // Per-column op stream: op_count byte + serialised ops.
+            // op_count of 0 is legal and means "column unchanged" —
+            // the decoder skips straight to the next column with no
+            // data consumed. op_count records the *logical* op count
+            // (not the byte length of the op stream); each iteration
+            // of the decoder's `for _ in 0..op_count` reads one
+            // variable-length opcode.
+            if col_op_count > u8::MAX as usize {
+                // Spec uses a u8 op-count; a column whose op stream
+                // wouldn't fit can't be emitted in op-7. Surface a
+                // diagnostic rather than truncate.
+                return Err(Error::unsupported(format!(
+                    "ANIM op 7 encode: column {col} of plane {p} produced {col_op_count} logical ops (max 255)"
+                )));
+            }
+            op_list.push(col_op_count as u8);
+            op_list.extend_from_slice(&col_ops);
+            data_list.extend_from_slice(&col_data);
+        }
+        if any_change {
+            plane_op[p] = op_list;
+            plane_data[p] = data_list;
+            plane_dirty[p] = true;
+        }
+    }
+
+    // Assemble: 64-byte pointer table + per-plane opcode lists +
+    // per-plane data lists. Pointers are absolute offsets from the
+    // start of the DLTA. Convention: opcode lists come first, then
+    // data lists — same layout the decoder reads.
+    let mut out = vec![0u8; 64];
+    // Opcode pointers (slots 0..=7).
+    for (slot, list) in plane_op.iter_mut().enumerate().take(8) {
+        if !plane_dirty[slot] {
+            continue;
+        }
+        let offset = out.len() as u32;
+        out[slot * 4..slot * 4 + 4].copy_from_slice(&offset.to_be_bytes());
+        out.append(list);
+    }
+    // Data pointers (slots 8..=15).
+    for (slot, list) in plane_data.iter_mut().enumerate().take(8) {
+        if !plane_dirty[slot] {
+            continue;
+        }
+        let offset = out.len() as u32;
+        out[(8 + slot) * 4..(8 + slot) * 4 + 4].copy_from_slice(&offset.to_be_bytes());
+        out.append(list);
+    }
+    Ok(out)
+}
+
+/// Encode a sequence of ILBM frames as a FORM/ANIM file using
+/// `operation = 7` (Short / Long Vertical Delta) for every delta
+/// frame.
+///
+/// The seed frame is the full leading FORM ILBM (same as
+/// [`encode_anim_op0`] / [`encode_anim_op5`]); subsequent frames
+/// carry an `ANHD` (op = 7) plus a `DLTA` chunk produced by
+/// [`encode_op7_body`] from the diff between the prior and current
+/// planar frames. `long_data` selects the short (2-byte items;
+/// `ANHD.bits` bit 0 cleared) vs long (4-byte items; bit 0 set)
+/// variant.
+///
+/// Compatible with the in-tree [`parse_anim`] op-7 decoder; tested
+/// via `tests/anim_op7_encode.rs`.
+pub fn encode_anim_op7(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>> {
+    if frames.is_empty() {
+        return Err(Error::invalid(
+            "ANIM op 7 encode: at least one frame required",
+        ));
+    }
+    if frames[0].bmhd.n_planes > 8 {
+        return Err(Error::unsupported(format!(
+            "ANIM op 7 encode: requires ≤ 8 colour planes (got {})",
+            frames[0].bmhd.n_planes
+        )));
+    }
+    let leading = crate::ilbm::encode_ilbm(&frames[0])?;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"FORM");
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(b"ANIM");
+    out.extend_from_slice(&leading);
+    if leading.len() & 1 == 1 {
+        out.push(0);
+    }
+
+    let mut prev_planar = rgba_to_planar(&frames[0]);
+
+    for frame in &frames[1..] {
+        let cur_planar = rgba_to_planar(frame);
+        let dlta = encode_op7_body(&prev_planar, &cur_planar, &frame.bmhd, long_data)?;
+        let anhd = Anhd {
+            operation: 7,
+            mask: 0,
+            w: frame.bmhd.width,
+            h: frame.bmhd.height,
+            x: frame.bmhd.x_origin,
+            y: frame.bmhd.y_origin,
+            abs_time: 0,
+            rel_time: 1,
+            interleave: 0,
+            pad0: 0,
+            bits: if long_data { 1 } else { 0 },
+        };
+        let anhd_bytes = anhd.write(dlta.len() as u32);
+        // Inner FORM ILBM size = 4 ("ILBM") + 8+40 (ANHD) + 8 + dlta.
+        let inner_size = (4 + 8 + 40 + 8 + dlta.len()) as u32;
+        out.extend_from_slice(b"FORM");
+        out.extend_from_slice(&inner_size.to_be_bytes());
+        out.extend_from_slice(b"ILBM");
+        out.extend_from_slice(b"ANHD");
+        out.extend_from_slice(&40u32.to_be_bytes());
+        out.extend_from_slice(&anhd_bytes);
+        out.extend_from_slice(b"DLTA");
+        out.extend_from_slice(&(dlta.len() as u32).to_be_bytes());
+        out.extend_from_slice(&dlta);
+        if dlta.len() & 1 == 1 {
             out.push(0);
         }
         prev_planar = cur_planar;

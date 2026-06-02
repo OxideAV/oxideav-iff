@@ -9,6 +9,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ANIM op-7 (Short / Long Vertical Delta) encoder.** New
+  [`anim::encode_op7_body`] builds the 64-byte pointer table + 8
+  per-plane opcode lists + 8 per-plane data lists from a `prev` /
+  `cur` planar-frame pair, picking Skip / Same / Uniq ops per column
+  to minimise byte cost (Same for runs ≥ 2 items, Uniq otherwise,
+  Skip for unchanged runs). [`anim::encode_anim_op7`] wraps it into a
+  full FORM/ANIM file with leading `FORM ILBM` (seed) + per-delta
+  `FORM ILBM { ANHD(op=7, bits=long_data?1:0) + DLTA }` frames. The
+  short (2-byte items, `ANHD.bits` bit 0 cleared) and long (4-byte
+  items, bit set) variants both round-trip through the in-tree
+  [`anim::parse_anim`] decoder. The parser was extended to accept the
+  `DLTA` chunk id alongside `BODY` so op-7 / op-5 / op-0 streams all
+  decode via the same path. New `tests/anim_op7_encode.rs` exercises
+  identical-frame elimination, sparse and full-change deltas, short
+  vs long mode, and rejects `long_data=true` with `row_bytes`
+  unaligned to 4. Doc reference: `docs/image/iff/anim.txt` Appendix
+  Anim7 §#.# (Wolfgang Hofer, 23.6.92).
+- **AIFF / AIFF-C `COMT` (Comments) chunk parsing.** The FORM walker
+  now decodes the `COMT` chunk into a structured
+  [`aiff::CommentsChunk`] surfaced through [`aiff::Form::comments`]
+  per `docs/audio/aiff/aiff-c.txt` §7.0. Each comment carries a
+  `timestamp` (seconds since 1904-01-01 UTC, the Mac epoch), a
+  `MarkerId` (0 = comment is not linked to any marker, otherwise
+  references the FORM's MARK entry), and a UTF-8-lossy decoded text
+  body. The accompanying [`aiff::Comment::linked_marker`] returns
+  `Option<i16>` so callers can distinguish linked vs free-floating
+  comments without checking the marker field directly, and
+  [`aiff::Comment::resolve_marker`] joins the linkage against a
+  supplied [`aiff::MarkerChunk`]. At most one `COMT` per FORM per
+  §7.0 — duplicates are rejected as `AiffError::DuplicateChunk
+  ("COMT")`. The per-comment `text` pad byte rule (pad to even byte
+  count, pad NOT included in `count`) is honoured with the same
+  end-of-buffer tolerance as `MARK`.
+- **AIFF / AIFF-C `AESD` (Audio Recording) chunk parsing.** The FORM
+  walker now decodes the `AESD` chunk into a structured
+  [`aiff::AesdChunk`] surfaced through [`aiff::Form::aesd`] per
+  §11.0. The 24-byte AES channel-status block is preserved verbatim
+  in `status`; [`aiff::AesdChunk::emphasis`] extracts the 3-bit
+  recording-emphasis field from byte 0 bits 2..=4 the spec calls out
+  as "of general interest". At most one `AESD` per FORM per §11.0;
+  duplicates rejected as `AiffError::DuplicateChunk("AESD")`. The
+  spec's "ckDataSize is always 24" invariant is enforced — shorter
+  is `Truncated`, longer is
+  `InvalidValue { what: "AESD ckSize", ... }`.
+- **AIFF / AIFF-C `APPL` (Application Specific) chunk parsing.** The
+  FORM walker now decodes every `APPL` chunk into an
+  [`aiff::ApplicationChunk`] and collects them into
+  [`aiff::Form::applications`] in document order (§12.0 explicitly
+  permits any number of APPL chunks per FORM, unlike the other
+  optional chunks). [`aiff::ApplicationChunk::dialect`] classifies
+  the four-byte `applicationSignature` into the three §12.0
+  dialects (`pdos` Apple II, `stoc` non-Apple, anything else =
+  Macintosh); [`aiff::ApplicationChunk::application_name`] decodes
+  the leading Pascal-string application name for `pdos` / `stoc`
+  chunks (Macintosh dialect carries raw bytes with no required
+  leading structure) and [`aiff::ApplicationChunk::
+  payload_after_name`] returns the slice after the name, stepping
+  by exactly `1 + length_byte` (§12.0 specifies chunk-level
+  pad-to-even on the whole APPL but not an inner pad after the
+  leading pstring).
+- **`MARK` and `INST` write-side encoders.** Encoders building AIFF /
+  AIFF-C files can now construct the exact wire body for these
+  chunks via [`aiff::write_marker_chunk`] / [`aiff::
+  write_instrument_chunk`]. The marker writer preserves document
+  order, honours the §6.0 pstring pad-to-even discipline, and caps
+  oversize names / lists at the wire field widths (u8 length, u16
+  numMarkers); the instrument writer emits exactly 20 bytes in spec
+  field order and accepts arbitrary `Loop` substructures. Companion
+  [`aiff::write_comments_chunk`] / [`aiff::write_appl_chunk`] /
+  [`aiff::write_aesd_chunk`] cover the other newly-surfaced
+  chunks. All five round-trip through the FORM-level [`aiff::parse`]
+  walker (verified by `tests/aiff_optional_chunks.rs`).
 - **AIFF / AIFF-C `INST` (Instrument) chunk parsing.** The FORM
   walker now decodes the `INST` chunk into a structured
   [`aiff::InstrumentChunk`] surfaced through

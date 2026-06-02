@@ -132,6 +132,42 @@ pub fn parse_marker_chunk(data: &[u8]) -> Result<MarkerChunk> {
     Ok(out)
 }
 
+/// Encode a [`MarkerChunk`] body in wire format — the bytes that
+/// would follow a `MARK` chunk header: `numMarkers(2) + markers[]`
+/// where each marker is `id(2) + position(4) + pstring + pad-to-even`.
+///
+/// Useful for round-tripping MARK chunks through write-side
+/// container encoders; the chunk header itself (`'MARK' + ckSize`)
+/// is the caller's responsibility.
+///
+/// Per §6.0 the marker name is a Pascal-string limited to 255
+/// characters (one-byte length field). A name longer than that is
+/// truncated at 255 bytes; the parser will round-trip the truncated
+/// form. Document order is preserved verbatim — §6.0 explicitly
+/// allows any order so we don't sort or renumber.
+///
+/// `numMarkers` is `u16` on the wire; lists longer than `u16::MAX`
+/// are truncated at `u16::MAX` (consistent with [`super::comment::
+/// write_comments_chunk`]).
+pub fn write_marker_chunk(m: &MarkerChunk) -> Vec<u8> {
+    let count = m.markers.len().min(u16::MAX as usize);
+    let mut out = Vec::new();
+    out.extend_from_slice(&(count as u16).to_be_bytes());
+    for marker in &m.markers[..count] {
+        out.extend_from_slice(&marker.id.to_be_bytes());
+        out.extend_from_slice(&marker.position.to_be_bytes());
+        let name_bytes = marker.name.as_bytes();
+        let name_len = name_bytes.len().min(u8::MAX as usize);
+        out.push(name_len as u8);
+        out.extend_from_slice(&name_bytes[..name_len]);
+        // pstring pad: (1 + name_len) must be even per §6.0.
+        if (1 + name_len) % 2 == 1 {
+            out.push(0);
+        }
+    }
+    out
+}
+
 /// Decode a Pascal-string marker name. Returns the decoded name and
 /// the number of bytes consumed (including the length byte and the
 /// optional pad byte that aligns the total to an even count).
@@ -349,5 +385,86 @@ mod tests {
         let body = pack_chunk(&[(1, u32::MAX, "max")]);
         let m = parse_marker_chunk(&body).unwrap();
         assert_eq!(m.markers[0].position, u32::MAX);
+    }
+
+    #[test]
+    fn write_round_trips_through_parse() {
+        let chunk = MarkerChunk {
+            markers: vec![
+                Marker {
+                    id: 1,
+                    position: 0,
+                    name: "begin".into(),
+                },
+                Marker {
+                    id: 2,
+                    position: 44_100,
+                    name: "end".into(),
+                },
+                Marker {
+                    id: 3,
+                    position: 88_200,
+                    name: "".into(),
+                },
+            ],
+        };
+        let bytes = write_marker_chunk(&chunk);
+        let parsed = parse_marker_chunk(&bytes).unwrap();
+        assert_eq!(parsed, chunk);
+    }
+
+    #[test]
+    fn write_empty_chunk() {
+        let chunk = MarkerChunk::default();
+        let bytes = write_marker_chunk(&chunk);
+        assert_eq!(bytes, vec![0, 0]);
+        let parsed = parse_marker_chunk(&bytes).unwrap();
+        assert_eq!(parsed, chunk);
+    }
+
+    #[test]
+    fn write_matches_hand_packed_layout() {
+        // Hand-pack one marker and confirm write_marker_chunk
+        // produces the same bytes.
+        let chunk = MarkerChunk {
+            markers: vec![Marker {
+                id: 7,
+                position: 256,
+                name: "cue".into(),
+            }],
+        };
+        let bytes = write_marker_chunk(&chunk);
+        let expected = pack_chunk(&[(7, 256, "cue")]);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn write_preserves_document_order() {
+        // §6.0: "markers need not be ordered in any particular manner"
+        // — write must preserve whatever the caller passed.
+        let chunk = MarkerChunk {
+            markers: vec![
+                Marker {
+                    id: 10,
+                    position: 100,
+                    name: "z".into(),
+                },
+                Marker {
+                    id: 5,
+                    position: 50,
+                    name: "a".into(),
+                },
+                Marker {
+                    id: 7,
+                    position: 200,
+                    name: "m".into(),
+                },
+            ],
+        };
+        let bytes = write_marker_chunk(&chunk);
+        let parsed = parse_marker_chunk(&bytes).unwrap();
+        assert_eq!(parsed.markers[0].id, 10);
+        assert_eq!(parsed.markers[1].id, 5);
+        assert_eq!(parsed.markers[2].id, 7);
     }
 }

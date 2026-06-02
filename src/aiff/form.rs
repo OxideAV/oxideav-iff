@@ -6,7 +6,10 @@
 //! prescribed by the spec — `docs/audio/aiff/aiff-aifc-format.md` §4
 //! is explicit on this — so we scan all chunks and route by ckID.
 
+use crate::aiff::aesd::{parse_aesd_chunk, AesdChunk};
+use crate::aiff::appl::{parse_appl_chunk, ApplicationChunk};
 use crate::aiff::chunk::ChunkIter;
+use crate::aiff::comment::{parse_comments_chunk, CommentsChunk};
 use crate::aiff::common::{parse_common, CommonChunk};
 use crate::aiff::error::{AiffError, Result};
 use crate::aiff::instrument::{parse_instrument_chunk, InstrumentChunk};
@@ -56,6 +59,21 @@ pub struct Form<'a> {
     /// rejected as [`AiffError::DuplicateChunk`]); a FORM with no
     /// INST chunk yields `None`.
     pub instrument: Option<InstrumentChunk>,
+    /// Parsed COMT chunk, when present. Per §7.0 at most one COMT
+    /// chunk may appear per FORM (duplicates are rejected as
+    /// [`AiffError::DuplicateChunk`]); a FORM with no COMT chunk
+    /// yields `None`. The chunk may legally carry zero comments.
+    pub comments: Option<CommentsChunk>,
+    /// Parsed AESD chunk, when present. Per §11.0 at most one AESD
+    /// chunk may appear per FORM (duplicates are rejected as
+    /// [`AiffError::DuplicateChunk`]); a FORM with no AESD chunk
+    /// yields `None`.
+    pub aesd: Option<AesdChunk>,
+    /// Parsed APPL chunks in document order. Per §12.0 any number
+    /// of APPL chunks may appear per FORM, so this is a `Vec`
+    /// rather than an `Option`. An empty vector means no APPL
+    /// chunks were present.
+    pub applications: Vec<ApplicationChunk>,
 }
 
 /// Parse a complete AIFF / AIFF-C file. `buf` is the raw file
@@ -96,6 +114,9 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
     let mut fver_timestamp: Option<u32> = None;
     let mut markers: Option<MarkerChunk> = None;
     let mut instrument: Option<InstrumentChunk> = None;
+    let mut comments: Option<CommentsChunk> = None;
+    let mut aesd: Option<AesdChunk> = None;
+    let mut applications: Vec<ApplicationChunk> = Vec::new();
 
     for chunk in ChunkIter::new(inner) {
         let chunk = chunk?;
@@ -120,6 +141,28 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
                     return Err(AiffError::DuplicateChunk("INST"));
                 }
                 instrument = Some(parse_instrument_chunk(chunk.data)?);
+            }
+            b"COMT" => {
+                // §7.0: "No more than one Comments Chunk may appear
+                // in a single FORM AIFC."
+                if comments.is_some() {
+                    return Err(AiffError::DuplicateChunk("COMT"));
+                }
+                comments = Some(parse_comments_chunk(chunk.data)?);
+            }
+            b"AESD" => {
+                // §11.0: "No more than one Audio Recording Chunk may
+                // appear in a FORM AIFC."
+                if aesd.is_some() {
+                    return Err(AiffError::DuplicateChunk("AESD"));
+                }
+                aesd = Some(parse_aesd_chunk(chunk.data)?);
+            }
+            b"APPL" => {
+                // §12.0: "Any number of Application Specific Chunks
+                // may exist in a single FORM AIFC." — accumulate in
+                // document order, no duplicate check.
+                applications.push(parse_appl_chunk(chunk.data)?);
             }
             b"SSND" => {
                 if chunk.data.len() < 8 {
@@ -186,6 +229,9 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
         fver_timestamp,
         markers,
         instrument,
+        comments,
+        aesd,
+        applications,
     })
 }
 

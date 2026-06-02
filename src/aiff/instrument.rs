@@ -270,6 +270,41 @@ pub fn parse_instrument_chunk(data: &[u8]) -> Result<InstrumentChunk> {
     })
 }
 
+/// Encode an [`InstrumentChunk`] body in wire format — exactly the
+/// 20 bytes the spec calls for. The chunk header itself
+/// (`'INST' + ckSize`) is the caller's responsibility.
+///
+/// Field order matches §9 ¶ "Instrument Chunk Format":
+/// `baseNote(1) + detune(1) + lowNote(1) + highNote(1) +
+/// lowVelocity(1) + highVelocity(1) + gain(2 BE) + sustainLoop(6)
+/// + releaseLoop(6)`. The `Loop` substructure writes
+/// `playMode(2 BE) + beginLoop(2 BE) + endLoop(2 BE)`.
+pub fn write_instrument_chunk(inst: &InstrumentChunk) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    out[0] = inst.base_note;
+    out[1] = inst.detune as u8;
+    out[2] = inst.low_note;
+    out[3] = inst.high_note;
+    out[4] = inst.low_velocity;
+    out[5] = inst.high_velocity;
+    out[6..8].copy_from_slice(&inst.gain.to_be_bytes());
+    write_loop_into(&mut out[8..14], &inst.sustain_loop);
+    write_loop_into(&mut out[14..20], &inst.release_loop);
+    out
+}
+
+fn write_loop_into(slot: &mut [u8], lp: &Loop) {
+    debug_assert_eq!(slot.len(), 6);
+    let mode = match lp.play_mode {
+        PlayMode::None => 0_i16,
+        PlayMode::Forward => 1_i16,
+        PlayMode::ForwardBackward => 2_i16,
+    };
+    slot[0..2].copy_from_slice(&mode.to_be_bytes());
+    slot[2..4].copy_from_slice(&lp.begin_loop.to_be_bytes());
+    slot[4..6].copy_from_slice(&lp.end_loop.to_be_bytes());
+}
+
 fn parse_loop(bytes: &[u8]) -> Result<Loop> {
     // 6-byte Loop: playMode(2) + beginLoop(2) + endLoop(2).
     debug_assert_eq!(bytes.len(), 6);
@@ -600,5 +635,109 @@ mod tests {
         assert!(!inst.sustain_loop.is_effective());
         let markers = fixed_markers();
         assert!(inst.resolve_sustain_loop(&markers).is_none());
+    }
+
+    #[test]
+    fn write_round_trips_through_parse() {
+        let inst = InstrumentChunk {
+            base_note: 60,
+            detune: -25,
+            low_note: 48,
+            high_note: 72,
+            low_velocity: 1,
+            high_velocity: 127,
+            gain: -6,
+            sustain_loop: Loop {
+                play_mode: PlayMode::Forward,
+                begin_loop: 1,
+                end_loop: 2,
+            },
+            release_loop: Loop {
+                play_mode: PlayMode::ForwardBackward,
+                begin_loop: 3,
+                end_loop: 4,
+            },
+        };
+        let bytes = write_instrument_chunk(&inst);
+        let parsed = parse_instrument_chunk(&bytes).unwrap();
+        assert_eq!(parsed, inst);
+    }
+
+    #[test]
+    fn write_matches_hand_packed_layout() {
+        let inst = InstrumentChunk {
+            base_note: 60,
+            detune: 5,
+            low_note: 36,
+            high_note: 96,
+            low_velocity: 1,
+            high_velocity: 127,
+            gain: 3,
+            sustain_loop: Loop {
+                play_mode: PlayMode::Forward,
+                begin_loop: 1,
+                end_loop: 2,
+            },
+            release_loop: Loop {
+                play_mode: PlayMode::None,
+                begin_loop: 0,
+                end_loop: 0,
+            },
+        };
+        let bytes = write_instrument_chunk(&inst);
+        let expected = pack(60, 5, 36, 96, 1, 127, 3, (1, 1, 2), (0, 0, 0));
+        assert_eq!(bytes.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn write_emits_exactly_20_bytes() {
+        let inst = InstrumentChunk {
+            base_note: 60,
+            detune: 0,
+            low_note: 0,
+            high_note: 127,
+            low_velocity: 1,
+            high_velocity: 127,
+            gain: 0,
+            sustain_loop: Loop {
+                play_mode: PlayMode::None,
+                begin_loop: 0,
+                end_loop: 0,
+            },
+            release_loop: Loop {
+                play_mode: PlayMode::None,
+                begin_loop: 0,
+                end_loop: 0,
+            },
+        };
+        let bytes = write_instrument_chunk(&inst);
+        assert_eq!(bytes.len(), 20);
+    }
+
+    #[test]
+    fn write_preserves_negative_detune_and_gain() {
+        let inst = InstrumentChunk {
+            base_note: 60,
+            detune: -50,
+            low_note: 0,
+            high_note: 127,
+            low_velocity: 1,
+            high_velocity: 127,
+            gain: -12,
+            sustain_loop: Loop {
+                play_mode: PlayMode::None,
+                begin_loop: 0,
+                end_loop: 0,
+            },
+            release_loop: Loop {
+                play_mode: PlayMode::None,
+                begin_loop: 0,
+                end_loop: 0,
+            },
+        };
+        let bytes = write_instrument_chunk(&inst);
+        let parsed = parse_instrument_chunk(&bytes).unwrap();
+        assert_eq!(parsed.detune, -50);
+        assert_eq!(parsed.gain, -12);
     }
 }

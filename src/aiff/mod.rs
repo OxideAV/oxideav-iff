@@ -48,15 +48,18 @@
 //! [`error::AiffError::UnsupportedPcmCompression`] for those so
 //! callers can dispatch cleanly.
 //!
-//! The optional text chunks (`NAME`, `AUTH`, `(c) `, `ANNO`, `COMT`)
-//! and the MIDI / AESD / APPL chunks are recognised by the chunk
-//! walker and skipped silently by the FORM-level parser; later rounds
-//! will surface them as structured fields.
+//! The optional text chunks (`NAME`, `AUTH`, `(c) `, `ANNO`) and the
+//! MIDI chunk are recognised by the chunk walker and skipped silently
+//! by the FORM-level parser; later rounds will surface them as
+//! structured fields.
 //!
 //! The `MARK` (marker) chunk is parsed into a structured
 //! [`MarkerChunk`] (id / sample-frame position / pstring name per
 //! marker) and surfaced through [`Form::markers`]. Multiple MARK
 //! chunks inside the same FORM are rejected per §6.0 of the spec.
+//! Encoders can also build a `MARK` chunk body via
+//! [`write_marker_chunk`] (preserving document order and the
+//! pad-to-even pstring discipline).
 //!
 //! The `INST` (instrument) chunk is parsed into [`InstrumentChunk`]
 //! and surfaced through [`Form::instrument`]. The decoded fields
@@ -69,9 +72,35 @@
 //! "begin position must be less than the end position" rule so
 //! callers can ask "what does the spec say to actually play?". At
 //! most one `INST` chunk per FORM is permitted; a second one is
-//! rejected as [`AiffError::DuplicateChunk`].
+//! rejected as [`AiffError::DuplicateChunk`]. The exact 20-byte
+//! ckData body can also be produced via [`write_instrument_chunk`]
+//! for write-side encoders.
+//!
+//! The `COMT` (comments) chunk is parsed into [`CommentsChunk`] —
+//! a list of `(timestamp, marker, text)` triples — and surfaced
+//! through [`Form::comments`]. Each comment optionally links to a
+//! `MARK` entry; [`Comment::resolve_marker`] joins the linkage
+//! against a supplied [`MarkerChunk`]. At most one `COMT` per FORM
+//! per §7.0; duplicates are rejected as [`AiffError::DuplicateChunk`].
+//!
+//! The `AESD` (audio recording) chunk is parsed into [`AesdChunk`]
+//! preserving the 24-byte AES channel-status block verbatim and
+//! exposing the byte-0 bits-2..=4 recording-emphasis field through
+//! [`AesdChunk::emphasis`]. Surfaced through [`Form::aesd`]; at most
+//! one AESD per FORM per §11.0.
+//!
+//! The `APPL` (application-specific) chunks — §12.0 explicitly
+//! permits any number per FORM — are parsed into
+//! [`ApplicationChunk`]s and surfaced through [`Form::applications`]
+//! in document order. The `pdos` / `stoc` dialects decode their
+//! leading Pascal-string application name via
+//! [`ApplicationChunk::application_name`] while Macintosh
+//! application signatures (any other FourCC) carry raw bytes.
 
+pub mod aesd;
+pub mod appl;
 pub mod chunk;
+pub mod comment;
 pub mod common;
 pub mod error;
 pub mod extended;
@@ -82,7 +111,10 @@ pub mod pcm;
 
 pub mod demuxer;
 
+pub use aesd::{parse_aesd_chunk, write_aesd_chunk, AesdChunk, Emphasis};
+pub use appl::{parse_appl_chunk, write_appl_chunk, ApplicationChunk, ApplicationDialect};
 pub use chunk::{Chunk, ChunkIter};
+pub use comment::{parse_comments_chunk, write_comments_chunk, Comment, CommentsChunk};
 pub use common::{
     parse_common, CommonChunk, COMPRESSION_FL32, COMPRESSION_FL32_UC, COMPRESSION_FL64,
     COMPRESSION_FL64_UC, COMPRESSION_NONE, COMPRESSION_RAW, COMPRESSION_SOWT, COMPRESSION_TWOS,
@@ -90,8 +122,10 @@ pub use common::{
 pub use error::{AiffError, Result};
 pub use extended::{decode_extended, decode_sample_rate};
 pub use form::{parse, Form, SoundData};
-pub use instrument::{parse_instrument_chunk, InstrumentChunk, Loop, PlayMode, ResolvedLoop};
-pub use marker::{parse_marker_chunk, Marker, MarkerChunk};
+pub use instrument::{
+    parse_instrument_chunk, write_instrument_chunk, InstrumentChunk, Loop, PlayMode, ResolvedLoop,
+};
+pub use marker::{parse_marker_chunk, write_marker_chunk, Marker, MarkerChunk};
 pub use pcm::{decode_pcm, is_pcm_compression, PcmSamples};
 
 pub use demuxer::{make_demuxer, register, AiffDemuxer, FORMAT_NAME};

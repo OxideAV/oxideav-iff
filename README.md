@@ -12,19 +12,40 @@ crate ships:
   CRNG / CCRT / DRNG colour-cycling descriptors).
 - **FORM/PBM** — read+round-trip (DPaint II / Brilliance chunky sibling).
 - **FORM/ANIM** — op-0 literal + op-5 byte-vertical delta
-  (encode+decode) + op-7 Short/Long Vertical Delta (decode).
+  (encode+decode) + op-7 Short/Long Vertical Delta
+  (encode+decode). The op-7 encoder picks Skip / Same / Uniq ops
+  per column to minimise byte cost (Same for runs ≥ 2, Uniq
+  otherwise, Skip for unchanged runs); both short (2-byte items)
+  and long (4-byte items, `ANHD.bits` bit 0 set) variants
+  round-trip through the in-tree decoder. The container walker
+  accepts both `BODY` and `DLTA` chunk ids so op-0 / op-5 / op-7
+  streams decode through the same path.
 - **FORM/AIFF and FORM/AIFC** — Apple AIFF / AIFF-C (read):
-  COMM/SSND/FVER/MARK/INST walker, 80-bit IEEE-extended sample-rate
-  decode, PCM compression-flavour readers for `NONE` / `twos` /
-  `sowt` / `raw ` / `fl32` / `FL32` / `fl64` / `FL64`, structured
-  `MARK` chunk parsing (`MarkerChunk` → id / sample-frame position /
-  pstring name per marker, with one-per-FORM enforcement and
-  unique-id validation), and structured `INST` (instrument) chunk
-  parsing (`InstrumentChunk` → MIDI baseNote/lowNote/highNote +
-  detune + lowVelocity/highVelocity + signed-dB gain +
-  sustainLoop/releaseLoop with `resolve_sustain_loop` /
-  `resolve_release_loop` joining the loop endpoints against the
-  MARK list per §9). Codec-bearing `compressionType` FourCCs
+  COMM/SSND/FVER/MARK/INST/COMT/AESD/APPL walker, 80-bit
+  IEEE-extended sample-rate decode, PCM compression-flavour
+  readers for `NONE` / `twos` / `sowt` / `raw ` / `fl32` / `FL32`
+  / `fl64` / `FL64`, structured `MARK` chunk parsing
+  (`MarkerChunk` → id / sample-frame position / pstring name per
+  marker, with one-per-FORM enforcement and unique-id validation),
+  structured `INST` (instrument) chunk parsing (`InstrumentChunk`
+  → MIDI baseNote/lowNote/highNote + detune + lowVelocity /
+  highVelocity + signed-dB gain + sustainLoop / releaseLoop with
+  `resolve_sustain_loop` / `resolve_release_loop` joining the loop
+  endpoints against the MARK list per §9), structured `COMT`
+  (comments) chunk parsing (`CommentsChunk` → per-comment
+  timestamp + optional `MarkerId` linkage + UTF-8 text body, with
+  `resolve_marker` joining the linkage against MARK per §7.0),
+  structured `AESD` (audio recording) chunk parsing (`AesdChunk` →
+  24-byte AES channel-status block + byte-0 recording-emphasis
+  field per §11.0), and structured `APPL` (application-specific)
+  chunk parsing (`ApplicationChunk` → 4-byte signature + raw data
+  + `pdos`/`stoc`/Macintosh dialect classification +
+  application-name decode for the `pdos`/`stoc` dialects per
+  §12.0; multiple APPL chunks per FORM are permitted and surfaced
+  in document order). Write-side encoders for `MARK`, `INST`,
+  `COMT`, `AESD`, and `APPL` are also available so callers
+  building an AIFF / AIFC file can emit every chunk class
+  round-trippably. Codec-bearing `compressionType` FourCCs
   (`ima4`, `ulaw`, `alaw`, …) are recognised in the parser but
   routed through sibling codec crates rather than decoded here.
 
@@ -373,12 +394,25 @@ re-implementing the bookkeeping.
 The chunk walker (`chunk.rs`) is format-agnostic; SMUS (music score)
 and MAUD are natural follow-ons that reuse the same FORM/LIST/CAT
 reader. ANIM op-7 (short / long vertical delta) decode landed in
-r192; op-7 encode + op-8 decode/encode remain open ILBM-side
-extensions; DEEP / TVPP / RGB8 / RGBN true-colour IFF chunks are
-the next ILBM-side decode candidates. AIFF-side, `COMT`
-(timestamped comments) and MARK / INST write-side encoders are the
-natural next steps, followed by the AESD (audio recording) and
-APPL (application-specific) chunk surfaces.
+r192; r209 ships the matching **op-7 encoder** (short + long data
+variants) and extends the container walker to accept the `DLTA`
+chunk id alongside `BODY` so op-0 / op-5 / op-7 streams decode
+through the same path. ANIM op-8 and DEEP / TVPP / RGB8 / RGBN
+true-colour IFF chunks remain unblocked on docs — neither has a
+spec section staged in `docs/image/iff/` yet (the only ANIM
+appendix present covers op-7).
+
+AIFF-side r209 surfaces the previously-skipped optional chunks
+end-to-end: **COMT** (timestamped comments, optional `MarkerId`
+linkage), **AESD** (24-byte AES channel-status block with the
+recording-emphasis field exposed), and **APPL** (application-
+specific, `pdos` / `stoc` / Macintosh dialect classification).
+Write-side encoders for **MARK**, **INST**, **COMT**, **AESD**,
+and **APPL** complete the round-trip story; encoders building a
+FORM AIFF / AIFC can now emit every chunk class the read path
+surfaces. SAXEL (§8.0, marked "rough proposal" in the 1991
+draft) and standalone `MIDI` data chunks (§10.0) are the
+natural next AIFF-side targets.
 
 ## License
 
