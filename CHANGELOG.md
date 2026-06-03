@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AIFF / AIFF-C `SAXL` (Sound Accelerator) chunk surfacing.** The
+  FORM walker now decodes every `SAXL` chunk
+  (`docs/audio/aiff/aiff-c.txt` §8.0 + Appendix D) into a structured
+  [`aiff::SaxelChunk`] (with a `Vec<aiff::Saxel>` of `(id, data)`
+  pairs) and exposes them through [`aiff::Form::saxels`] in document
+  order. §8.0 explicitly permits "any number of Saxel Chunks" per
+  FORM AIFC (and "Multiple Saxel Chunks are allowed in a single FORM
+  AIFC file"), so the surface is a `Vec` rather than an `Option` —
+  matching how §10.0 MIDI and §12.0 APPL handle the
+  "any-number-per-FORM" rule. The chunk body is preserved verbatim
+  as a raw byte stream — Appendix D ¶ "saxelData contains the
+  specific sound accelerator data which is compression-type specific"
+  and §8.0 ¶ "Under Construction" / Appendix D ¶ "Caution" emphasise
+  the mechanism remained a "rough proposal" in the 1991 draft, so
+  this crate does not interpret `data` against any particular
+  decompressor's state-priming convention. Lightweight observers
+  [`aiff::Saxel::len`] / [`aiff::Saxel::is_empty`] cover the common
+  "what's the priming-data length?" inspection without re-parsing.
+  Lookups are provided in both directions: [`aiff::Saxel::resolve_marker`]
+  joins a saxel's `id` against a supplied [`aiff::MarkerChunk`] per
+  §8.0 ¶ "id identifies the marker for which the sound accelerator
+  data is to be used" (returning `None` when the id isn't a positive
+  `MarkerId` per §6.0 or no marker with that id is present), and
+  [`aiff::SaxelChunk::by_marker_id`] scans the chunk's saxel list
+  for a matching id. The per-saxel pad byte (Appendix D ¶ "The data
+  must be padded with a byte at the end as needed to make it an even
+  number of bytes long. This pad byte, if present, is not included
+  in size.") is honoured on parse and written on encode; end-of-chunk
+  pad on the last saxel is tolerated as either present or absent,
+  mirroring the MARK / COMT pstring-tail tolerance for legacy
+  encoders that elided the trailing pad. The matching
+  [`aiff::write_saxel_chunk`] write-side helper completes the
+  round-trip story; an encoder building a FORM AIFC can now emit
+  every chunk class the read path surfaces (MARK, INST, COMT, AESD,
+  APPL, MIDI, SAXL + the four §13.0 text chunks). New
+  `tests/aiff_saxel.rs` covers single-chunk + multiple-chunk-in-FORM
+  + empty-Vec-when-absent surfacing, the empty-saxel-list intra-chunk
+  case, odd-size saxelData per-saxel pad handling, the write-side
+  round-trip, `resolve_marker` against a FORM-level MARK chunk plus
+  the zero/negative-id MarkerId-sentinel rejection per §6.0,
+  `by_marker_id` lookup, and SAXL coexisting with MARK + COMT + APPL
+  + MIDI + ANNO in a single FORM. Internal `saxel.rs` tests exercise
+  the same surfaces against the lower-level helpers (empty list,
+  single-saxel even/odd data, empty-data, multiple saxels in
+  document order with mixed pad, `by_marker_id` happy-path, three
+  truncation classes, end-of-chunk pad tolerance, write-helper
+  round-trip, write-helper empty-chunk, byte-for-byte write layout
+  match, and write document-order preservation). Doc reference:
+  `docs/audio/aiff/aiff-c.txt` §8.0 + Appendix D.
+
 - **AIFF / AIFF-C §13.0 text chunks (`NAME` / `AUTH` / `(c) ` / `ANNO`).**
   The FORM walker now decodes the four §13.0 Text Chunks of
   `docs/audio/aiff/aiff-c.txt` into a structured [`aiff::TextChunk`]

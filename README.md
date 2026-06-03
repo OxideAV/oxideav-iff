@@ -21,7 +21,7 @@ crate ships:
   accepts both `BODY` and `DLTA` chunk ids so op-0 / op-5 / op-7
   streams decode through the same path.
 - **FORM/AIFF and FORM/AIFC** — Apple AIFF / AIFF-C (read):
-  COMM/SSND/FVER/MARK/INST/COMT/AESD/APPL/MIDI/NAME/AUTH/(c) /ANNO
+  COMM/SSND/FVER/MARK/INST/COMT/AESD/APPL/MIDI/SAXL/NAME/AUTH/(c) /ANNO
   walker, 80-bit IEEE-extended sample-rate decode, PCM
   compression-flavour readers for `NONE` / `twos` / `sowt` /
   `raw ` / `fl32` / `FL32` / `fl64` / `FL64`, structured `MARK`
@@ -48,7 +48,16 @@ crate ships:
   verbatim per §10.0, with `is_sysex` / `len` / `is_empty`
   classifiers; multiple MIDI chunks per FORM are permitted and
   surfaced in document order, an event-level Standard MIDI File
-  decode belongs in the `oxideav-midi` sibling crate), and
+  decode belongs in the `oxideav-midi` sibling crate), structured
+  §8.0 / Appendix D `SAXL` (Sound Accelerator) chunk parsing
+  (`SaxelChunk` → `Vec<Saxel>` with each entry pairing a `MarkerId`
+  with a compression-type-specific `data` byte-stream preserved
+  verbatim per Appendix D ¶ "saxelData contains the specific sound
+  accelerator data which is compression-type specific", plus
+  `Saxel::resolve_marker` / `SaxelChunk::by_marker_id` lookups;
+  multiple SAXL chunks per FORM are permitted per §8.0 ¶ "Multiple
+  Saxel Chunks are allowed in a single FORM AIFC file" and surfaced
+  in document order via `Form::saxels`), and
   structured §13.0 text-chunk parsing (`TextChunk` → `kind`
   discriminant for `NAME` / `AUTH` / `(c) ` / `ANNO` + raw text
   bytes preserved verbatim per §13.0 ¶ "pure ASCII […] neither a
@@ -57,9 +66,9 @@ crate ships:
   singletons surfaced via `Form::name` / `Form::author` /
   `Form::copyright`, `ANNO` is "any-number-per-FORM" per §13.0 and
   surfaced via `Form::annotations` in document order). Write-side
-  encoders for `MARK`, `INST`, `COMT`, `AESD`, `APPL`, `MIDI`, and
-  the four §13.0 text chunks are also available so callers
-  building an AIFF / AIFC file can emit every chunk class
+  encoders for `MARK`, `INST`, `COMT`, `AESD`, `APPL`, `MIDI`,
+  `SAXL`, and the four §13.0 text chunks are also available so
+  callers building an AIFF / AIFC file can emit every chunk class
   round-trippably. Codec-bearing
   `compressionType` FourCCs (`ima4`, `ulaw`, `alaw`, …) are
   recognised in the parser but routed through sibling codec crates
@@ -446,6 +455,49 @@ the close parenthesis." The spec uses the round-bracket character
 itself as the on-wire stand-in for ©; downstream code that wants
 the © glyph should decode the text body, not the ckID.
 
+### AIFF / AIFF-C SAXL (Sound Accelerator) chunks
+
+`SAXL` chunks are parsed into a structured
+[`aiff::SaxelChunk`] surface exposed via [`aiff::Form::saxels`]:
+
+| Field            | On-wire                | API                                  |
+|------------------|------------------------|--------------------------------------|
+| numSaxels        | big-endian `u16`       | `saxels[i].saxels.len()`             |
+| `Saxel.id`       | big-endian `i16`       | `Saxel::id`                          |
+| `Saxel.size`     | big-endian `u16`       | `Saxel::len()`                       |
+| `Saxel.data`     | byte[size] verbatim    | `Saxel::data`                        |
+
+§8.0 / Appendix D permits "any number of Saxel Chunks" per FORM AIFC
+(unlike `MARK` / `INST` / `COMT` / `AESD` which are at-most-one) so
+the FORM walker accumulates them in document order via
+[`aiff::Form::saxels`]. Within a chunk the saxels themselves are
+also preserved in document order — Appendix D ¶ "The saxels need
+not be ordered in any particular manner" so we don't re-sort.
+
+[`aiff::Saxel::resolve_marker`] joins a saxel's `id` against the
+FORM's [`aiff::MarkerChunk`] per §8.0 ¶ "id identifies the marker
+for which the sound accelerator data is to be used"; it returns
+`None` when the id isn't a positive `MarkerId` per §6.0 or when no
+marker with that id exists in the supplied chunk.
+[`aiff::SaxelChunk::by_marker_id`] is a convenience reverse-lookup
+that scans the chunk's saxel list for a matching `id`.
+
+The `data` payload is preserved byte-for-byte — Appendix D ¶
+"saxelData contains the specific sound accelerator data which is
+compression-type specific" — so the parser does NOT interpret it
+against any particular algorithm. §8.0 ¶ "Under Construction" /
+Appendix D ¶ "Caution" emphasise the mechanism remained a
+"rough proposal" in the 1991 draft, so callers wiring an actual
+decompressor's state-priming entry point own the algorithm-specific
+decode (the ACE2 / ACE8 / MAC3 / MAC6 "previous 48 sample frames"
+convention Appendix D describes lives in the codec crate, not
+here).
+
+The matching write-side helper [`aiff::write_saxel_chunk`] emits
+the body bytes; the chunk header (`'SAXL' + ckSize`) and any
+odd-length outer pad byte are the caller's responsibility,
+matching every other AIFF write-side helper in this module.
+
 ## Roadmap
 
 The chunk walker (`chunk.rs`) is format-agnostic; SMUS (music score)
@@ -470,13 +522,22 @@ verbatim with `is_sysex` / `len` / `is_empty` classifiers plus a
 write-side helper; the SMF event-level decode lives in the
 `oxideav-midi` sibling crate. r220 surfaces the §13.0 **text
 chunks** (`NAME` / `AUTH` / `(c) ` / `ANNO`) — see the dedicated
-section above. Write-side encoders for **MARK**, **INST**,
-**COMT**, **AESD**, **APPL**, **MIDI**, and the §13.0 text
-chunks complete the round-trip story; encoders building a FORM
-AIFF / AIFC can now emit every chunk class the read path
-surfaces. SAXEL (§8.0, marked "rough proposal" / "Under
-Construction" in the 1991 draft) is the natural next AIFF-side
-target.
+section above. r227 surfaces **SAXL** (§8.0 / Appendix D Sound
+Accelerator) chunks — `SaxelChunk` → `Vec<Saxel>` with each entry
+linking a `MarkerId` to a compression-type-specific priming-data
+byte stream, multiple chunks per FORM in document order, plus a
+write-side helper and a `Saxel::resolve_marker` / `SaxelChunk::by_marker_id`
+lookup pair. The §8.0 ¶ "Under Construction" / Appendix D ¶
+"Caution" status of the mechanism means the parser preserves
+`data` verbatim rather than interpreting it against any specific
+compression algorithm. Write-side encoders for **MARK**, **INST**,
+**COMT**, **AESD**, **APPL**, **MIDI**, **SAXL**, and the §13.0
+text chunks complete the round-trip story; encoders building a
+FORM AIFF / AIFC can now emit every chunk class the read path
+surfaces. The remaining AIFF-C §x.x surfaces are saturated — Apple
+shipped 13 chunk classes (FVER, COMM, SSND, MARK, INST, COMT,
+AESD, APPL, MIDI, SAXL, NAME, AUTH, (c)  + ANNO) and this crate
+now reads + writes every one of them.
 
 ## License
 

@@ -2,14 +2,15 @@
 //!
 //! Walks the outermost `FORM` chunk and collects the COMM, SSND, and
 //! any optional metadata chunks (NAME, AUTH, ANNO, (c) , COMT, MARK,
-//! INST, MIDI, AESD, APPL, FVER). Chunk order inside a FORM is not
-//! prescribed by the spec — `docs/audio/aiff/aiff-aifc-format.md` §4
-//! is explicit on this — so we scan all chunks and route by ckID. The
-//! `MIDI` chunk (§10.0), `APPL` chunk (§12.0), and `ANNO` chunk
-//! (§13.0) are explicitly "any-number-per-FORM" per the spec, so we
-//! accumulate them in document order rather than rejecting duplicates.
-//! `NAME`, `AUTH`, and `(c) ` are §13.0 at-most-one-per-FORM
-//! singletons and surfaced as such.
+//! INST, MIDI, AESD, APPL, SAXL, FVER). Chunk order inside a FORM is
+//! not prescribed by the spec — `docs/audio/aiff/aiff-aifc-format.md`
+//! §4 is explicit on this — so we scan all chunks and route by ckID.
+//! The `MIDI` chunk (§10.0), `APPL` chunk (§12.0), `SAXL` chunk
+//! (§8.0 / Appendix D), and `ANNO` chunk (§13.0) are explicitly
+//! "any-number-per-FORM" per the spec, so we accumulate them in
+//! document order rather than rejecting duplicates. `NAME`, `AUTH`,
+//! and `(c) ` are §13.0 at-most-one-per-FORM singletons and surfaced
+//! as such.
 
 use crate::aiff::aesd::{parse_aesd_chunk, AesdChunk};
 use crate::aiff::appl::{parse_appl_chunk, ApplicationChunk};
@@ -20,6 +21,7 @@ use crate::aiff::error::{AiffError, Result};
 use crate::aiff::instrument::{parse_instrument_chunk, InstrumentChunk};
 use crate::aiff::marker::{parse_marker_chunk, MarkerChunk};
 use crate::aiff::midi::{parse_midi_chunk, MidiDataChunk};
+use crate::aiff::saxel::{parse_saxel_chunk, SaxelChunk};
 use crate::aiff::text::{parse_text_chunk, TextChunk, TextKind};
 
 /// Parsed SSND (Sound Data) chunk.
@@ -86,6 +88,11 @@ pub struct Form<'a> {
     /// rather than an `Option`. An empty vector means no MIDI chunks
     /// were present.
     pub midi: Vec<MidiDataChunk>,
+    /// Parsed SAXL (Sound Accelerator) chunks in document order. Per
+    /// §8.0 / Appendix D any number of Saxel Chunks may appear per
+    /// FORM AIFC, so this is a `Vec` rather than an `Option`. An empty
+    /// vector means no SAXL chunks were present.
+    pub saxels: Vec<SaxelChunk>,
     /// Parsed `NAME` chunk, when present. Per §13.0 at most one NAME
     /// chunk may appear per FORM (duplicates are rejected as
     /// [`AiffError::DuplicateChunk`]); a FORM with no NAME chunk
@@ -150,6 +157,7 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
     let mut aesd: Option<AesdChunk> = None;
     let mut applications: Vec<ApplicationChunk> = Vec::new();
     let mut midi: Vec<MidiDataChunk> = Vec::new();
+    let mut saxels: Vec<SaxelChunk> = Vec::new();
     let mut name: Option<TextChunk> = None;
     let mut author: Option<TextChunk> = None;
     let mut copyright: Option<TextChunk> = None;
@@ -206,6 +214,15 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
                 // in a FORM AIFC." — accumulate in document order,
                 // no duplicate check.
                 midi.push(parse_midi_chunk(chunk.data)?);
+            }
+            b"SAXL" => {
+                // §8.0 / Appendix D: "Any number of Saxel Chunks may
+                // appear in a FORM AIFC." — accumulate in document
+                // order, no duplicate check. The mechanism remained
+                // "Under Construction" in the 1991 draft so the body
+                // is preserved verbatim and not interpreted against
+                // any specific algorithm here.
+                saxels.push(parse_saxel_chunk(chunk.data)?);
             }
             b"NAME" => {
                 // §13.0: "No more than one Name Chunk may exist
@@ -311,6 +328,7 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
         aesd,
         applications,
         midi,
+        saxels,
         name,
         author,
         copyright,

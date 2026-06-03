@@ -112,6 +112,18 @@
 //! ([`MidiDataChunk::len`], [`MidiDataChunk::is_empty`],
 //! [`MidiDataChunk::is_sysex`]) cover the common "is this a SysEx
 //! patch dump or something else?" classification without re-parsing.
+//!
+//! The `SAXL` (Sound Accelerator) chunks — §8.0 / Appendix D permits
+//! any number per FORM — are parsed into [`SaxelChunk`]s and surfaced
+//! through [`Form::saxels`] in document order. Each contained
+//! [`Saxel`] pairs a `MarkerId` with a compression-type-specific
+//! `data` payload that primes a decompressor's internal state so
+//! playback can begin at a random marker without startup artifacts.
+//! Appendix D ¶ "Caution" / §8.0 ¶ "Under Construction" emphasises
+//! the mechanism remained a "rough proposal" so the parser preserves
+//! `data` verbatim rather than interpreting it against any specific
+//! algorithm; [`Saxel::resolve_marker`] joins the saxel's id against
+//! a [`MarkerChunk`] for callers that want the §6.0 lookup.
 
 pub mod aesd;
 pub mod appl;
@@ -125,6 +137,7 @@ pub mod instrument;
 pub mod marker;
 pub mod midi;
 pub mod pcm;
+pub mod saxel;
 pub mod text;
 
 pub mod demuxer;
@@ -146,6 +159,7 @@ pub use instrument::{
 pub use marker::{parse_marker_chunk, write_marker_chunk, Marker, MarkerChunk};
 pub use midi::{parse_midi_chunk, write_midi_chunk, MidiDataChunk};
 pub use pcm::{decode_pcm, is_pcm_compression, PcmSamples};
+pub use saxel::{parse_saxel_chunk, write_saxel_chunk, Saxel, SaxelChunk};
 pub use text::{parse_text_chunk, write_text_chunk, TextChunk, TextKind};
 
 pub use demuxer::{make_demuxer, register, AiffDemuxer, FORMAT_NAME};
