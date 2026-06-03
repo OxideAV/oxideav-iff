@@ -5,9 +5,11 @@
 //! INST, MIDI, AESD, APPL, FVER). Chunk order inside a FORM is not
 //! prescribed by the spec — `docs/audio/aiff/aiff-aifc-format.md` §4
 //! is explicit on this — so we scan all chunks and route by ckID. The
-//! `MIDI` chunk (§10.0) and `APPL` chunk (§12.0) are explicitly
-//! "any-number-per-FORM" per the spec, so we accumulate them in
-//! document order rather than rejecting duplicates.
+//! `MIDI` chunk (§10.0), `APPL` chunk (§12.0), and `ANNO` chunk
+//! (§13.0) are explicitly "any-number-per-FORM" per the spec, so we
+//! accumulate them in document order rather than rejecting duplicates.
+//! `NAME`, `AUTH`, and `(c) ` are §13.0 at-most-one-per-FORM
+//! singletons and surfaced as such.
 
 use crate::aiff::aesd::{parse_aesd_chunk, AesdChunk};
 use crate::aiff::appl::{parse_appl_chunk, ApplicationChunk};
@@ -18,6 +20,7 @@ use crate::aiff::error::{AiffError, Result};
 use crate::aiff::instrument::{parse_instrument_chunk, InstrumentChunk};
 use crate::aiff::marker::{parse_marker_chunk, MarkerChunk};
 use crate::aiff::midi::{parse_midi_chunk, MidiDataChunk};
+use crate::aiff::text::{parse_text_chunk, TextChunk, TextKind};
 
 /// Parsed SSND (Sound Data) chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +86,26 @@ pub struct Form<'a> {
     /// rather than an `Option`. An empty vector means no MIDI chunks
     /// were present.
     pub midi: Vec<MidiDataChunk>,
+    /// Parsed `NAME` chunk, when present. Per §13.0 at most one NAME
+    /// chunk may appear per FORM (duplicates are rejected as
+    /// [`AiffError::DuplicateChunk`]); a FORM with no NAME chunk
+    /// yields `None`.
+    pub name: Option<TextChunk>,
+    /// Parsed `AUTH` chunk, when present. Per §13.0 at most one AUTH
+    /// chunk may appear per FORM (duplicates are rejected as
+    /// [`AiffError::DuplicateChunk`]); a FORM with no AUTH chunk
+    /// yields `None`.
+    pub author: Option<TextChunk>,
+    /// Parsed `(c) ` (copyright) chunk, when present. Per §13.0 at
+    /// most one Copyright chunk may appear per FORM (duplicates are
+    /// rejected as [`AiffError::DuplicateChunk`]); a FORM with no
+    /// Copyright chunk yields `None`.
+    pub copyright: Option<TextChunk>,
+    /// Parsed `ANNO` chunks in document order. Per §13.0 "Any number
+    /// of Annotation Chunks may exist within a FORM AIFC", so this
+    /// is a `Vec` rather than an `Option`. An empty vector means no
+    /// ANNO chunks were present.
+    pub annotations: Vec<TextChunk>,
 }
 
 /// Parse a complete AIFF / AIFF-C file. `buf` is the raw file
@@ -127,6 +150,10 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
     let mut aesd: Option<AesdChunk> = None;
     let mut applications: Vec<ApplicationChunk> = Vec::new();
     let mut midi: Vec<MidiDataChunk> = Vec::new();
+    let mut name: Option<TextChunk> = None;
+    let mut author: Option<TextChunk> = None;
+    let mut copyright: Option<TextChunk> = None;
+    let mut annotations: Vec<TextChunk> = Vec::new();
 
     for chunk in ChunkIter::new(inner) {
         let chunk = chunk?;
@@ -180,6 +207,40 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
                 // no duplicate check.
                 midi.push(parse_midi_chunk(chunk.data)?);
             }
+            b"NAME" => {
+                // §13.0: "No more than one Name Chunk may exist
+                // within a FORM AIFC."
+                if name.is_some() {
+                    return Err(AiffError::DuplicateChunk("NAME"));
+                }
+                name = Some(parse_text_chunk(TextKind::Name, chunk.data)?);
+            }
+            b"AUTH" => {
+                // §13.0: "No more than one Author Chunk may exist
+                // within a FORM AIFC."
+                if author.is_some() {
+                    return Err(AiffError::DuplicateChunk("AUTH"));
+                }
+                author = Some(parse_text_chunk(TextKind::Author, chunk.data)?);
+            }
+            b"(c) " => {
+                // §13.0: "No more than one Copyright Chunk may exist
+                // within a FORM AIFC." The on-wire ckID is the four
+                // bytes `(`, `c`, `)`, ` ` — the chunk ID character
+                // itself stands in for the © glyph (§13.0 ¶ "the 'c'
+                // is lowercase and there is a space [0x20] after the
+                // close parenthesis").
+                if copyright.is_some() {
+                    return Err(AiffError::DuplicateChunk("(c) "));
+                }
+                copyright = Some(parse_text_chunk(TextKind::Copyright, chunk.data)?);
+            }
+            b"ANNO" => {
+                // §13.0: "Any number of Annotation Chunks may exist
+                // within a FORM AIFC." — accumulate in document order,
+                // no duplicate check.
+                annotations.push(parse_text_chunk(TextKind::Annotation, chunk.data)?);
+            }
             b"SSND" => {
                 if chunk.data.len() < 8 {
                     return Err(AiffError::Truncated("SSND chunk header"));
@@ -224,10 +285,10 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
                 ]));
             }
             _ => {
-                // Optional / unrecognised chunks: skip silently.
-                // Text chunks (NAME / AUTH / (c) / ANNO) remain
-                // structurally unparsed and will be surfaced in a
-                // later round.
+                // Unrecognised chunks: skip silently. §4 of the
+                // staged AIFF-AIFC layout is explicit that chunk
+                // order is unspecified and that callers must
+                // tolerate ckIDs they do not recognise.
             }
         }
     }
@@ -250,6 +311,10 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
         aesd,
         applications,
         midi,
+        name,
+        author,
+        copyright,
+        annotations,
     })
 }
 
@@ -816,16 +881,17 @@ mod tests {
         ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
         ssnd_body.extend_from_slice(&pcm);
 
-        // ANNO (annotation) and a wild custom 'ZZZZ' chunk — should both
-        // be ignored.
-        let anno_body = b"hello world";
+        // Two wild custom ckIDs — neither matches any §13.0 / §10.0 /
+        // §12.0 chunk, so both must be ignored without affecting the
+        // SSND parse.
         let zzzz_body = b"some-bytes";
+        let qqqq_body = b"more-bytes";
 
         let mut inner = Vec::new();
         inner.extend_from_slice(b"AIFF");
         inner.extend_from_slice(&pack(b"COMM", &comm_body));
-        inner.extend_from_slice(&pack(b"ANNO", anno_body));
         inner.extend_from_slice(&pack(b"ZZZZ", zzzz_body));
+        inner.extend_from_slice(&pack(b"QQQQ", qqqq_body));
         inner.extend_from_slice(&pack(b"SSND", &ssnd_body));
         let mut f = Vec::new();
         f.extend_from_slice(b"FORM");
@@ -834,5 +900,188 @@ mod tests {
 
         let parsed = parse(&f).unwrap();
         assert_eq!(parsed.sound.as_ref().unwrap().samples, &pcm);
+        // None of the §13.0 text chunks are populated.
+        assert!(parsed.name.is_none());
+        assert!(parsed.author.is_none());
+        assert!(parsed.copyright.is_none());
+        assert!(parsed.annotations.is_empty());
+    }
+
+    #[test]
+    fn parses_form_with_all_text_chunks() {
+        // FORM(AIFC) wrapping COMM + NAME + AUTH + (c)  + ANNO×2 + SSND.
+        let pcm = [0x12_u8, 0x34, 0x56, 0x78];
+        let mut comm_body = Vec::new();
+        comm_body.extend_from_slice(&1_i16.to_be_bytes());
+        comm_body.extend_from_slice(&2_u32.to_be_bytes());
+        comm_body.extend_from_slice(&16_i16.to_be_bytes());
+        comm_body.extend_from_slice(&ext(44_100.0));
+        comm_body.extend_from_slice(b"NONE");
+        comm_body.push(0);
+        comm_body.push(0); // pad
+
+        let mut ssnd_body = Vec::new();
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&pcm);
+
+        let fver_body = 0xA280_5140_u32.to_be_bytes();
+
+        let mut inner = Vec::new();
+        inner.extend_from_slice(b"AIFC");
+        inner.extend_from_slice(&pack(b"FVER", &fver_body));
+        inner.extend_from_slice(&pack(b"COMM", &comm_body));
+        inner.extend_from_slice(&pack(b"NAME", b"Helicopter take-off"));
+        inner.extend_from_slice(&pack(b"AUTH", b"sound designer"));
+        inner.extend_from_slice(&pack(b"(c) ", b"1991 Apple Computer, Inc."));
+        inner.extend_from_slice(&pack(b"ANNO", b"first comment"));
+        inner.extend_from_slice(&pack(b"ANNO", b"second comment"));
+        inner.extend_from_slice(&pack(b"SSND", &ssnd_body));
+        let mut f = Vec::new();
+        f.extend_from_slice(b"FORM");
+        f.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        f.extend_from_slice(&inner);
+
+        let parsed = parse(&f).unwrap();
+        assert_eq!(
+            parsed.name.as_ref().unwrap().as_str(),
+            Some("Helicopter take-off")
+        );
+        assert_eq!(
+            parsed.author.as_ref().unwrap().as_str(),
+            Some("sound designer")
+        );
+        assert_eq!(
+            parsed.copyright.as_ref().unwrap().as_str(),
+            Some("1991 Apple Computer, Inc.")
+        );
+        assert_eq!(parsed.annotations.len(), 2);
+        assert_eq!(parsed.annotations[0].as_str(), Some("first comment"));
+        assert_eq!(parsed.annotations[1].as_str(), Some("second comment"));
+        // The SSND payload still parses alongside the text chunks.
+        assert_eq!(parsed.sound.as_ref().unwrap().samples, &pcm);
+    }
+
+    #[test]
+    fn rejects_duplicate_name_chunks() {
+        // §13.0: at most one NAME per FORM.
+        let pcm = [0x00_u8, 0x01];
+        let mut comm_body = Vec::new();
+        comm_body.extend_from_slice(&1_i16.to_be_bytes());
+        comm_body.extend_from_slice(&1_u32.to_be_bytes());
+        comm_body.extend_from_slice(&16_i16.to_be_bytes());
+        comm_body.extend_from_slice(&ext(44_100.0));
+
+        let mut ssnd_body = Vec::new();
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&pcm);
+
+        let mut inner = Vec::new();
+        inner.extend_from_slice(b"AIFF");
+        inner.extend_from_slice(&pack(b"COMM", &comm_body));
+        inner.extend_from_slice(&pack(b"NAME", b"first"));
+        inner.extend_from_slice(&pack(b"NAME", b"second"));
+        inner.extend_from_slice(&pack(b"SSND", &ssnd_body));
+        let mut f = Vec::new();
+        f.extend_from_slice(b"FORM");
+        f.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        f.extend_from_slice(&inner);
+
+        assert!(matches!(parse(&f), Err(AiffError::DuplicateChunk("NAME"))));
+    }
+
+    #[test]
+    fn rejects_duplicate_auth_chunks() {
+        // §13.0: at most one AUTH per FORM.
+        let pcm = [0x00_u8, 0x01];
+        let mut comm_body = Vec::new();
+        comm_body.extend_from_slice(&1_i16.to_be_bytes());
+        comm_body.extend_from_slice(&1_u32.to_be_bytes());
+        comm_body.extend_from_slice(&16_i16.to_be_bytes());
+        comm_body.extend_from_slice(&ext(44_100.0));
+
+        let mut ssnd_body = Vec::new();
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&pcm);
+
+        let mut inner = Vec::new();
+        inner.extend_from_slice(b"AIFF");
+        inner.extend_from_slice(&pack(b"COMM", &comm_body));
+        inner.extend_from_slice(&pack(b"AUTH", b"alice"));
+        inner.extend_from_slice(&pack(b"AUTH", b"bob"));
+        inner.extend_from_slice(&pack(b"SSND", &ssnd_body));
+        let mut f = Vec::new();
+        f.extend_from_slice(b"FORM");
+        f.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        f.extend_from_slice(&inner);
+
+        assert!(matches!(parse(&f), Err(AiffError::DuplicateChunk("AUTH"))));
+    }
+
+    #[test]
+    fn rejects_duplicate_copyright_chunks() {
+        // §13.0: at most one Copyright per FORM.
+        let pcm = [0x00_u8, 0x01];
+        let mut comm_body = Vec::new();
+        comm_body.extend_from_slice(&1_i16.to_be_bytes());
+        comm_body.extend_from_slice(&1_u32.to_be_bytes());
+        comm_body.extend_from_slice(&16_i16.to_be_bytes());
+        comm_body.extend_from_slice(&ext(44_100.0));
+
+        let mut ssnd_body = Vec::new();
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&pcm);
+
+        let mut inner = Vec::new();
+        inner.extend_from_slice(b"AIFF");
+        inner.extend_from_slice(&pack(b"COMM", &comm_body));
+        inner.extend_from_slice(&pack(b"(c) ", b"1991"));
+        inner.extend_from_slice(&pack(b"(c) ", b"1992"));
+        inner.extend_from_slice(&pack(b"SSND", &ssnd_body));
+        let mut f = Vec::new();
+        f.extend_from_slice(b"FORM");
+        f.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        f.extend_from_slice(&inner);
+
+        assert!(matches!(parse(&f), Err(AiffError::DuplicateChunk("(c) "))));
+    }
+
+    #[test]
+    fn allows_multiple_annotation_chunks() {
+        // §13.0: ANNO is "any number per FORM".
+        let pcm = [0x00_u8, 0x01];
+        let mut comm_body = Vec::new();
+        comm_body.extend_from_slice(&1_i16.to_be_bytes());
+        comm_body.extend_from_slice(&1_u32.to_be_bytes());
+        comm_body.extend_from_slice(&16_i16.to_be_bytes());
+        comm_body.extend_from_slice(&ext(44_100.0));
+
+        let mut ssnd_body = Vec::new();
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd_body.extend_from_slice(&pcm);
+
+        let mut inner = Vec::new();
+        inner.extend_from_slice(b"AIFF");
+        inner.extend_from_slice(&pack(b"COMM", &comm_body));
+        inner.extend_from_slice(&pack(b"ANNO", b"alpha"));
+        inner.extend_from_slice(&pack(b"ANNO", b"beta"));
+        inner.extend_from_slice(&pack(b"ANNO", b"gamma"));
+        inner.extend_from_slice(&pack(b"SSND", &ssnd_body));
+        let mut f = Vec::new();
+        f.extend_from_slice(b"FORM");
+        f.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        f.extend_from_slice(&inner);
+
+        let parsed = parse(&f).unwrap();
+        let annos: Vec<&str> = parsed
+            .annotations
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(annos, vec!["alpha", "beta", "gamma"]);
     }
 }

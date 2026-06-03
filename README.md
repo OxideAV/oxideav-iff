@@ -21,10 +21,11 @@ crate ships:
   accepts both `BODY` and `DLTA` chunk ids so op-0 / op-5 / op-7
   streams decode through the same path.
 - **FORM/AIFF and FORM/AIFC** — Apple AIFF / AIFF-C (read):
-  COMM/SSND/FVER/MARK/INST/COMT/AESD/APPL/MIDI walker, 80-bit
-  IEEE-extended sample-rate decode, PCM compression-flavour
-  readers for `NONE` / `twos` / `sowt` / `raw ` / `fl32` / `FL32`
-  / `fl64` / `FL64`, structured `MARK` chunk parsing
+  COMM/SSND/FVER/MARK/INST/COMT/AESD/APPL/MIDI/NAME/AUTH/(c) /ANNO
+  walker, 80-bit IEEE-extended sample-rate decode, PCM
+  compression-flavour readers for `NONE` / `twos` / `sowt` /
+  `raw ` / `fl32` / `FL32` / `fl64` / `FL64`, structured `MARK`
+  chunk parsing
   (`MarkerChunk` → id / sample-frame position / pstring name per
   marker, with one-per-FORM enforcement and unique-id validation),
   structured `INST` (instrument) chunk parsing (`InstrumentChunk`
@@ -47,10 +48,19 @@ crate ships:
   verbatim per §10.0, with `is_sysex` / `len` / `is_empty`
   classifiers; multiple MIDI chunks per FORM are permitted and
   surfaced in document order, an event-level Standard MIDI File
-  decode belongs in the `oxideav-midi` sibling crate). Write-side
-  encoders for `MARK`, `INST`, `COMT`, `AESD`, `APPL`, and `MIDI`
-  are also available so callers building an AIFF / AIFC file can
-  emit every chunk class round-trippably. Codec-bearing
+  decode belongs in the `oxideav-midi` sibling crate), and
+  structured §13.0 text-chunk parsing (`TextChunk` → `kind`
+  discriminant for `NAME` / `AUTH` / `(c) ` / `ANNO` + raw text
+  bytes preserved verbatim per §13.0 ¶ "pure ASCII […] neither a
+  pstring nor a C string", with `as_str` / `as_string_lossy`
+  decode helpers; `NAME` / `AUTH` / `(c) ` are at-most-one-per-FORM
+  singletons surfaced via `Form::name` / `Form::author` /
+  `Form::copyright`, `ANNO` is "any-number-per-FORM" per §13.0 and
+  surfaced via `Form::annotations` in document order). Write-side
+  encoders for `MARK`, `INST`, `COMT`, `AESD`, `APPL`, `MIDI`, and
+  the four §13.0 text chunks are also available so callers
+  building an AIFF / AIFC file can emit every chunk class
+  round-trippably. Codec-bearing
   `compressionType` FourCCs (`ima4`, `ulaw`, `alaw`, …) are
   recognised in the parser but routed through sibling codec crates
   rather than decoded here.
@@ -395,6 +405,47 @@ isn't strictly less than the end marker's — letting the caller
 ask "what does the spec say to actually play?" without
 re-implementing the bookkeeping.
 
+### AIFF / AIFF-C text chunks
+
+`NAME`, `AUTH`, `(c) `, and `ANNO` are the four §13.0 text chunks.
+They share an identical wire layout — a four-byte ckID, a four-byte
+big-endian `ckSize`, and a flat run of bytes whose length is the
+`ckSize` value — and the parser surfaces them through structured
+[`aiff::TextChunk`] entries on the [`aiff::Form`] tree:
+
+| ckID    | Field                | Cardinality           | Surface                       |
+|---------|----------------------|-----------------------|-------------------------------|
+| `NAME`  | name of the sound    | at most one per FORM  | `Form::name: Option<TextChunk>` |
+| `AUTH`  | author name(s)       | at most one per FORM  | `Form::author: Option<TextChunk>` |
+| `(c) `  | copyright notice     | at most one per FORM  | `Form::copyright: Option<TextChunk>` |
+| `ANNO`  | free-form annotation | any number per FORM   | `Form::annotations: Vec<TextChunk>` |
+
+A duplicate `NAME` / `AUTH` / `(c) ` raises
+[`AiffError::DuplicateChunk`]; multiple `ANNO` chunks are
+accumulated in document order, mirroring how the §10.0 MIDI and
+§12.0 APPL chunks handle the "any-number-per-FORM" rule.
+
+The text body itself is preserved byte-for-byte — §13.0 ¶ "text
+contains pure ASCII characters. It is neither a pstring nor a C
+string. The number of characters in text is determined by
+ckDataSize" — so no trailing-NUL trimming or pstring-length read
+happens here. [`TextChunk::as_str`] returns a borrowed `&str` for
+valid UTF-8 bodies and [`TextChunk::as_string_lossy`] decodes the
+full body with `U+FFFD` substitution so MacRoman / Latin-1 bodies
+produced by older encoders are still salvageable. Empty text
+bodies (`ckDataSize == 0`) are accepted — §13.0 places no minimum
+on the text field. The matching write-side helper
+[`aiff::write_text_chunk`] emits the raw text bytes; the chunk
+header and any odd-length pad byte are the caller's responsibility
+(matching every other AIFF write-side helper).
+
+The on-wire ckID for the Copyright chunk is the four ASCII bytes
+`0x28 0x63 0x29 0x20`, i.e. `(`, lowercase `c`, `)`, space — per
+§13.0 ¶ "the 'c' is lowercase and there is a space [0x20] after
+the close parenthesis." The spec uses the round-bracket character
+itself as the on-wire stand-in for ©; downstream code that wants
+the © glyph should decode the text body, not the ckID.
+
 ## Roadmap
 
 The chunk walker (`chunk.rs`) is format-agnostic; SMUS (music score)
@@ -417,12 +468,15 @@ r215 adds **MIDI** (§10.0 MIDI Data) chunk surfacing — multiple
 chunks per FORM in document order, raw byte stream preserved
 verbatim with `is_sysex` / `len` / `is_empty` classifiers plus a
 write-side helper; the SMF event-level decode lives in the
-`oxideav-midi` sibling crate. Write-side encoders for **MARK**,
-**INST**, **COMT**, **AESD**, **APPL**, and **MIDI** complete the
-round-trip story; encoders building a FORM AIFF / AIFC can now
-emit every chunk class the read path surfaces. SAXEL (§8.0,
-marked "rough proposal" / "Under Construction" in the 1991 draft)
-is the natural next AIFF-side target.
+`oxideav-midi` sibling crate. r220 surfaces the §13.0 **text
+chunks** (`NAME` / `AUTH` / `(c) ` / `ANNO`) — see the dedicated
+section above. Write-side encoders for **MARK**, **INST**,
+**COMT**, **AESD**, **APPL**, **MIDI**, and the §13.0 text
+chunks complete the round-trip story; encoders building a FORM
+AIFF / AIFC can now emit every chunk class the read path
+surfaces. SAXEL (§8.0, marked "rough proposal" / "Under
+Construction" in the 1991 draft) is the natural next AIFF-side
+target.
 
 ## License
 

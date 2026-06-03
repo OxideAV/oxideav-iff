@@ -48,10 +48,16 @@
 //! [`error::AiffError::UnsupportedPcmCompression`] for those so
 //! callers can dispatch cleanly.
 //!
-//! The optional text chunks (`NAME`, `AUTH`, `(c) `, `ANNO`) are
-//! recognised by the chunk walker and skipped silently by the
-//! FORM-level parser; later rounds will surface them as structured
-//! fields.
+//! The §13.0 text chunks (`NAME`, `AUTH`, `(c) `, `ANNO`) are parsed
+//! into [`TextChunk`]s and surfaced through [`Form::name`],
+//! [`Form::author`], [`Form::copyright`], and [`Form::annotations`].
+//! Per §13.0, `NAME` / `AUTH` / `(c) ` are at-most-one-per-FORM
+//! (duplicates raise [`AiffError::DuplicateChunk`]) while `ANNO` is
+//! unconstrained and accumulated in document order, mirroring how
+//! §10.0 MIDI and §12.0 APPL handle the "any-number-per-FORM" rule.
+//! The text body is preserved byte-for-byte ("neither a pstring nor a
+//! C string"); UTF-8 lossy decoding is available as a
+//! [`TextChunk::as_string_lossy`] convenience.
 //!
 //! The `MARK` (marker) chunk is parsed into a structured
 //! [`MarkerChunk`] (id / sample-frame position / pstring name per
@@ -119,6 +125,7 @@ pub mod instrument;
 pub mod marker;
 pub mod midi;
 pub mod pcm;
+pub mod text;
 
 pub mod demuxer;
 
@@ -139,6 +146,7 @@ pub use instrument::{
 pub use marker::{parse_marker_chunk, write_marker_chunk, Marker, MarkerChunk};
 pub use midi::{parse_midi_chunk, write_midi_chunk, MidiDataChunk};
 pub use pcm::{decode_pcm, is_pcm_compression, PcmSamples};
+pub use text::{parse_text_chunk, write_text_chunk, TextChunk, TextKind};
 
 pub use demuxer::{make_demuxer, register, AiffDemuxer, FORMAT_NAME};
 

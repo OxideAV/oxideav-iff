@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AIFF / AIFF-C §13.0 text chunks (`NAME` / `AUTH` / `(c) ` / `ANNO`).**
+  The FORM walker now decodes the four §13.0 Text Chunks of
+  `docs/audio/aiff/aiff-c.txt` into a structured [`aiff::TextChunk`]
+  (with a [`aiff::TextKind`] discriminant tagging which of the four
+  ckIDs the chunk came from) and surfaces them through new
+  [`aiff::Form::name`] / [`aiff::Form::author`] /
+  [`aiff::Form::copyright`] / [`aiff::Form::annotations`] fields.
+  Per §13.0 ¶ "No more than one Name / Author / Copyright Chunk may
+  exist within a FORM AIFC", `NAME` / `AUTH` / `(c) ` are
+  duplicate-checked singletons (a second occurrence raises
+  [`aiff::AiffError::DuplicateChunk`]); per §13.0 ¶ "Any number of
+  Annotation Chunks may exist within a FORM AIFC", `ANNO` is
+  accumulated into a `Vec<TextChunk>` in document order, matching how
+  §10.0 MIDI and §12.0 APPL handle the "any-number-per-FORM" rule.
+  The text body is preserved byte-for-byte (§13.0 ¶ "text contains
+  pure ASCII characters. It is neither a pstring nor a C string");
+  [`aiff::TextChunk::as_str`] returns a borrowed `&str` for valid
+  UTF-8 bodies and [`aiff::TextChunk::as_string_lossy`] decodes the
+  full body with `U+FFFD` substitution so MacRoman / Latin-1 bodies
+  produced by older encoders are still salvageable. Empty text
+  bodies (`ckDataSize == 0`) are accepted — §13.0 places no
+  minimum on the text field. A matching [`aiff::write_text_chunk`]
+  write-side helper completes the round-trip story; an encoder
+  building a FORM AIFF / AIFC can now emit every §13.0 ckID
+  alongside the COMT / MARK / INST / AESD / APPL / MIDI write paths
+  added in earlier rounds. The `(c) ` ckID uses the canonical
+  four-byte ASCII form `0x28 0x63 0x29 0x20` per §13.0 ¶ "the 'c' is
+  lowercase and there is a space [0x20] after the close parenthesis";
+  the spec uses the round-bracket character itself as the ckID glyph
+  standing in for ©. New `tests/aiff_text_chunks.rs` covers
+  standalone parse/write round-trips, the four-kind happy path with
+  one file carrying NAME + AUTH + `(c) ` + 2 × ANNO, three
+  duplicate-chunk rejection paths, a document-order check for ANNO,
+  empty-body acceptance, odd-length pad-byte round-trip, and the
+  `(c) ` ckID variant-resistance check. Internal `form.rs` tests
+  exercise the same surfaces against the lower-level helpers.
+
 - **AIFF / AIFF-C `MIDI` (MIDI Data) chunk surfacing.** The FORM
   walker now decodes every `MIDI` chunk (`docs/audio/aiff/aiff-c.txt`
   §10.0) into a structured [`aiff::MidiDataChunk`] and exposes them
