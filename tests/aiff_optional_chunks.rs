@@ -10,7 +10,7 @@
 
 use oxideav_iff::aiff::{
     parse, AesdChunk, ApplicationChunk, ApplicationDialect, Comment, CommentsChunk,
-    InstrumentChunk, Loop, Marker, MarkerChunk, PlayMode,
+    InstrumentChunk, Loop, Marker, MarkerChunk, MidiDataChunk, PlayMode,
 };
 
 /// 80-bit IEEE extended encoding for a sample rate in Hz. Mirrors
@@ -332,4 +332,115 @@ fn aesd_write_helper_roundtrips() {
     let f = form_aiff(&[(b"AESD", body.to_vec())]);
     let p = parse(&f).unwrap();
     assert_eq!(p.aesd.unwrap(), a);
+}
+
+#[test]
+fn surfaces_single_midi_chunk() {
+    // §10.0 SysEx-style body: F0 ... F7.
+    let body = vec![
+        0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7,
+    ];
+    let f = form_aiff(&[(b"MIDI", body.clone())]);
+    let p = parse(&f).unwrap();
+    assert_eq!(p.midi.len(), 1);
+    assert_eq!(p.midi[0].data, body);
+    assert!(p.midi[0].is_sysex());
+    assert!(!p.midi[0].is_empty());
+}
+
+#[test]
+fn surfaces_multiple_midi_chunks_in_document_order() {
+    // §10.0: "Any number of MIDI Data Chunks may exist in a FORM AIFC."
+    let m1 = vec![0xF0, 0x41, 0xF7];
+    let m2 = vec![0x90, 0x3C, 0x7F]; // Note On, ch1
+    let m3 = vec![0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7];
+    let f = form_aiff(&[
+        (b"MIDI", m1.clone()),
+        (b"MIDI", m2.clone()),
+        (b"MIDI", m3.clone()),
+    ]);
+    let p = parse(&f).unwrap();
+    assert_eq!(p.midi.len(), 3);
+    assert_eq!(p.midi[0].data, m1);
+    assert_eq!(p.midi[1].data, m2);
+    assert_eq!(p.midi[2].data, m3);
+    assert!(p.midi[0].is_sysex());
+    assert!(!p.midi[1].is_sysex());
+    assert!(p.midi[2].is_sysex());
+}
+
+#[test]
+fn surfaces_zero_midi_chunks_as_empty_vec() {
+    let f = form_aiff(&[]);
+    let p = parse(&f).unwrap();
+    assert!(p.midi.is_empty());
+}
+
+#[test]
+fn midi_chunk_with_odd_length_round_trips_through_chunk_walker() {
+    // 5-byte odd-length MIDI body — outer chunk walker inserts a pad
+    // byte but strips it before handing the body to the MIDI parser.
+    let body = vec![0xC0, 0x00, 0xB0, 0x07, 0x40];
+    let f = form_aiff(&[(b"MIDI", body.clone())]);
+    let p = parse(&f).unwrap();
+    assert_eq!(p.midi.len(), 1);
+    assert_eq!(p.midi[0].data, body);
+    assert_eq!(p.midi[0].len(), 5);
+}
+
+#[test]
+fn midi_chunk_write_helper_roundtrips() {
+    use oxideav_iff::aiff::write_midi_chunk;
+    let m = MidiDataChunk {
+        data: vec![0xF0, 0x7D, 0x00, 0x01, 0x02, 0xF7],
+    };
+    let body = write_midi_chunk(&m);
+    let f = form_aiff(&[(b"MIDI", body)]);
+    let p = parse(&f).unwrap();
+    assert_eq!(p.midi.len(), 1);
+    assert_eq!(p.midi[0], m);
+}
+
+#[test]
+fn empty_midi_chunk_is_accepted() {
+    // §10.0 doesn't forbid ckDataSize=0; the parser surfaces it as a
+    // zero-length data buffer the caller can choose to ignore.
+    let f = form_aiff(&[(b"MIDI", Vec::new())]);
+    let p = parse(&f).unwrap();
+    assert_eq!(p.midi.len(), 1);
+    assert!(p.midi[0].is_empty());
+    assert_eq!(p.midi[0].len(), 0);
+    assert!(!p.midi[0].is_sysex());
+}
+
+#[test]
+fn midi_chunk_coexists_with_other_optional_chunks() {
+    // Build a FORM exercising MARK + INST + MIDI together — confirms
+    // the new branch doesn't clobber the existing surfaces.
+    let mut mark = Vec::new();
+    mark.extend_from_slice(&1_u16.to_be_bytes());
+    mark.extend_from_slice(&1_i16.to_be_bytes());
+    mark.extend_from_slice(&0_u32.to_be_bytes());
+    mark.push(3);
+    mark.extend_from_slice(b"cue");
+
+    let mut inst = vec![60, 0, 0, 127, 1, 127];
+    inst.extend_from_slice(&0_i16.to_be_bytes());
+    inst.extend_from_slice(&[0u8; 12]);
+
+    let midi1 = vec![0xF0, 0x41, 0x10, 0xF7];
+    let midi2 = vec![0xB0, 0x07, 0x64];
+
+    let f = form_aiff(&[
+        (b"MARK", mark),
+        (b"INST", inst),
+        (b"MIDI", midi1.clone()),
+        (b"MIDI", midi2.clone()),
+    ]);
+    let p = parse(&f).unwrap();
+    assert!(p.markers.is_some());
+    assert!(p.instrument.is_some());
+    assert_eq!(p.midi.len(), 2);
+    assert_eq!(p.midi[0].data, midi1);
+    assert_eq!(p.midi[1].data, midi2);
 }

@@ -4,7 +4,10 @@
 //! any optional metadata chunks (NAME, AUTH, ANNO, (c) , COMT, MARK,
 //! INST, MIDI, AESD, APPL, FVER). Chunk order inside a FORM is not
 //! prescribed by the spec — `docs/audio/aiff/aiff-aifc-format.md` §4
-//! is explicit on this — so we scan all chunks and route by ckID.
+//! is explicit on this — so we scan all chunks and route by ckID. The
+//! `MIDI` chunk (§10.0) and `APPL` chunk (§12.0) are explicitly
+//! "any-number-per-FORM" per the spec, so we accumulate them in
+//! document order rather than rejecting duplicates.
 
 use crate::aiff::aesd::{parse_aesd_chunk, AesdChunk};
 use crate::aiff::appl::{parse_appl_chunk, ApplicationChunk};
@@ -14,6 +17,7 @@ use crate::aiff::common::{parse_common, CommonChunk};
 use crate::aiff::error::{AiffError, Result};
 use crate::aiff::instrument::{parse_instrument_chunk, InstrumentChunk};
 use crate::aiff::marker::{parse_marker_chunk, MarkerChunk};
+use crate::aiff::midi::{parse_midi_chunk, MidiDataChunk};
 
 /// Parsed SSND (Sound Data) chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +78,11 @@ pub struct Form<'a> {
     /// rather than an `Option`. An empty vector means no APPL
     /// chunks were present.
     pub applications: Vec<ApplicationChunk>,
+    /// Parsed MIDI chunks in document order. Per §10.0 any number of
+    /// MIDI Data chunks may appear per FORM AIFC, so this is a `Vec`
+    /// rather than an `Option`. An empty vector means no MIDI chunks
+    /// were present.
+    pub midi: Vec<MidiDataChunk>,
 }
 
 /// Parse a complete AIFF / AIFF-C file. `buf` is the raw file
@@ -117,6 +126,7 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
     let mut comments: Option<CommentsChunk> = None;
     let mut aesd: Option<AesdChunk> = None;
     let mut applications: Vec<ApplicationChunk> = Vec::new();
+    let mut midi: Vec<MidiDataChunk> = Vec::new();
 
     for chunk in ChunkIter::new(inner) {
         let chunk = chunk?;
@@ -164,6 +174,12 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
                 // document order, no duplicate check.
                 applications.push(parse_appl_chunk(chunk.data)?);
             }
+            b"MIDI" => {
+                // §10.0: "Any number of MIDI Data Chunks may exist
+                // in a FORM AIFC." — accumulate in document order,
+                // no duplicate check.
+                midi.push(parse_midi_chunk(chunk.data)?);
+            }
             b"SSND" => {
                 if chunk.data.len() < 8 {
                     return Err(AiffError::Truncated("SSND chunk header"));
@@ -209,8 +225,9 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
             }
             _ => {
                 // Optional / unrecognised chunks: skip silently.
-                // Marker / instrument / text / application chunks are
-                // valid here and may be implemented in a later round.
+                // Text chunks (NAME / AUTH / (c) / ANNO) remain
+                // structurally unparsed and will be surfaced in a
+                // later round.
             }
         }
     }
@@ -232,6 +249,7 @@ pub fn parse(buf: &[u8]) -> Result<Form<'_>> {
         comments,
         aesd,
         applications,
+        midi,
     })
 }
 

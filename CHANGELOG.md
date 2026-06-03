@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AIFF / AIFF-C `MIDI` (MIDI Data) chunk surfacing.** The FORM
+  walker now decodes every `MIDI` chunk (`docs/audio/aiff/aiff-c.txt`
+  §10.0) into a structured [`aiff::MidiDataChunk`] and exposes them
+  through [`aiff::Form::midi`] in document order. §10.0 explicitly
+  permits "any number of MIDI Data Chunks" per FORM AIFC, so the
+  surface is a `Vec` rather than an `Option`. The chunk body is
+  preserved verbatim as a raw MIDI byte stream — the spec calls
+  `MIDIdata` "a stream of MIDI data" and imposes no internal
+  framing, so an MMA Standard MIDI File-style decode (MThd / MTrk
+  / variable-length quantity / running status) remains the job of
+  the `oxideav-midi` sibling crate. Lightweight observers
+  [`aiff::MidiDataChunk::len`] /
+  [`aiff::MidiDataChunk::is_empty`] /
+  [`aiff::MidiDataChunk::is_sysex`] cover the common "is this a
+  SysEx patch dump or something else?" classification without
+  re-parsing (`is_sysex` matches the leading `0xF0` status byte
+  the spec calls out as the chunk's "primary purpose"). The
+  matching [`aiff::write_midi_chunk`] write-side helper completes
+  the round-trip story for encoders building a FORM AIFC. Empty
+  chunks (`ckDataSize == 0`) are accepted per §10.0 ¶ "MIDIData
+  contains a stream of MIDI data." — the spec sets no minimum
+  body length. New `tests/aiff_optional_chunks.rs` cases
+  (`surfaces_single_midi_chunk`,
+  `surfaces_multiple_midi_chunks_in_document_order`,
+  `surfaces_zero_midi_chunks_as_empty_vec`,
+  `midi_chunk_with_odd_length_round_trips_through_chunk_walker`,
+  `midi_chunk_write_helper_roundtrips`,
+  `empty_midi_chunk_is_accepted`,
+  `midi_chunk_coexists_with_other_optional_chunks`) exercise the
+  full surface plus 6 module-level unit tests
+  (`parses_empty_chunk`, `preserves_byte_stream_verbatim`,
+  `is_sysex_false_when_first_byte_is_not_f0`, `write_round_trips`,
+  `write_round_trips_empty_chunk`, `classifies_odd_length_stream`,
+  `accepts_large_body`). Doc reference:
+  `docs/audio/aiff/aiff-c.txt` §10.0 MIDI DATA CHUNK.
 - **ANIM op-7 (Short / Long Vertical Delta) encoder.** New
   [`anim::encode_op7_body`] builds the 64-byte pointer table + 8
   per-plane opcode lists + 8 per-plane data lists from a `prev` /

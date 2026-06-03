@@ -21,7 +21,7 @@ crate ships:
   accepts both `BODY` and `DLTA` chunk ids so op-0 / op-5 / op-7
   streams decode through the same path.
 - **FORM/AIFF and FORM/AIFC** — Apple AIFF / AIFF-C (read):
-  COMM/SSND/FVER/MARK/INST/COMT/AESD/APPL walker, 80-bit
+  COMM/SSND/FVER/MARK/INST/COMT/AESD/APPL/MIDI walker, 80-bit
   IEEE-extended sample-rate decode, PCM compression-flavour
   readers for `NONE` / `twos` / `sowt` / `raw ` / `fl32` / `FL32`
   / `fl64` / `FL64`, structured `MARK` chunk parsing
@@ -42,12 +42,18 @@ crate ships:
   + `pdos`/`stoc`/Macintosh dialect classification +
   application-name decode for the `pdos`/`stoc` dialects per
   §12.0; multiple APPL chunks per FORM are permitted and surfaced
-  in document order). Write-side encoders for `MARK`, `INST`,
-  `COMT`, `AESD`, and `APPL` are also available so callers
-  building an AIFF / AIFC file can emit every chunk class
-  round-trippably. Codec-bearing `compressionType` FourCCs
-  (`ima4`, `ulaw`, `alaw`, …) are recognised in the parser but
-  routed through sibling codec crates rather than decoded here.
+  in document order), and structured `MIDI` (MIDI Data) chunk
+  parsing (`MidiDataChunk` → raw MIDI byte stream preserved
+  verbatim per §10.0, with `is_sysex` / `len` / `is_empty`
+  classifiers; multiple MIDI chunks per FORM are permitted and
+  surfaced in document order, an event-level Standard MIDI File
+  decode belongs in the `oxideav-midi` sibling crate). Write-side
+  encoders for `MARK`, `INST`, `COMT`, `AESD`, `APPL`, and `MIDI`
+  are also available so callers building an AIFF / AIFC file can
+  emit every chunk class round-trippably. Codec-bearing
+  `compressionType` FourCCs (`ima4`, `ulaw`, `alaw`, …) are
+  recognised in the parser but routed through sibling codec crates
+  rather than decoded here.
 
 Zero C dependencies.
 
@@ -407,12 +413,16 @@ end-to-end: **COMT** (timestamped comments, optional `MarkerId`
 linkage), **AESD** (24-byte AES channel-status block with the
 recording-emphasis field exposed), and **APPL** (application-
 specific, `pdos` / `stoc` / Macintosh dialect classification).
-Write-side encoders for **MARK**, **INST**, **COMT**, **AESD**,
-and **APPL** complete the round-trip story; encoders building a
-FORM AIFF / AIFC can now emit every chunk class the read path
-surfaces. SAXEL (§8.0, marked "rough proposal" in the 1991
-draft) and standalone `MIDI` data chunks (§10.0) are the
-natural next AIFF-side targets.
+r215 adds **MIDI** (§10.0 MIDI Data) chunk surfacing — multiple
+chunks per FORM in document order, raw byte stream preserved
+verbatim with `is_sysex` / `len` / `is_empty` classifiers plus a
+write-side helper; the SMF event-level decode lives in the
+`oxideav-midi` sibling crate. Write-side encoders for **MARK**,
+**INST**, **COMT**, **AESD**, **APPL**, and **MIDI** complete the
+round-trip story; encoders building a FORM AIFF / AIFC can now
+emit every chunk class the read path surfaces. SAXEL (§8.0,
+marked "rough proposal" / "Under Construction" in the 1991 draft)
+is the natural next AIFF-side target.
 
 ## License
 

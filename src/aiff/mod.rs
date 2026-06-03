@@ -48,10 +48,10 @@
 //! [`error::AiffError::UnsupportedPcmCompression`] for those so
 //! callers can dispatch cleanly.
 //!
-//! The optional text chunks (`NAME`, `AUTH`, `(c) `, `ANNO`) and the
-//! MIDI chunk are recognised by the chunk walker and skipped silently
-//! by the FORM-level parser; later rounds will surface them as
-//! structured fields.
+//! The optional text chunks (`NAME`, `AUTH`, `(c) `, `ANNO`) are
+//! recognised by the chunk walker and skipped silently by the
+//! FORM-level parser; later rounds will surface them as structured
+//! fields.
 //!
 //! The `MARK` (marker) chunk is parsed into a structured
 //! [`MarkerChunk`] (id / sample-frame position / pstring name per
@@ -96,6 +96,16 @@
 //! leading Pascal-string application name via
 //! [`ApplicationChunk::application_name`] while Macintosh
 //! application signatures (any other FourCC) carry raw bytes.
+//!
+//! The `MIDI` (MIDI Data) chunks — §10.0 permits any number per FORM
+//! — are parsed into [`MidiDataChunk`]s and surfaced through
+//! [`Form::midi`] in document order. The body is the raw MIDI byte
+//! stream the spec describes as opaque to the AIFF layer; a full
+//! Standard MIDI File / event-level decode is the job of the
+//! `oxideav-midi` sibling crate. Lightweight observers
+//! ([`MidiDataChunk::len`], [`MidiDataChunk::is_empty`],
+//! [`MidiDataChunk::is_sysex`]) cover the common "is this a SysEx
+//! patch dump or something else?" classification without re-parsing.
 
 pub mod aesd;
 pub mod appl;
@@ -107,6 +117,7 @@ pub mod extended;
 pub mod form;
 pub mod instrument;
 pub mod marker;
+pub mod midi;
 pub mod pcm;
 
 pub mod demuxer;
@@ -126,6 +137,7 @@ pub use instrument::{
     parse_instrument_chunk, write_instrument_chunk, InstrumentChunk, Loop, PlayMode, ResolvedLoop,
 };
 pub use marker::{parse_marker_chunk, write_marker_chunk, Marker, MarkerChunk};
+pub use midi::{parse_midi_chunk, write_midi_chunk, MidiDataChunk};
 pub use pcm::{decode_pcm, is_pcm_compression, PcmSamples};
 
 pub use demuxer::{make_demuxer, register, AiffDemuxer, FORMAT_NAME};
