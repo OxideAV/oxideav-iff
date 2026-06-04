@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ILBM `DEST` (destination-merge) chunk surfacing.** `parse_ilbm`
+  now lifts the `DEST` property (ILBM §2.6) into a structured
+  [`ilbm::Dest`] (`depth` / `pad1` / `plane_pick` / `plane_on_off` /
+  `plane_mask`) and exposes it through `IlbmImage::dest`. The §6
+  grammar fixes the property order as `BMHD [CMAP] [GRAB] [DEST]
+  [SPRT] [CAMG] ... BODY`; `encode_ilbm` honours that slot, writing
+  an eight-byte payload (`UBYTE depth`, `UBYTE pad1`, three big-endian
+  `UWORD` masks) right after `GRAB`. A helper
+  [`ilbm::Dest::pick_count_matches_depth`] surfaces the §2.6 soft
+  expectation "the number of '1' bits should equal nPlanes" without
+  rejecting non-conforming inputs at parse time (the spec frames the
+  equality as an expectation, not a requirement). Round-trip is
+  byte-stable, including a non-zero `pad1` byte (§2.6: "unused; for
+  consistency put 0 here"). Eight new tests in `tests/ilbm_dest.rs`
+  cover the wire layout, the implicit `(1 << nPlanes) - 1` default
+  case, mismatch detection, and the FORM-envelope ordering invariant.
+
 - **AIFF / AIFF-C `SAXL` (Sound Accelerator) chunk surfacing.** The
   FORM walker now decodes every `SAXL` chunk
   (`docs/audio/aiff/aiff-c.txt` §8.0 + Appendix D) into a structured

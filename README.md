@@ -8,6 +8,7 @@ crate ships:
 - **FORM/ILBM** — read+round-trip (1..=8 indexed bitplanes **and
   24-bit literal-RGB true-colour**, ByteRun1 / Auto compression,
   EHB, HAM6, HAM8, HasMask, transparent-colour keying, GRAB hotspot,
+  DEST destination-merge (depth / planePick / planeOnOff / planeMask),
   SHAM per-line palette, PCHG small-format palette change list,
   CRNG / CCRT / DRNG colour-cycling descriptors).
 - **FORM/PBM** — read+round-trip (DPaint II / Brilliance chunky sibling).
@@ -195,6 +196,7 @@ Read + round-trip support for `FORM / ILBM`:
 | `Masking::HasMask` plane → alpha         |  Y   |   Y   |
 | `Masking::HasTransparentColor` keying    |  Y   |   Y   |
 | `GRAB` hotspot (mouse-pointer anchor)    |  Y   |   Y   |
+| `DEST` destination-merge (depth/pick/on/mask) |  Y   |   Y   |
 | `SHAM` Sliced HAM (per-line 16×RGB444)   |  Y   |   Y   |
 | `PCHG` palette change list (small fmt)   |  Y   |   Y   |
 | `PCHG` palette change list (big fmt)     |  Y   |   N*  |
@@ -210,7 +212,9 @@ list).
 
 - Public API: [`ilbm::parse_ilbm`], [`ilbm::encode_ilbm`],
   [`ilbm::IlbmImage`], [`ilbm::Bmhd`], [`ilbm::Camg`],
-  [`ilbm::Grab`], [`ilbm::Sham`], [`ilbm::Pchg`] /
+  [`ilbm::Grab`], [`ilbm::Dest`] /
+  [`ilbm::Dest::pick_count_matches_depth`],
+  [`ilbm::Sham`], [`ilbm::Pchg`] /
   [`ilbm::Pchg::palette_at_line`], [`ilbm::Crng`] /
   [`ilbm::Crng::cycle_step`], [`ilbm::Ccrt`] /
   [`ilbm::Ccrt::cycle_step`], [`ilbm::Drng`] / [`ilbm::DrngTrueCell`]

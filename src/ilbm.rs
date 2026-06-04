@@ -298,6 +298,90 @@ impl Grab {
     }
 }
 
+// ───────────────────── DEST (Destination Merge) ─────────────────────
+
+/// `DEST` — destination-merge property describing how to scatter source
+/// bitplanes into a deeper destination image. Eight bytes on disk:
+///
+/// ```text
+/// UBYTE depth        // # bitplanes in the original source
+/// UBYTE pad1         // 0 on write; ignored on read
+/// UWORD planePick    // 1 bit = "consume next source plane here"
+/// UWORD planeOnOff   // default bit when planePick bit is 0
+/// UWORD planeMask    // 1 bit = write to destination bitplane
+/// ```
+///
+/// All `UWORD` fields are big-endian; only the low `depth` bits matter
+/// for the destination bitmap, higher-order bits are unused. With no
+/// `DEST` chunk the implicit default is `planePick == planeMask ==
+/// (1 << nPlanes) - 1` and `planeOnOff == 0` (i.e. one-to-one mapping
+/// of source planes into the destination, every plane written, zero
+/// fill where no source plane).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dest {
+    /// Number of bitplanes in the source image (the `nPlanes` carried
+    /// by `BMHD`).
+    pub depth: u8,
+    /// Pad byte from the on-disk layout. Spec says "put 0 here"; kept
+    /// so a parse → write round-trip preserves the original byte.
+    pub pad1: u8,
+    /// `planePick` mask: a `1` bit consumes the next source bitplane
+    /// into the destination bitplane at the same bit position. The
+    /// count of `1` bits is expected to equal `depth`.
+    pub plane_pick: u16,
+    /// `planeOnOff` mask: at destination bitplanes whose `planePick`
+    /// bit is `0`, this bit is broadcast to every pixel of that plane
+    /// instead of pulling from a source plane.
+    pub plane_on_off: u16,
+    /// `planeMask` mask: a `1` bit means "write to this destination
+    /// bitplane"; a `0` bit means "leave the destination bitplane
+    /// untouched" (the receiver's existing pixels remain).
+    pub plane_mask: u16,
+}
+
+impl Dest {
+    /// Parse a `DEST` chunk body. Eight bytes required; the spec
+    /// fixes the layout to `depth/pad1/planePick/planeOnOff/planeMask`.
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 8 {
+            return Err(Error::invalid(format!(
+                "ILBM DEST: need 8 bytes, got {}",
+                body.len()
+            )));
+        }
+        Ok(Self {
+            depth: body[0],
+            pad1: body[1],
+            plane_pick: u16::from_be_bytes([body[2], body[3]]),
+            plane_on_off: u16::from_be_bytes([body[4], body[5]]),
+            plane_mask: u16::from_be_bytes([body[6], body[7]]),
+        })
+    }
+    /// Serialise to the 8-byte on-disk form.
+    pub fn write(&self) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[0] = self.depth;
+        out[1] = self.pad1;
+        out[2..4].copy_from_slice(&self.plane_pick.to_be_bytes());
+        out[4..6].copy_from_slice(&self.plane_on_off.to_be_bytes());
+        out[6..8].copy_from_slice(&self.plane_mask.to_be_bytes());
+        out
+    }
+
+    /// True when `plane_pick` has exactly `depth` `1` bits set in its
+    /// low `depth` positions. The spec phrases this as a soft
+    /// expectation; callers building synthetic `DEST` chunks can use
+    /// this to sanity-check their wire bytes.
+    pub fn pick_count_matches_depth(&self) -> bool {
+        let mask = if self.depth >= 16 {
+            0xFFFFu16
+        } else {
+            (1u16 << self.depth).wrapping_sub(1)
+        };
+        (self.plane_pick & mask).count_ones() == self.depth as u32
+    }
+}
+
 // ───────────────────── SHAM (Sliced HAM) ─────────────────────
 
 /// `SHAM` — Sliced-HAM extension. After a 16-bit version word the
@@ -1482,6 +1566,10 @@ pub struct IlbmImage {
     pub form_type: [u8; 4],
     /// Optional `GRAB` hotspot (mouse-pointer anchor for sprites).
     pub grab: Option<Grab>,
+    /// Optional `DEST` destination-merge descriptor. Captures how the
+    /// source's `nPlanes` bitplanes scatter into a deeper destination
+    /// bitmap (Amiga "merge into a `depth`-deep viewport" pattern).
+    pub dest: Option<Dest>,
     /// Optional `SHAM` Sliced-HAM payload (one 16-entry RGB444 palette
     /// per scanline). Only meaningful when `camg.is_ham()` and
     /// `bmhd.n_planes == 6`.
@@ -1525,6 +1613,7 @@ impl Default for IlbmImage {
             camg: Camg::default(),
             form_type: *b"ILBM",
             grab: None,
+            dest: None,
             sham: None,
             pchg: None,
             crngs: Vec::new(),
@@ -1567,6 +1656,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
     let mut camg = Camg::default();
     let mut body_data: Option<Vec<u8>> = None;
     let mut grab: Option<Grab> = None;
+    let mut dest: Option<Dest> = None;
     let mut sham_raw: Option<Vec<u8>> = None;
     let mut pchg: Option<Pchg> = None;
     let mut crngs: Vec<Crng> = Vec::new();
@@ -1609,6 +1699,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
             b"CAMG" => camg = Camg::parse(payload)?,
             b"BODY" => body_data = Some(payload.to_vec()),
             b"GRAB" => grab = Some(Grab::parse(payload)?),
+            b"DEST" => dest = Some(Dest::parse(payload)?),
             b"SHAM" => sham_raw = Some(payload.to_vec()),
             b"PCHG" => pchg = Some(Pchg::parse(payload)?),
             b"CRNG" => crngs.push(Crng::parse(payload)?),
@@ -1704,6 +1795,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
             camg,
             form_type,
             grab,
+            dest,
             sham,
             pchg,
             crngs,
@@ -1730,6 +1822,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
             camg,
             form_type,
             grab,
+            dest,
             sham,
             pchg,
             crngs,
@@ -1909,6 +2002,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
         camg,
         form_type,
         grab,
+        dest,
         sham,
         pchg,
         crngs,
@@ -2019,6 +2113,15 @@ pub fn encode_ilbm(image: &IlbmImage) -> Result<Vec<u8>> {
         out.extend_from_slice(b"GRAB");
         out.extend_from_slice(&4u32.to_be_bytes());
         out.extend_from_slice(&g.write());
+    }
+
+    // DEST — destination-merge descriptor (ILBM §2.6). Eight bytes;
+    // even-sized so no pad byte. Emitted in the position fixed by the
+    // spec grammar `BMHD [CMAP] [GRAB] [DEST] [SPRT] [CAMG]`.
+    if let Some(d) = image.dest {
+        out.extend_from_slice(b"DEST");
+        out.extend_from_slice(&8u32.to_be_bytes());
+        out.extend_from_slice(&d.write());
     }
 
     // SHAM (Sliced HAM per-line palette table)
