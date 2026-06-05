@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ILBM `SPRT` (sprite-precedence) chunk surfacing.** `parse_ilbm`
+  now lifts the `SPRT` property (ILBM supplement §2.7) into a
+  structured [`ilbm::Sprt`] (single `UWORD precedence`) and
+  exposes it through `IlbmImage::sprt`. The supplement defines
+  the chunk as "presence flags the ILBM as intended as a sprite"
+  with a `UWORD SpritePrecedence` where "0 is the highest"
+  (foremost). The Appendix A grammar slots SPRT between `[DEST]`
+  and `[CAMG]` (`BMHD [CMAP] [GRAB] [DEST] [SPRT] [CAMG]`); §6
+  also notes the property chunks "may actually be in any order
+  but all must appear before the BODY chunk". `encode_ilbm` emits
+  the two-byte payload immediately after `DEST`, before `BODY`.
+  A const sentinel [`ilbm::Sprt::FOREMOST`] = `0` plus a
+  [`ilbm::Sprt::is_foremost`] predicate surface the §2.7
+  "0 is the highest" convention without forcing callers to
+  remember the bare-int sentinel. The full unsigned-16 range
+  `0..=0xFFFF` round-trips. Eleven new tests in `tests/ilbm_sprt.rs`
+  cover the two-byte wire layout, foremost-zero handling,
+  max-UWORD handling, short-payload rejection, the implicit
+  no-SPRT default, the grammar-ordering invariant (DEST precedes
+  SPRT precedes BODY), full-property-set coexistence with GRAB +
+  DEST + CAMG, and parse → encode → parse byte-stability. Doc
+  reference: `docs/image/iff/ilbm.txt` §2.7 + Appendix A.
+
 - **ILBM `DEST` (destination-merge) chunk surfacing.** `parse_ilbm`
   now lifts the `DEST` property (ILBM §2.6) into a structured
   [`ilbm::Dest`] (`depth` / `pad1` / `plane_pick` / `plane_on_off` /

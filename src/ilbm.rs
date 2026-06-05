@@ -382,6 +382,61 @@ impl Dest {
     }
 }
 
+// ───────────────────── SPRT (Sprite Precedence) ─────────────────────
+
+/// `SPRT` — Sprite Precedence property. A single big-endian
+/// `UWORD` carrying the sprite layering hint defined by the ILBM
+/// supplement §2.7: the chunk's presence flags the ILBM "as
+/// intended as a sprite", and its `precedence` is "relative
+/// precedence, 0 is the highest" (foremost). Reader programs may
+/// honour the precedence or override it; the supplement also notes
+/// that mapping an ILBM into an Amiga hardware sprite has setup
+/// rules of its own (e.g. a 2-plane sprite uses
+/// `transparentColor == 0` and remaps `CMAP` registers 1..=3 to
+/// the hardware sprite's three colour registers).
+///
+/// On-disk layout: two bytes, no pad needed (size 2 is even).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sprt {
+    /// Relative sprite precedence. `0` denotes the foremost
+    /// (highest-priority) sprite; larger values sit further back.
+    /// The spec uses `UWORD`, so the full unsigned 16-bit range
+    /// `0..=0xFFFF` is legal.
+    pub precedence: u16,
+}
+
+impl Sprt {
+    /// Sentinel for the supplement's "foremost" sprite — the
+    /// `precedence == 0` slot.
+    pub const FOREMOST: u16 = 0;
+
+    /// Parse a `SPRT` chunk body. Two big-endian bytes; the
+    /// supplement fixes the chunk to a single `UWORD
+    /// SpritePrecedence`.
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 2 {
+            return Err(Error::invalid(format!(
+                "ILBM SPRT: need 2 bytes, got {}",
+                body.len()
+            )));
+        }
+        Ok(Self {
+            precedence: u16::from_be_bytes([body[0], body[1]]),
+        })
+    }
+
+    /// Serialise to the 2-byte on-disk form.
+    pub fn write(&self) -> [u8; 2] {
+        self.precedence.to_be_bytes()
+    }
+
+    /// `true` when this sprite holds the supplement's
+    /// foremost-precedence slot (`precedence == 0`).
+    pub fn is_foremost(&self) -> bool {
+        self.precedence == Self::FOREMOST
+    }
+}
+
 // ───────────────────── SHAM (Sliced HAM) ─────────────────────
 
 /// `SHAM` — Sliced-HAM extension. After a 16-bit version word the
@@ -1570,6 +1625,10 @@ pub struct IlbmImage {
     /// source's `nPlanes` bitplanes scatter into a deeper destination
     /// bitmap (Amiga "merge into a `depth`-deep viewport" pattern).
     pub dest: Option<Dest>,
+    /// Optional `SPRT` sprite-precedence flag. Presence marks the
+    /// ILBM "as intended as a sprite"; the wrapped `precedence`
+    /// follows the ILBM supplement §2.7 (`0 = foremost`).
+    pub sprt: Option<Sprt>,
     /// Optional `SHAM` Sliced-HAM payload (one 16-entry RGB444 palette
     /// per scanline). Only meaningful when `camg.is_ham()` and
     /// `bmhd.n_planes == 6`.
@@ -1614,6 +1673,7 @@ impl Default for IlbmImage {
             form_type: *b"ILBM",
             grab: None,
             dest: None,
+            sprt: None,
             sham: None,
             pchg: None,
             crngs: Vec::new(),
@@ -1657,6 +1717,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
     let mut body_data: Option<Vec<u8>> = None;
     let mut grab: Option<Grab> = None;
     let mut dest: Option<Dest> = None;
+    let mut sprt: Option<Sprt> = None;
     let mut sham_raw: Option<Vec<u8>> = None;
     let mut pchg: Option<Pchg> = None;
     let mut crngs: Vec<Crng> = Vec::new();
@@ -1700,6 +1761,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
             b"BODY" => body_data = Some(payload.to_vec()),
             b"GRAB" => grab = Some(Grab::parse(payload)?),
             b"DEST" => dest = Some(Dest::parse(payload)?),
+            b"SPRT" => sprt = Some(Sprt::parse(payload)?),
             b"SHAM" => sham_raw = Some(payload.to_vec()),
             b"PCHG" => pchg = Some(Pchg::parse(payload)?),
             b"CRNG" => crngs.push(Crng::parse(payload)?),
@@ -1796,6 +1858,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
             form_type,
             grab,
             dest,
+            sprt,
             sham,
             pchg,
             crngs,
@@ -1823,6 +1886,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
             form_type,
             grab,
             dest,
+            sprt,
             sham,
             pchg,
             crngs,
@@ -2003,6 +2067,7 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
         form_type,
         grab,
         dest,
+        sprt,
         sham,
         pchg,
         crngs,
@@ -2122,6 +2187,18 @@ pub fn encode_ilbm(image: &IlbmImage) -> Result<Vec<u8>> {
         out.extend_from_slice(b"DEST");
         out.extend_from_slice(&8u32.to_be_bytes());
         out.extend_from_slice(&d.write());
+    }
+
+    // SPRT — sprite-precedence flag (ILBM supplement §2.7). Two
+    // bytes; even-sized so no pad byte. Spec grammar slots SPRT
+    // between [DEST] and [CAMG]; Appendix A §6 also notes the
+    // property chunks "may actually be in any order but all must
+    // appear before the BODY chunk", so the placement is
+    // grammar-faithful regardless of the order existing files use.
+    if let Some(s) = image.sprt {
+        out.extend_from_slice(b"SPRT");
+        out.extend_from_slice(&2u32.to_be_bytes());
+        out.extend_from_slice(&s.write());
     }
 
     // SHAM (Sliced HAM per-line palette table)

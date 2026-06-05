@@ -472,6 +472,7 @@ fn mk_image_with_pchg(pchg: Option<Pchg>) -> IlbmImage {
         form_type: *b"ILBM",
         grab: None,
         dest: None,
+        sprt: None,
         sham: None,
         pchg,
         crngs: vec![],
