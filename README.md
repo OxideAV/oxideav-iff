@@ -505,6 +505,55 @@ the body bytes; the chunk header (`'SAXL' + ckSize`) and any
 odd-length outer pad byte are the caller's responsibility,
 matching every other AIFF write-side helper in this module.
 
+### AIFF-C §14 chunk precedence
+
+§14 of the AIFF-C spec ranks every chunk class the spec defines so
+that callers can resolve overlapping information cleanly — the §14
+worked example is loop endpoints carried both by the Instrument
+Chunk and by MIDI System-Exclusive bytes inside a MIDI Data Chunk:
+
+| Precedence              | Class                | ckID     |
+|-------------------------|----------------------|----------|
+| §3.1 sentinel           | `FormatVersion`      | `FVER`   |
+| Highest                 | `Common`             | `COMM`   |
+|                         | `Instrument`         | `INST`   |
+|                         | `Saxel`              | `SAXL`   |
+|                         | `Comments`           | `COMT`   |
+|                         | `Marker`             | `MARK`   |
+|                         | `SoundData`          | `SSND`   |
+|                         | `Name`               | `NAME`   |
+|                         | `Author`             | `AUTH`   |
+|                         | `Copyright`          | `(c) `   |
+| §14 ¶ document order    | `Annotation`         | `ANNO`   |
+|                         | `AudioRecording`     | `AESD`   |
+|                         | `MidiData`           | `MIDI`   |
+| Lowest                  | `ApplicationSpecific`| `APPL`   |
+
+The surface is the [`aiff::ChunkClass`] enum (`#[repr(u8)]`, where
+the integer value is the precedence rank — lower = higher
+precedence) plus three helpers:
+
+- [`aiff::ChunkClass::rank`] returns the rank as a `u8`.
+- [`aiff::ChunkClass::higher_precedence_than`] is the §14 ¶ "the
+  loop points in the Instrument Chunk take precedence over
+  conflicting loop points found in the MIDI Data Chunk" predicate.
+- [`aiff::ChunkClass::ck_id`] returns the on-wire 4-byte ckID — the
+  §13.0 ¶ "the 'c' is lowercase and there is a space [0x20] after
+  the close parenthesis" Copyright tag is exactly `b"(c) "`.
+- [`aiff::ChunkClass::all_in_precedence_order`] enumerates the
+  fourteen-entry table for callers iterating by rank.
+
+The matching [`aiff::Form::precedence_order`] and
+[`aiff::Form::highest_precedence_class`] helpers walk a parsed
+`Form` and emit a `Vec<ChunkClass>` of the classes the FORM
+actually contains in §14 order. The §4 layout-doc ¶ "chunk order
+inside a FORM is unspecified" rule means the on-wire chunk
+sequence is irrelevant: precedence_order always reports the §14
+ordering. Multi-instance classes (§8.0 `SAXL`, §10.0 `MIDI`,
+§12.0 `APPL`, §13.0 `ANNO`) appear once per instance and preserve
+the document-order semantics §14 ¶ "Annotation Chunk[s] -- in the
+order they appear in the FORM" requires.
+
 ## Roadmap
 
 The chunk walker (`chunk.rs`) is format-agnostic; SMUS (music score)
@@ -544,7 +593,12 @@ FORM AIFF / AIFC can now emit every chunk class the read path
 surfaces. The remaining AIFF-C §x.x surfaces are saturated — Apple
 shipped 13 chunk classes (FVER, COMM, SSND, MARK, INST, COMT,
 AESD, APPL, MIDI, SAXL, NAME, AUTH, (c)  + ANNO) and this crate
-now reads + writes every one of them.
+now reads + writes every one of them. r243 surfaces the §14
+**chunk-precedence** rules through the [`aiff::ChunkClass`]
+ranked enum and the [`aiff::Form::precedence_order`] /
+[`aiff::Form::highest_precedence_class`] helpers — see the
+"AIFF-C §14 chunk precedence" section above for the ranked
+table and the §14 worked example mapping.
 
 ## License
 

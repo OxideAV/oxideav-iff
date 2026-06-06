@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AIFF-C §14 chunk-precedence surface.** A new `aiff::ChunkClass`
+  enum ranks the §3.1 / §4..§13 chunk classes per the §14 ordering
+  ("Highest precedence Common Chunk … Lowest precedence Application
+  Specific Chunk"). The enum's `repr(u8)` is the precedence rank
+  (`FVER = 0`; the §14 ranked block runs `1..=13` from `COMM` to
+  `APPL`), with [`ChunkClass::rank`] returning that rank and
+  [`ChunkClass::higher_precedence_than`] giving the §14 ¶ "the
+  loop points in the Instrument Chunk take precedence over
+  conflicting loop points found in the MIDI Data Chunk" predicate
+  in one call. [`ChunkClass::ck_id`] returns the on-wire 4-byte
+  ckID (with the §13.0 ¶ "the 'c' is lowercase and there is a
+  space [0x20] after the close parenthesis" Copyright case
+  honoured exactly as `b"(c) "`), and
+  [`ChunkClass::all_in_precedence_order`] enumerates the full
+  fourteen-entry table for callers that want to iterate by §14
+  rank. The matching [`aiff::Form::precedence_order`] helper
+  walks a parsed `Form` and emits a `Vec<ChunkClass>` of the
+  classes the FORM actually contains in §14 order (regardless of
+  the on-wire chunk layout — §4 of the staged AIFF-AIFC layout
+  doc is explicit that chunk order inside a FORM is unspecified);
+  multi-instance classes (§8.0 `SAXL`, §10.0 `MIDI`, §12.0
+  `APPL`, §13.0 `ANNO`) appear once per instance and preserve the
+  document-order semantics §14 ¶ "Annotation Chunk[s] -- in the
+  order they appear in the FORM" requires. The companion
+  [`aiff::Form::highest_precedence_class`] returns the top entry
+  (always `Some` because `COMM` is mandatory) and identifies an
+  AIFF-C FORM with a §3.1 `FVER` chunk as `FormatVersion`-led.
+  Eight unit tests in `src/aiff/precedence.rs` and seven
+  integration tests in `tests/aiff_precedence.rs` cover the
+  rank-vs-spec-order invariant, the ckID round-trip, the
+  §13.0 Copyright `(c) ` byte literal, the §14 worked example
+  Instrument-outranks-MIDI, the §14 "Common always outranks" /
+  "APPL always loses" envelope, irreflexivity of
+  `higher_precedence_than`, `Ord` agreement with `rank`, a
+  minimal AIFF FORM ordering, a minimal AIFF-C FORM with
+  `FVER` ordering, a full thirteen-class FORM with deliberately
+  scrambled on-wire layout, multi-instance multiplicities for
+  `ANNO` / `APPL` / `MIDI` / `SAXL`, and the
+  `highest_precedence_class` switch from `Common` to
+  `FormatVersion` when `FVER` is present.
+  Doc reference: `docs/audio/aiff/aiff-c.txt` §14 ("Chunk
+  Precedence"), lines 1209–1259 of the staged spec text.
+
 - **ILBM `SPRT` (sprite-precedence) chunk surfacing.** `parse_ilbm`
   now lifts the `SPRT` property (ILBM supplement §2.7) into a
   structured [`ilbm::Sprt`] (single `UWORD precedence`) and

@@ -124,6 +124,18 @@
 //! `data` verbatim rather than interpreting it against any specific
 //! algorithm; [`Saxel::resolve_marker`] joins the saxel's id against
 //! a [`MarkerChunk`] for callers that want the §6.0 lookup.
+//!
+//! The §14 chunk-precedence rules are exposed through the
+//! [`ChunkClass`] enum (a precedence-ranked enumeration of every
+//! §3.1, §4..§13 chunk class) and the [`Form::precedence_order`] /
+//! [`Form::highest_precedence_class`] helpers. §14 ¶ "Information
+//! in the Common Chunk always takes precedence over conflicting
+//! information in any other chunk" maps to
+//! `ChunkClass::Common.higher_precedence_than(other)`; the §14
+//! worked example "the loop points in the Instrument Chunk take
+//! precedence over conflicting loop points found in the MIDI Data
+//! Chunk" maps to
+//! `ChunkClass::Instrument.higher_precedence_than(ChunkClass::MidiData)`.
 
 pub mod aesd;
 pub mod appl;
@@ -137,6 +149,7 @@ pub mod instrument;
 pub mod marker;
 pub mod midi;
 pub mod pcm;
+pub mod precedence;
 pub mod saxel;
 pub mod text;
 
@@ -159,6 +172,7 @@ pub use instrument::{
 pub use marker::{parse_marker_chunk, write_marker_chunk, Marker, MarkerChunk};
 pub use midi::{parse_midi_chunk, write_midi_chunk, MidiDataChunk};
 pub use pcm::{decode_pcm, is_pcm_compression, PcmSamples};
+pub use precedence::ChunkClass;
 pub use saxel::{parse_saxel_chunk, write_saxel_chunk, Saxel, SaxelChunk};
 pub use text::{parse_text_chunk, write_text_chunk, TextChunk, TextKind};
 
