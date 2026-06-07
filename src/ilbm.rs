@@ -510,6 +510,60 @@ impl Sham {
         }
         out
     }
+
+    /// True when no per-scanline palette entries are present (e.g. the
+    /// chunk decoded but every row would just re-use `CMAP`). Useful
+    /// for callers wanting to skip the SHAM render fast-path.
+    pub fn is_empty(&self) -> bool {
+        self.palettes.is_empty()
+    }
+
+    /// Number of scanlines covered by an explicit SHAM palette. May be
+    /// less than the image height when the chunk was short — the
+    /// parser pads in that case but a caller that wants the "explicit
+    /// stride" can compare against this.
+    pub fn rows(&self) -> usize {
+        self.palettes.len()
+    }
+
+    /// Borrow the SHAM palette for scanline `y` without allocating.
+    /// Returns `None` when `y` is past the last stored palette (which
+    /// only happens for callers that bypassed [`Sham::parse`]'s
+    /// `expected_height` padding — the parsed-from-bytes path always
+    /// has a palette per row in `0..expected_height`).
+    pub fn row_palette(&self, y: u32) -> Option<&[[u8; 3]]> {
+        self.palettes.get(y as usize).map(|v| v.as_slice())
+    }
+
+    /// Resolve the effective 16-entry palette to use when expanding
+    /// HAM6 op-`0b00` lookups on scanline `y`.
+    ///
+    /// When a SHAM palette exists for `y` the SHAM palette is returned
+    /// verbatim (16 RGB entries, RGB444 widened to 8-bit by the
+    /// parser). When SHAM is short — fewer parsed rows than the
+    /// requested `y` — the caller-supplied `base` palette is returned
+    /// truncated/padded to 16 entries with `[0, 0, 0]` as fallback.
+    ///
+    /// Mirrors [`Pchg::palette_at_line`] in shape: per-row palette
+    /// resolution returning an owned 16-entry CMAP that can be fed
+    /// directly into [`expand_ham_row`]. The `base` fallback exists
+    /// for parity with that helper; callers that want the raw
+    /// "explicit-only or nothing" view should use [`Sham::row_palette`]
+    /// instead.
+    ///
+    /// [`expand_ham_row`]: crate::ilbm::expand_ham_row
+    pub fn palette_at_line(&self, base: &[[u8; 3]], y: u32) -> Vec<[u8; 3]> {
+        match self.palettes.get(y as usize) {
+            Some(pal) => pal.clone(),
+            None => {
+                let mut out: Vec<[u8; 3]> = base.iter().take(16).copied().collect();
+                while out.len() < 16 {
+                    out.push([0, 0, 0]);
+                }
+                out
+            }
+        }
+    }
 }
 
 // ───────────────────── PCHG (Palette CHanGe) ─────────────────────

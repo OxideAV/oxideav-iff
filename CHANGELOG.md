@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ILBM `Sham` typed row-palette accessors.** The Sliced-HAM
+  per-scanline palette descriptor now exposes typed accessors that
+  match the [`Pchg::palette_at_line`] shape: [`Sham::row_palette(y)`]
+  borrows the 16-entry RGB888 palette for scanline `y` without
+  allocating (returning `None` past the parsed-row count, so callers
+  can spot the explicit-vs-padded boundary on hand-built `Sham`
+  values), [`Sham::palette_at_line(base, y)`] returns an owned
+  16-entry palette mirroring the `Pchg` accessor's shape (SHAM row
+  verbatim when present; `base` truncated/padded to 16 entries
+  otherwise — the fallback always emits a 16-entry CMAP suitable for
+  feeding directly into [`expand_ham_row`]), and
+  [`Sham::is_empty`] / [`Sham::rows`] surface the
+  "any explicit rows?" / "how many?" predicates without forcing
+  callers to reach into the `palettes` field. Three new tests in
+  `tests/ilbm_round2.rs` exercise the explicit-row path, the
+  past-end fallback path (both full-length and short `base`
+  palettes — the helper pads with `[0, 0, 0]` when `base` has fewer
+  than 16 entries), the empty-chunk path, and the parser's
+  short-chunk row-padding behaviour as observed through the typed
+  accessors. No behaviour change for existing call sites; the
+  helpers are pure additions and `Sham::palettes` remains
+  publicly readable.
+
 - **`cargo-fuzz` harness with three libFuzzer targets.** New `fuzz/`
   subdirectory wires the standard `cargo-fuzz` layout into the crate
   with three targets covering the highest-risk parser surfaces:

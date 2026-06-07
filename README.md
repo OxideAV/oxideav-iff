@@ -9,8 +9,10 @@ crate ships:
   24-bit literal-RGB true-colour**, ByteRun1 / Auto compression,
   EHB, HAM6, HAM8, HasMask, transparent-colour keying, GRAB hotspot,
   DEST destination-merge (depth / planePick / planeOnOff / planeMask),
-  SPRT sprite-precedence flag, SHAM per-line palette, PCHG
-  small-format palette change list,
+  SPRT sprite-precedence flag, SHAM per-line palette **with typed
+  row-palette accessors (`row_palette` / `palette_at_line` /
+  `is_empty` / `rows`) mirroring the `Pchg::palette_at_line`
+  shape**, PCHG small-format palette change list,
   CRNG / CCRT / DRNG colour-cycling descriptors).
 - **FORM/PBM** — read+round-trip (DPaint II / Brilliance chunky sibling).
 - **FORM/ANIM** — op-0 literal + op-5 byte-vertical delta

@@ -217,6 +217,104 @@ fn sham_per_line_palette_overrides_cmap() {
     assert_eq!(&dec.rgba[4 * 4..4 * 4 + 4], &[0, 0xFF, 0, 0xFF]);
 }
 
+#[test]
+fn sham_typed_accessors_walk_explicit_rows_and_fallback() {
+    // Build a SHAM with two explicit row palettes. The first row's
+    // index-1 is red, the second row's index-1 is green; index-0 of
+    // both rows is black.
+    let mut pal_row0: Vec<[u8; 3]> = vec![[0; 3]; 16];
+    pal_row0[1] = [0xF0, 0, 0]; // RGB444 nibble pattern post-widen
+    let mut pal_row1: Vec<[u8; 3]> = vec![[0; 3]; 16];
+    pal_row1[1] = [0, 0xF0, 0];
+    let sham = Sham {
+        version: 0,
+        palettes: vec![pal_row0.clone(), pal_row1.clone()],
+    };
+
+    // rows() / is_empty() / row_palette()
+    assert!(!sham.is_empty(), "SHAM with 2 rows is non-empty");
+    assert_eq!(sham.rows(), 2);
+    assert_eq!(sham.row_palette(0), Some(pal_row0.as_slice()));
+    assert_eq!(sham.row_palette(1), Some(pal_row1.as_slice()));
+    assert_eq!(sham.row_palette(2), None, "past end is None");
+
+    // palette_at_line() picks the per-row palette verbatim when y is
+    // in-range.
+    let base: Vec<[u8; 3]> = vec![[0x80, 0x80, 0x80]; 16];
+    let at0 = sham.palette_at_line(&base, 0);
+    assert_eq!(at0, pal_row0, "row 0 returns SHAM row 0");
+    let at1 = sham.palette_at_line(&base, 1);
+    assert_eq!(at1, pal_row1, "row 1 returns SHAM row 1");
+
+    // palette_at_line() past the last stored row falls back to base,
+    // truncated/padded to 16 entries.
+    let at_past = sham.palette_at_line(&base, 99);
+    assert_eq!(at_past.len(), 16, "fallback is always 16 entries");
+    assert_eq!(at_past[0], [0x80, 0x80, 0x80], "first base entry kept");
+    let short_base: Vec<[u8; 3]> = vec![[0x11, 0x22, 0x33]; 4];
+    let at_past_short = sham.palette_at_line(&short_base, 99);
+    assert_eq!(at_past_short.len(), 16, "padded up to 16 entries");
+    assert_eq!(at_past_short[0], [0x11, 0x22, 0x33]);
+    assert_eq!(at_past_short[3], [0x11, 0x22, 0x33]);
+    assert_eq!(at_past_short[4], [0, 0, 0], "padding is black");
+    assert_eq!(at_past_short[15], [0, 0, 0]);
+}
+
+#[test]
+fn sham_empty_chunk_reports_zero_rows() {
+    // A SHAM that decoded the version word but stored no palettes —
+    // e.g. an `expected_height == 0` parse path or a hand-built
+    // empty descriptor. rows() / is_empty() / row_palette() must all
+    // agree.
+    let sham = Sham {
+        version: 0,
+        palettes: Vec::new(),
+    };
+    assert!(sham.is_empty());
+    assert_eq!(sham.rows(), 0);
+    assert!(sham.row_palette(0).is_none());
+    let base: Vec<[u8; 3]> = vec![[1, 2, 3]; 16];
+    let fallback = sham.palette_at_line(&base, 0);
+    assert_eq!(fallback, base, "empty SHAM uses base for any y");
+}
+
+#[test]
+fn sham_parse_pads_short_chunks_and_accessors_see_padded_rows() {
+    // The parser pads missing rows by repeating the prior palette;
+    // verify the typed accessors observe the padded view (so callers
+    // don't need to re-implement the padding rule).
+    // Build a 4-byte body: version=0 then ONE explicit 32-byte palette
+    // whose only non-zero entry is RGB444 (red) at index 1.
+    let mut body: Vec<u8> = Vec::with_capacity(2 + 32);
+    body.extend_from_slice(&0u16.to_be_bytes());
+    for i in 0..16u8 {
+        if i == 1 {
+            // index-1: 0x0F00 → r=0xF, g=0, b=0
+            body.push(0x0F);
+            body.push(0x00);
+        } else {
+            body.push(0x00);
+            body.push(0x00);
+        }
+    }
+    let sham = Sham::parse(&body, 3).expect("SHAM parse with padded tail");
+    // rows() reports the padded length, not the explicit byte count.
+    assert_eq!(sham.rows(), 3);
+    // The parser widens 0xF→0xFF.
+    let red = [0xFF, 0, 0];
+    assert_eq!(sham.row_palette(0).unwrap()[1], red, "explicit row 0");
+    assert_eq!(
+        sham.row_palette(1).unwrap()[1],
+        red,
+        "row 1 padded by repeating row 0"
+    );
+    assert_eq!(
+        sham.row_palette(2).unwrap()[1],
+        red,
+        "row 2 padded by repeating row 0"
+    );
+}
+
 // ───────────────────── PCHG ─────────────────────
 
 #[test]
