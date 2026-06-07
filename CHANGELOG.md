@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ILBM `PCHG` typed-header surface.** The PCHG (Palette CHanGe)
+  chunk now exposes its 20-byte fixed-layout header via a typed
+  [`Pchg::header`] accessor returning an `Option<PchgHeader>`
+  carrying every field the parser reads off the wire:
+  [`PchgHeader::compression`], [`PchgHeader::flags`],
+  [`PchgHeader::start_line`], [`PchgHeader::line_count`],
+  [`PchgHeader::changed_lines`], [`PchgHeader::min_reg`],
+  [`PchgHeader::max_reg`], [`PchgHeader::max_changes`], and
+  [`PchgHeader::total_changes`]. A companion [`PchgKind`]
+  (`Small` / `Big`) enum decodes the change-record encoding
+  selector out of the `flags` word; [`Pchg::kind`] is the
+  convenience accessor (zero-flag bodies report `Small` per the
+  annex's documented default), and [`PchgHeader::is_compressed`]
+  flags the `Compression == 1` (Huffman-compressed-records)
+  variant — that wire shape still isn't decoded into per-line
+  changes, but it now surfaces through the typed header for
+  callers needing to fall back to [`Pchg::raw`]. The new
+  [`Pchg::derive_header_hints`] re-derives the four annex hint
+  fields (`changed_lines`, `min_reg`, `max_reg`, `max_changes`,
+  `total_changes`) directly from the decoded [`Pchg::lines`],
+  matching the annex's canonical semantics including the
+  "empty-PCHG ⇒ MinReg == MaxReg == 0" rule, and
+  [`Pchg::header_matches_payload`] gates the on-wire header
+  against the canonical re-derivation so editors can flag hint
+  drift after modifying the change list before re-encoding.
+  Fifteen new tests in `tests/ilbm_pchg_header.rs` cover the
+  Small + Big header round-trips, both payloads decoded through
+  the typed accessor, the four-field re-derivation against
+  Small/Big/empty PCHGs, the consistency check on both
+  round-trip and deliberately stale-hint inputs (incorrect
+  `TotalChanges` / `MinReg`), the zero-flag default-to-Small
+  rule, the `is_compressed` flag on a synthetic
+  `Compression == 1` body, and the short-`raw` "header is
+  `None`" path for hand-crafted `Pchg` values. No behaviour
+  change for existing call sites; the helpers are pure
+  additions on top of the existing parser. Doc reference:
+  header-layout comment in `src/ilbm.rs` PCHG section (the
+  annex layout was already documented inline in the parser;
+  this round only surfaces the fields the parser already reads).
+
 - **ILBM `Sham` typed row-palette accessors.** The Sliced-HAM
   per-scanline palette descriptor now exposes typed accessors that
   match the [`Pchg::palette_at_line`] shape: [`Sham::row_palette(y)`]

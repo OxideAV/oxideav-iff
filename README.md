@@ -12,8 +12,15 @@ crate ships:
   SPRT sprite-precedence flag, SHAM per-line palette **with typed
   row-palette accessors (`row_palette` / `palette_at_line` /
   `is_empty` / `rows`) mirroring the `Pchg::palette_at_line`
-  shape**, PCHG small-format palette change list,
-  CRNG / CCRT / DRNG colour-cycling descriptors).
+  shape**, PCHG Small + Big palette-change list **with a typed
+  `PchgHeader` accessor surfacing every 20-byte header field
+  (`compression` / `flags` / `start_line` / `line_count` /
+  `changed_lines` / `min_reg` / `max_reg` / `max_changes` /
+  `total_changes`), a `PchgKind` (Small / Big) enum derived from
+  the flag word, and a `derive_header_hints` re-derivation helper
+  + `header_matches_payload` consistency check for callers
+  validating or re-deriving the header hints after editing the
+  change list**, CRNG / CCRT / DRNG colour-cycling descriptors).
 - **FORM/PBM** — read+round-trip (DPaint II / Brilliance chunky sibling).
 - **FORM/ANIM** — op-0 literal + op-5 byte-vertical delta
   (encode+decode) + op-7 Short/Long Vertical Delta

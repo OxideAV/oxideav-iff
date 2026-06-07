@@ -583,6 +583,113 @@ pub struct PchgLine {
     pub changes: Vec<PchgChange>,
 }
 
+/// Which of the two PCHG change-record encodings a chunk uses, decoded
+/// from the 16-bit `Flags` field in the PCHG header.
+///
+/// Per the PCHG IFF Annex header layout, two flag bits select the
+/// per-change record encoding:
+///
+/// * Flag bit `1` (`0x0001`) — `SmallLineChanges`: 12-bit channel
+///   palette; each change record is `(u8 RegisterIndex, u16
+///   RGB444 big-endian)` for a 3-byte payload.
+/// * Flag bit `2` (`0x0002`) — `BigLineChanges`: 24-bit channel
+///   palette; each change record is `(u16 RegisterIndex, u8 R, u8 G,
+///   u8 B)` for a 5-byte payload, with a 2-byte `u16` ChangeCount
+///   instead of the Small format's 1-byte count.
+///
+/// The two bits are mutually exclusive — both being set is a malformed
+/// PCHG and rejected by [`Pchg::parse`]. When neither bit is set the
+/// annex defines the encoding to default to Small; we report that as
+/// [`PchgKind::Small`] so callers can rely on a non-`Option` accessor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PchgKind {
+    /// 12-bit channel encoding — 1-byte RegisterIndex + 2-byte RGB444
+    /// per change, 1-byte ChangeCount per line.
+    Small,
+    /// 24-bit channel encoding — 2-byte RegisterIndex + 3-byte RGB888
+    /// per change, 2-byte ChangeCount per line.
+    Big,
+}
+
+/// Decoded PCHG header — the 20-byte fixed-layout prefix in front of
+/// every PCHG chunk's change records.
+///
+/// All fields are surfaced verbatim as parsed off the wire. Together
+/// they describe the change-record encoding ([`Self::kind`]), the
+/// scanline range the chunk covers (`start_line` / `line_count`), and
+/// the four header hints the annex defines as upper-bound summaries of
+/// the change records that follow (`changed_lines` / `min_reg` /
+/// `max_reg` / `max_changes` / `total_changes`).
+///
+/// The header hints aren't load-bearing for decode — [`Pchg::parse`] is
+/// permissive about mismatches because historical PCHG-generating tools
+/// have been inconsistent about them — but they're useful to callers
+/// authoring PCHG-aware editors that want to validate or re-derive the
+/// hints after editing the per-line change list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PchgHeader {
+    /// `Compression` (u16) — `0` = uncompressed change records (the
+    /// only mode [`Pchg::parse`] actually decodes), `1` = the
+    /// annex-defined Huffman-compressed mode (not yet decoded; the
+    /// raw bytes still round-trip via [`Pchg::raw`]).
+    pub compression: u16,
+    /// `Flags` (u16) — the raw 16-bit flag word. Bit 0 selects Small,
+    /// bit 1 selects Big; higher bits are reserved. [`Self::kind`]
+    /// returns the [`PchgKind`] derived from this field.
+    pub flags: u16,
+    /// `StartLine` (i16) — first scanline (zero-based, may be
+    /// negative to address a row above the ILBM origin) covered by
+    /// the change records.
+    pub start_line: i16,
+    /// `LineCount` (u16) — total number of scanlines the change
+    /// records cover, starting at `start_line`. Lines with zero
+    /// changes contribute an empty per-line record but still count.
+    pub line_count: u16,
+    /// `ChangedLines` (u16) — number of scanlines in `LineCount`
+    /// whose per-line record carries at least one change (i.e. lines
+    /// with ChangeCount > 0). An optimisation hint.
+    pub changed_lines: u16,
+    /// `MinReg` (u16) — smallest palette register index touched by
+    /// any change record in the chunk.
+    pub min_reg: u16,
+    /// `MaxReg` (u16) — largest palette register index touched by
+    /// any change record in the chunk.
+    pub max_reg: u16,
+    /// `MaxChanges` (u16) — highest per-line `ChangeCount` seen in
+    /// the chunk.
+    pub max_changes: u16,
+    /// `TotalChanges` (u32) — sum of every per-line `ChangeCount`
+    /// across every covered scanline.
+    pub total_changes: u32,
+}
+
+impl PchgHeader {
+    /// Decode the [`PchgKind`] from [`Self::flags`].
+    ///
+    /// Returns `Big` when flag bit 1 is set, otherwise `Small` (the
+    /// annex's documented default when no flag bits are set, and the
+    /// only valid choice when bit 0 is set). [`Pchg::parse`] rejects
+    /// the both-bits-set case before this struct is constructed, so
+    /// the choice here is unambiguous on any header produced by the
+    /// parser.
+    pub fn kind(&self) -> PchgKind {
+        if self.flags & 2 != 0 {
+            PchgKind::Big
+        } else {
+            PchgKind::Small
+        }
+    }
+
+    /// True when `Compression == 1`, the annex-defined Huffman-
+    /// compressed change-record encoding. [`Pchg::parse`] does not
+    /// decode that variant yet; callers detecting this should fall
+    /// back to the raw bytes via [`Pchg::raw`] if they need the
+    /// original payload.
+    pub fn is_compressed(&self) -> bool {
+        self.compression == 1
+    }
+}
+
 /// `PCHG` — Palette CHanGe list (Sebastiano Vigna). Per-scanline CMAP
 /// overrides; supports two formats encoded in a 12-bit "small/big"
 /// flag:
@@ -752,6 +859,120 @@ impl Pchg {
             }
         }
         cur
+    }
+
+    /// Decode the 20-byte PCHG header from [`Self::raw`] into a typed
+    /// [`PchgHeader`].
+    ///
+    /// Returns `None` when `raw` is shorter than 20 bytes — that can
+    /// only happen for `Pchg` values built by hand (e.g. in tests)
+    /// since [`Pchg::parse`] rejects short bodies before construction.
+    /// On any `Pchg` produced by the parser this always returns
+    /// `Some`.
+    pub fn header(&self) -> Option<PchgHeader> {
+        if self.raw.len() < 20 {
+            return None;
+        }
+        let r = &self.raw;
+        Some(PchgHeader {
+            compression: u16::from_be_bytes([r[0], r[1]]),
+            flags: u16::from_be_bytes([r[2], r[3]]),
+            start_line: i16::from_be_bytes([r[4], r[5]]),
+            line_count: u16::from_be_bytes([r[6], r[7]]),
+            changed_lines: u16::from_be_bytes([r[8], r[9]]),
+            min_reg: u16::from_be_bytes([r[10], r[11]]),
+            max_reg: u16::from_be_bytes([r[12], r[13]]),
+            max_changes: u16::from_be_bytes([r[14], r[15]]),
+            total_changes: u32::from_be_bytes([r[16], r[17], r[18], r[19]]),
+        })
+    }
+
+    /// Convenience: [`PchgHeader::kind`] for the underlying header,
+    /// or `None` when the raw buffer is too short for a header. On
+    /// any parser-produced `Pchg` this always returns `Some`.
+    pub fn kind(&self) -> Option<PchgKind> {
+        self.header().map(|h| h.kind())
+    }
+
+    /// Compute the four PCHG header-hint fields (`ChangedLines`,
+    /// `MinReg`, `MaxReg`, `MaxChanges`, `TotalChanges`) directly
+    /// from [`Self::lines`].
+    ///
+    /// The annex defines these as upper-bound summaries an encoder
+    /// fills in for downstream readers. This helper computes the
+    /// canonical values from the decoded change records so callers
+    /// can either validate a parsed header against the records that
+    /// follow it ([`Self::header_matches_payload`]) or re-derive the
+    /// hints after editing the change list before re-encoding.
+    ///
+    /// Returns the tuple
+    /// `(changed_lines, min_reg, max_reg, max_changes, total_changes)`
+    /// with `min_reg` / `max_reg` set to `0` when no changes are
+    /// present (matching the annex's treatment of empty PCHGs as
+    /// `MinReg == MaxReg == 0`).
+    pub fn derive_header_hints(&self) -> (u16, u16, u16, u16, u32) {
+        let mut changed_lines: u16 = 0;
+        let mut min_reg: u16 = u16::MAX;
+        let mut max_reg: u16 = 0;
+        let mut max_changes: u16 = 0;
+        let mut total_changes: u32 = 0;
+        for line in &self.lines {
+            if line.changes.is_empty() {
+                continue;
+            }
+            changed_lines = changed_lines.saturating_add(1);
+            let cc = line.changes.len() as u32;
+            total_changes = total_changes.saturating_add(cc);
+            let cc16 = u16::try_from(cc).unwrap_or(u16::MAX);
+            if cc16 > max_changes {
+                max_changes = cc16;
+            }
+            for ch in &line.changes {
+                if ch.index < min_reg {
+                    min_reg = ch.index;
+                }
+                if ch.index > max_reg {
+                    max_reg = ch.index;
+                }
+            }
+        }
+        if changed_lines == 0 {
+            min_reg = 0;
+            max_reg = 0;
+        }
+        (changed_lines, min_reg, max_reg, max_changes, total_changes)
+    }
+
+    /// True when every header hint in [`Self::header`] agrees with
+    /// the corresponding canonical value derived from
+    /// [`Self::lines`].
+    ///
+    /// Specifically:
+    ///
+    /// * `changed_lines` matches the number of lines with a non-empty
+    ///   change list.
+    /// * `min_reg` / `max_reg` bracket every change record's
+    ///   `RegisterIndex` (when no changes are present, both must be
+    ///   `0`).
+    /// * `max_changes` matches the longest per-line change list.
+    /// * `total_changes` matches the sum of every per-line change
+    ///   count.
+    ///
+    /// Returns `false` when the header is absent (raw too short to
+    /// decode) or when any hint disagrees. Mirrors the validation
+    /// surface other AIFF/ILBM chunks expose (e.g. `MarkerChunk`'s
+    /// `id`-uniqueness check) so editors can flag hint drift after
+    /// modifying the change list.
+    pub fn header_matches_payload(&self) -> bool {
+        let Some(h) = self.header() else {
+            return false;
+        };
+        let (cl, lo, hi, mc, tc) = self.derive_header_hints();
+        h.changed_lines == cl
+            && h.min_reg == lo
+            && h.max_reg == hi
+            && h.max_changes == mc
+            && h.total_changes == tc
     }
 }
 
