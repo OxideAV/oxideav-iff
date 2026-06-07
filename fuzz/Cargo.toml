@@ -1,0 +1,65 @@
+[package]
+name = "oxideav-iff-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Three libFuzzer targets cover the highest-risk parser surface of
+# the crate:
+#
+#  * `aiff_decode` — feeds arbitrary bytes to `AiffDemuxer::from_bytes`,
+#                    which walks the entire FORM AIFF / AIFC chunk tree
+#                    (FORM header + COMM + SSND + optional MARK / INST /
+#                    COMT / AESD / APPL / MIDI / SAXL / NAME / AUTH /
+#                    (c)  / ANNO chunks). The decoder must return a
+#                    `Result` and never panic / abort / OOM — the
+#                    classic overflow spots are the 32-bit chunk size
+#                    field, the 80-bit IEEE-extended sample-rate
+#                    decode, and the per-chunk pad-byte arithmetic.
+#  * `anim_decode` — feeds arbitrary bytes to `parse_anim`, the
+#                    FORM ANIM walker that loads a first FORM ILBM
+#                    frame and applies subsequent ANHD + DLTA delta
+#                    frames (operation 0 literal, 5 byte-vertical-RLC,
+#                    and 7 short / long vertical delta). Covers the
+#                    chunk walker plus three distinct delta decoders.
+#  * `pchg_parse`  — feeds arbitrary bytes to `ilbm::Pchg::parse`, the
+#                    PCHG palette-change-per-line decoder from the
+#                    Vigna 1994 IFF Annex. PCHG carries an optional
+#                    ByteRun1 / SmallLineChanges compression mode plus
+#                    per-line mask/change run-length tables — the most
+#                    failure-mode-dense single chunk class the crate
+#                    parses.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-iff]
+path = ".."
+
+# Prevent this from interfering with the umbrella workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "aiff_decode"
+path = "fuzz_targets/aiff_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "anim_decode"
+path = "fuzz_targets/anim_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pchg_parse"
+path = "fuzz_targets/pchg_parse.rs"
+test = false
+doc = false

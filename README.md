@@ -600,6 +600,56 @@ ranked enum and the [`aiff::Form::precedence_order`] /
 "AIFF-C §14 chunk precedence" section above for the ranked
 table and the §14 worked example mapping.
 
+## Fuzzing
+
+A [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harness
+lives in [`fuzz/`](fuzz/) with three libFuzzer targets covering the
+highest-risk parser surface of the crate:
+
+* `aiff_decode` — feeds arbitrary bytes to
+  `aiff::demuxer::AiffDemuxer::from_bytes`, the top-of-stack entry
+  point that walks the entire Apple FORM AIFF / FORM AIFC chunk
+  tree (FORM header + COMM common + SSND sound data + optional
+  MARK / INST / COMT / AESD / APPL / MIDI / SAXL / NAME / AUTH /
+  `(c) ` / ANNO metadata). The classic overflow spots are the
+  32-bit chunk-size field, the 80-bit IEEE-extended sample-rate
+  decode, and the per-chunk pad-byte arithmetic — this target
+  keeps them honest.
+* `anim_decode` — feeds arbitrary bytes to `anim::parse_anim`, the
+  FORM ANIM walker that loads a first FORM ILBM frame and then
+  applies subsequent ANHD + DLTA delta frames using one of three
+  vertical-delta operations (op-0 literal, op-5 byte-vertical-RLC,
+  op-7 short / long vertical delta). Each delta decoder has its
+  own per-frame BODY/DLTA size arithmetic and its own
+  failure-mode surface.
+* `pchg_parse` — feeds arbitrary bytes to `ilbm::Pchg::parse`, the
+  PCHG (Palette CHanGes per scan-line) chunk decoder from the
+  Vigna 1994 IFF Annex. PCHG is the most failure-mode-dense
+  single chunk class the crate parses: a 20-byte tabular header,
+  an optional ByteRun1 / SmallLineChanges compression mode, a
+  per-line change mask, and small-or-big change-record variants
+  that drive cumulative-state palette reconstruction.
+
+The contract under test for every target is purely that the call
+*returns*: a malformed input yields `Err(oxideav_core::Error::…)`,
+a well-formed one yields `Ok(_)`, and neither path may panic,
+integer-overflow (in a debug build), index out of bounds, or
+allocate an attacker-controlled buffer larger than the input
+actually supports.
+
+To run a target:
+
+```sh
+cargo install cargo-fuzz
+cd crates/oxideav-iff
+cargo +nightly fuzz run aiff_decode
+# or anim_decode / pchg_parse
+```
+
+The harness builds under nightly Rust (libFuzzer needs nightly's
+`-Z` flags); see the `cargo-fuzz` book for corpus management,
+artifact triage, and coverage-guided minimisation.
+
 ## License
 
 MIT - see [LICENSE](LICENSE).

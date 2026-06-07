@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`cargo-fuzz` harness with three libFuzzer targets.** New `fuzz/`
+  subdirectory wires the standard `cargo-fuzz` layout into the crate
+  with three targets covering the highest-risk parser surfaces:
+  `aiff_decode` (the top-of-stack
+  `aiff::demuxer::AiffDemuxer::from_bytes` FORM AIFF / AIFC walker),
+  `anim_decode` (the `anim::parse_anim` FORM ANIM walker with its
+  op-0 / op-5 / op-7 delta decoders), and `pchg_parse` (the
+  failure-mode-dense `ilbm::Pchg::parse` PCHG palette-change-per-line
+  chunk decoder). The contract under fuzz is purely that each call
+  returns a `Result` and never panics / aborts / OOMs, regardless of
+  how malformed the input is. Run with
+  `cargo +nightly fuzz run <target>` from the crate root; see the
+  README "Fuzzing" section for the full target catalogue and the
+  failure-mode notes each target was authored to keep honest.
+
 - **AIFF-C §14 chunk-precedence surface.** A new `aiff::ChunkClass`
   enum ranks the §3.1 / §4..§13 chunk classes per the §14 ordering
   ("Highest precedence Common Chunk … Lowest precedence Application
