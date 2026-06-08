@@ -85,6 +85,16 @@ crate ships:
   recognised in the parser but routed through sibling codec crates
   rather than decoded here.
 
+Shared chunk primitives (`chunk` module): `ChunkHeader` +
+`read_chunk_header` (8-byte header + clean-EOF convention),
+`GroupKind` + `TopLevelGroup` + `probe_top_level_group` /
+`read_top_level_group` (front-half magic check that decodes the
+single top-level `FORM` / `LIST` / `CAT ` envelope every IFF file
+opens with, surfacing the inner `FormType` / `ContentsType` 4CC and
+the declared envelope length without committing to any specific
+form-type), `read_body` / `skip_chunk_body` / `skip_pad` (pad-byte
+aware body walkers).
+
 Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)

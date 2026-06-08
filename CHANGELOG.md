@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Top-level group probe primitive** ([`chunk::probe_top_level_group`]
+  + [`chunk::read_top_level_group`]). EA IFF 85 §6 restricts a
+  conforming file to a single `FORM`/`LIST`/`CAT ` group at offset 0
+  whose first 12 bytes encode `kind` + `ckSize` + the 4-byte inner
+  type ID (`FormType` for FORM/PROP, `ContentsType` for LIST/CAT).
+  Today the four forms this crate handles (`8SVX` / `ILBM` / `ANIM` /
+  `AIFF`/`AIFC`) each open with a near-identical hand-rolled magic
+  check (`&buf[0..4] == b"FORM" && &buf[8..12] == b"<type>"`); the
+  new primitive lifts that into one tested entry point that returns a
+  typed [`chunk::TopLevelGroup`] (with [`chunk::GroupKind`] +
+  `inner_type` 4CC + `size` + [`TopLevelGroup::declared_total_len`])
+  and surfaces "starts with a non-group FourCC" as
+  `Error::invalid("IFF: not a top-level group chunk (got XXXX)")`
+  so callers can fall through cleanly to a non-IFF container probe.
+  Cross-form regression coverage lives in
+  `tests/top_level_group_probe.rs` (5 envelope checks, one per
+  shipped form plus a `Cursor` round-trip).
 - **ILBM `PCHG` typed-header surface.** The PCHG (Palette CHanGe)
   chunk now exposes its 20-byte fixed-layout header via a typed
   [`Pchg::header`] accessor returning an `Option<PchgHeader>`
