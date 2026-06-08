@@ -93,7 +93,12 @@ single top-level `FORM` / `LIST` / `CAT ` envelope every IFF file
 opens with, surfacing the inner `FormType` / `ContentsType` 4CC and
 the declared envelope length without committing to any specific
 form-type), `read_body` / `skip_chunk_body` / `skip_pad` (pad-byte
-aware body walkers).
+aware body walkers), `ReservedId` + `ReservedId::classify` /
+`ChunkHeader::reserved` / `ChunkHeader::is_filler` (EA IFF 85 §3
+universally-reserved ckID classifier covering `FORM` / `LIST` /
+`CAT ` / `PROP` / four-space FILLER + the 27 reserved-future-version
+IDs `LIS1..9` / `FOR1..9` / `CAT1..9`), and the matching
+`FILLER_ID` / `PROP_ID` constants.
 
 Zero C dependencies.
 
