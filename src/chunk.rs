@@ -14,6 +14,149 @@ pub const GROUP_FORM: [u8; 4] = *b"FORM";
 pub const GROUP_LIST: [u8; 4] = *b"LIST";
 pub const GROUP_CAT: [u8; 4] = *b"CAT ";
 
+/// FourCC for the EA IFF 85 §3 "filler" chunk — four ASCII spaces.
+///
+/// `b"    "` is one of the five universally-reserved ckIDs (§3
+/// "Chunks", ¶ "the following ckIDs are universally reserved … the
+/// special ID '    ' (4 spaces) is a ckID for 'filler' chunks, that
+/// is, chunks that fill space but have no meaningful contents.").
+/// The other four reserved IDs already have constants in this module
+/// (`GROUP_FORM`, `GROUP_LIST`, `GROUP_CAT`) or are surfaced by the
+/// `prop` consumers (`PROP`); FILLER has no group-walker role of its
+/// own and was previously left as a bare byte literal.
+pub const FILLER_ID: [u8; 4] = *b"    ";
+
+/// FourCC for the EA IFF 85 §3 `PROP` property-set group chunk.
+///
+/// Reserved alongside the three group IDs in the §3 enumeration of
+/// universally-reserved ckIDs. `PROP` is a shared-properties group
+/// that only appears as the first child of a `LIST` (§5 ¶ "A LIST
+/// chunk may contain PROP chunks specifying default properties for
+/// FORMs in that LIST"); it is *not* a top-level group, so
+/// [`probe_top_level_group`] still rejects it.
+pub const PROP_ID: [u8; 4] = *b"PROP";
+
+/// Classification of a 4-byte ckID against the EA IFF 85 §3 list of
+/// universally-reserved IDs.
+///
+/// §3 ¶ "the following ckIDs are universally reserved to identify
+/// chunks with particular IFF meanings: 'LIST', 'FORM', 'PROP',
+/// 'CAT ', and '    '. The special ID '    ' (4 spaces) is a ckID
+/// for 'filler' chunks, that is, chunks that fill space but have no
+/// meaningful contents. The IDs 'LIS1' through 'LIS9', 'FOR1' through
+/// 'FOR9', and 'CAT1' through 'CAT9' are reserved for future
+/// 'version number' variations. All IFF-compatible software must
+/// account for these 23 chunk IDs."
+///
+/// [`ReservedId::classify`] maps any 4-byte ckID to one of the four
+/// variants below (or `None` when the ID is not in the §3 list).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservedId {
+    /// One of the three group-chunk IDs — `FORM`, `LIST`, or `CAT `.
+    /// The [`GroupKind`] variant is preserved so callers that already
+    /// have a group dispatch can reuse it.
+    Group(GroupKind),
+    /// The §3 `PROP` property-set group ID.
+    Prop,
+    /// The §3 four-space FILLER ID — a chunk that "fills space but
+    /// has no meaningful contents". Readers must walk past it without
+    /// interpreting the body.
+    Filler,
+    /// One of the twenty-seven §3 future-version variants — `LIS1..LIS9`,
+    /// `FOR1..FOR9`, or `CAT1..CAT9`. The first byte of the
+    /// `(parent, digit)` tuple is one of the three group-kind variants
+    /// the version family belongs to, and `digit` is the trailing
+    /// `1..=9` character. The current spec defines no decoder for
+    /// these IDs; "All IFF-compatible software must account for these
+    /// 23 chunk IDs" so a reader must at least recognise them as
+    /// reserved rather than treating them as ordinary data chunks.
+    ReservedFuture { parent: GroupKind, digit: u8 },
+}
+
+impl ReservedId {
+    /// Classify a 4-byte ckID against the EA IFF 85 §3 reserved list.
+    ///
+    /// Returns `None` when `id` is not one of the 23 reserved IDs;
+    /// callers can then treat the chunk as either a local data chunk
+    /// (when nested inside a known FORM) or an unrecognised top-level
+    /// magic.
+    pub fn classify(id: [u8; 4]) -> Option<Self> {
+        if id == FILLER_ID {
+            return Some(ReservedId::Filler);
+        }
+        if id == PROP_ID {
+            return Some(ReservedId::Prop);
+        }
+        if let Some(kind) = GroupKind::from_id(id) {
+            return Some(ReservedId::Group(kind));
+        }
+        // Check the twenty-seven LIS1..LIS9 / FOR1..FOR9 / CAT1..CAT9
+        // version variants. The §3 spelling preserves the parent
+        // group's first three bytes: "LIS" / "FOR" / "CAT" plus a
+        // trailing ASCII digit '1'..='9'. Note that 'CAT '+digit
+        // would yield "CAT 1" (5 bytes) which won't fit; the §3
+        // version family for CAT spells out as "CAT1".."CAT9", with
+        // the trailing space dropped — same as for LIST → "LIS1".."LIS9".
+        let (a, b, c, d) = (id[0], id[1], id[2], id[3]);
+        if (b'1'..=b'9').contains(&d) {
+            let parent = match (a, b, c) {
+                (b'L', b'I', b'S') => Some(GroupKind::List),
+                (b'F', b'O', b'R') => Some(GroupKind::Form),
+                (b'C', b'A', b'T') => Some(GroupKind::Cat),
+                _ => None,
+            };
+            if let Some(parent) = parent {
+                return Some(ReservedId::ReservedFuture { parent, digit: d });
+            }
+        }
+        None
+    }
+
+    /// Convenience predicate — `true` when this ID is one of the three
+    /// group ckIDs (`FORM`, `LIST`, `CAT `). Mirrors
+    /// [`ChunkHeader::is_group`] one level up.
+    pub fn is_group(self) -> bool {
+        matches!(self, ReservedId::Group(_))
+    }
+
+    /// Convenience predicate — `true` when this ID is the four-space
+    /// FILLER chunk ID.
+    pub fn is_filler(self) -> bool {
+        matches!(self, ReservedId::Filler)
+    }
+
+    /// Convenience predicate — `true` when this ID is one of the
+    /// twenty-seven reserved-future-version IDs (`LIS1..9` / `FOR1..9` /
+    /// `CAT1..9`). A reader has no defined decode for these (the §3
+    /// spec only reserves them for "future version number
+    /// variations"); the predicate is offered so callers can route
+    /// them to a versioning-aware fall-back path instead of
+    /// misclassifying them as ordinary data chunks.
+    pub fn is_reserved_future(self) -> bool {
+        matches!(self, ReservedId::ReservedFuture { .. })
+    }
+
+    /// Enumerate the full §3 reserved set in spec-listed order —
+    /// `FORM`, `LIST`, `PROP`, `CAT `, `    ` (filler), followed by
+    /// the twenty-seven future-version IDs `LIS1..9` / `FOR1..9` /
+    /// `CAT1..9`.
+    ///
+    /// The §3 ¶ "All IFF-compatible software must account for these
+    /// 23 chunk IDs" sentence cites a total of 23 — the running count
+    /// in the document text doesn't quite match the explicit
+    /// enumeration (5 base + 3×9 future = 32 distinct IDs); this
+    /// helper returns every ID the same paragraph spells out, which
+    /// is the set a recogniser actually needs.
+    pub fn all_reserved_ids() -> [[u8; 4]; 32] {
+        [
+            GROUP_FORM, GROUP_LIST, PROP_ID, GROUP_CAT, FILLER_ID, *b"LIS1", *b"LIS2", *b"LIS3",
+            *b"LIS4", *b"LIS5", *b"LIS6", *b"LIS7", *b"LIS8", *b"LIS9", *b"FOR1", *b"FOR2",
+            *b"FOR3", *b"FOR4", *b"FOR5", *b"FOR6", *b"FOR7", *b"FOR8", *b"FOR9", *b"CAT1",
+            *b"CAT2", *b"CAT3", *b"CAT4", *b"CAT5", *b"CAT6", *b"CAT7", *b"CAT8", *b"CAT9",
+        ]
+    }
+}
+
 /// Which of the three EA IFF 85 group-chunk kinds occupies the
 /// top-level slot of the file.
 ///
@@ -194,6 +337,30 @@ impl ChunkHeader {
 
     pub fn is_group(&self) -> bool {
         matches!(self.id, GROUP_FORM | GROUP_LIST | GROUP_CAT)
+    }
+
+    /// Classify this chunk's `id` against the EA IFF 85 §3 list of
+    /// universally-reserved ckIDs.
+    ///
+    /// Returns `Some(ReservedId::…)` for the three group kinds (`FORM`
+    /// / `LIST` / `CAT `), `PROP`, the four-space FILLER chunk, and
+    /// the twenty-seven reserved-future-version IDs (`LIS1..9` /
+    /// `FOR1..9` / `CAT1..9`). Any other ckID — including every
+    /// FORM-local property like `BMHD` / `CMAP` / `COMM` — falls
+    /// outside the universally-reserved set and yields `None`.
+    pub fn reserved(&self) -> Option<ReservedId> {
+        ReservedId::classify(self.id)
+    }
+
+    /// Convenience shorthand for `reserved() == Some(ReservedId::Filler)`.
+    ///
+    /// The §3 spec ¶ "the special ID '    ' (4 spaces) is a ckID for
+    /// 'filler' chunks, that is, chunks that fill space but have no
+    /// meaningful contents" — a reader that has identified a chunk as
+    /// FILLER can `skip_chunk_body` past it without ever reading the
+    /// payload.
+    pub fn is_filler(&self) -> bool {
+        self.id == FILLER_ID
     }
 }
 
@@ -388,5 +555,217 @@ mod tests {
             assert_eq!(GroupKind::from_id(k.id()), Some(k));
         }
         assert_eq!(GroupKind::from_id(*b"PROP"), None);
+    }
+
+    #[test]
+    fn reserved_id_classifies_three_groups() {
+        assert_eq!(
+            ReservedId::classify(*b"FORM"),
+            Some(ReservedId::Group(GroupKind::Form))
+        );
+        assert_eq!(
+            ReservedId::classify(*b"LIST"),
+            Some(ReservedId::Group(GroupKind::List))
+        );
+        assert_eq!(
+            ReservedId::classify(*b"CAT "),
+            Some(ReservedId::Group(GroupKind::Cat))
+        );
+    }
+
+    #[test]
+    fn reserved_id_classifies_prop_and_filler() {
+        // §3 ¶ "LIST, FORM, PROP, CAT , and '    '" — PROP and the
+        // 4-space FILLER are the two non-group universally-reserved
+        // IDs the chunk header dispatcher needs to recognise.
+        assert_eq!(ReservedId::classify(*b"PROP"), Some(ReservedId::Prop));
+        assert_eq!(ReservedId::classify(*b"    "), Some(ReservedId::Filler));
+    }
+
+    #[test]
+    fn reserved_id_classifies_all_twenty_seven_future_versions() {
+        // §3 ¶ "LIS1 through LIS9, FOR1 through FOR9, and CAT1 through
+        // CAT9" — the 27 reserved version-number variants. The
+        // classifier preserves the parent group kind plus the digit.
+        for d in b'1'..=b'9' {
+            let mut id = *b"LIS_";
+            id[3] = d;
+            assert_eq!(
+                ReservedId::classify(id),
+                Some(ReservedId::ReservedFuture {
+                    parent: GroupKind::List,
+                    digit: d,
+                }),
+                "LIS{}",
+                d as char,
+            );
+            let mut id = *b"FOR_";
+            id[3] = d;
+            assert_eq!(
+                ReservedId::classify(id),
+                Some(ReservedId::ReservedFuture {
+                    parent: GroupKind::Form,
+                    digit: d,
+                }),
+                "FOR{}",
+                d as char,
+            );
+            let mut id = *b"CAT_";
+            id[3] = d;
+            assert_eq!(
+                ReservedId::classify(id),
+                Some(ReservedId::ReservedFuture {
+                    parent: GroupKind::Cat,
+                    digit: d,
+                }),
+                "CAT{}",
+                d as char,
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_id_rejects_non_reserved_ckid() {
+        // Common FORM-local properties are NOT in the §3 reserved
+        // set — classify must return None so callers route them to
+        // the data-chunk path.
+        for non_reserved in [
+            *b"BMHD", *b"CMAP", *b"BODY", *b"DLTA", *b"VHDR", *b"COMM", *b"SSND", *b"MARK",
+            *b"ANNO", *b"NAME", *b"AUTH", *b"COMT", *b"INST", *b"MIDI", *b"APPL", *b"AESD",
+            *b"SAXL", *b"TEXT", *b"FVER", *b"GRAB", *b"DEST", *b"SPRT", *b"CAMG", *b"CRNG",
+            *b"CCRT", *b"DRNG", *b"SHAM", *b"PCHG", *b"ANHD",
+        ] {
+            assert_eq!(
+                ReservedId::classify(non_reserved),
+                None,
+                "{:?} should not classify as reserved",
+                std::str::from_utf8(&non_reserved).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_id_rejects_boundary_version_digits() {
+        // §3 spells the version family as digits '1'..='9' — '0' is
+        // excluded ("LIS0" is not in the reserved set) and 'A' is
+        // not a digit at all. Both must classify as None so the
+        // chunk lands on the data-chunk path.
+        assert_eq!(ReservedId::classify(*b"LIS0"), None);
+        assert_eq!(ReservedId::classify(*b"FOR0"), None);
+        assert_eq!(ReservedId::classify(*b"CAT0"), None);
+        assert_eq!(ReservedId::classify(*b"LISA"), None);
+        // Also: a non-version trailing byte against the LIS / FOR /
+        // CAT prefix must not match — e.g. LIST already classifies
+        // as a group, but "LISx" with lowercase is just data.
+        assert_eq!(ReservedId::classify(*b"LISx"), None);
+    }
+
+    #[test]
+    fn reserved_id_predicates() {
+        let g = ReservedId::Group(GroupKind::Form);
+        assert!(g.is_group());
+        assert!(!g.is_filler());
+        assert!(!g.is_reserved_future());
+
+        let f = ReservedId::Filler;
+        assert!(!f.is_group());
+        assert!(f.is_filler());
+        assert!(!f.is_reserved_future());
+
+        let p = ReservedId::Prop;
+        assert!(!p.is_group());
+        assert!(!p.is_filler());
+        assert!(!p.is_reserved_future());
+
+        let rf = ReservedId::ReservedFuture {
+            parent: GroupKind::List,
+            digit: b'3',
+        };
+        assert!(!rf.is_group());
+        assert!(!rf.is_filler());
+        assert!(rf.is_reserved_future());
+    }
+
+    #[test]
+    fn all_reserved_ids_covers_every_id_classify_recognises() {
+        // Round-trip: every entry in the §3 enumeration must classify
+        // back to a Some(_) variant. Conversely, the enumeration must
+        // be deduplicated — the §3 list has no duplicates.
+        let ids = ReservedId::all_reserved_ids();
+        assert_eq!(ids.len(), 32, "§3 list has 5 base + 27 future = 32 IDs");
+
+        let mut seen = std::collections::BTreeSet::new();
+        for id in ids {
+            assert!(
+                seen.insert(id),
+                "{:?} appears twice in all_reserved_ids",
+                std::str::from_utf8(&id).unwrap_or("????"),
+            );
+            assert!(
+                ReservedId::classify(id).is_some(),
+                "{:?} present in enumeration but rejected by classify",
+                std::str::from_utf8(&id).unwrap_or("????"),
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_header_reserved_and_is_filler() {
+        // A FILLER chunk surfaces through both shortcuts on
+        // ChunkHeader.
+        let h = ChunkHeader {
+            id: FILLER_ID,
+            size: 8,
+        };
+        assert!(h.is_filler());
+        assert_eq!(h.reserved(), Some(ReservedId::Filler));
+        // A FORM chunk header is a group (existing is_group keeps
+        // working) and also classifies as ReservedId::Group.
+        let h = ChunkHeader {
+            id: GROUP_FORM,
+            size: 24,
+        };
+        assert!(h.is_group());
+        assert!(!h.is_filler());
+        assert_eq!(h.reserved(), Some(ReservedId::Group(GroupKind::Form)));
+        // A FORM-local data chunk falls outside the §3 reserved set.
+        let h = ChunkHeader {
+            id: *b"BMHD",
+            size: 20,
+        };
+        assert!(!h.is_group());
+        assert!(!h.is_filler());
+        assert!(h.reserved().is_none());
+    }
+
+    #[test]
+    fn filler_chunk_walks_past_body_without_decoding() {
+        // The "spec essence" use case: a reader that sees a FILLER
+        // ckID skips past padded_size bytes without ever reading
+        // ckData. Verified end-to-end against the existing
+        // skip_chunk_body helper.
+        // FILLER ckID + ckSize = 5 (odd, so 1 byte pad) + 5 body
+        // bytes + 1 pad + a follow-on full FORM chunk header to
+        // confirm the cursor lands at the right offset.
+        let bytes: Vec<u8> = [
+            b"    ".as_slice(),
+            &[0, 0, 0, 5],
+            b"hello",
+            &[0],
+            b"FORM",
+            &[0, 0, 0, 4],
+            b"ILBM",
+        ]
+        .concat();
+        let mut cur = Cursor::new(&bytes[..]);
+        let h = read_chunk_header(&mut cur).unwrap().unwrap();
+        assert!(h.is_filler());
+        assert_eq!(h.size, 5);
+        assert_eq!(h.padded_size(), 6);
+        skip_chunk_body(&mut cur, &h).unwrap();
+        // Confirm we landed on the FORM that follows.
+        let h2 = read_chunk_header(&mut cur).unwrap().unwrap();
+        assert_eq!(&h2.id, b"FORM");
+        assert_eq!(h2.size, 4);
     }
 }

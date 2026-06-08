@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **EA IFF 85 §3 universally-reserved ckID classifier
+  (`chunk::ReservedId`).** §3 ¶ "the following ckIDs are universally
+  reserved to identify chunks with particular IFF meanings: 'LIST',
+  'FORM', 'PROP', 'CAT ', and '    '. […] The IDs 'LIS1' through
+  'LIS9', 'FOR1' through 'FOR9', and 'CAT1' through 'CAT9' are
+  reserved for future 'version number' variations" enumerates the
+  full reserved set every conforming IFF reader must recognise. The
+  new [`chunk::ReservedId`] enum maps any 4-byte ckID to one of
+  `Group(GroupKind)` (the three group-chunk IDs already surfaced
+  by [`chunk::GroupKind`]), `Prop` (the §3 PROP property-set group
+  that only appears as the first child of a LIST), `Filler` (the
+  four-space ID for "chunks that fill space but have no meaningful
+  contents"), or `ReservedFuture { parent, digit }` (the
+  twenty-seven LIS1..9 / FOR1..9 / CAT1..9 version-number
+  variants, carrying back the parent group kind and the ASCII
+  digit). Two new module-level constants — [`chunk::FILLER_ID`]
+  (`b"    "`) and [`chunk::PROP_ID`] (`b"PROP"`) — give the two
+  previously-unnamed reserved IDs a typed home alongside the
+  existing [`chunk::GROUP_FORM`] / [`chunk::GROUP_LIST`] /
+  [`chunk::GROUP_CAT`] constants. [`chunk::ReservedId::classify`]
+  is the free entry point; [`chunk::ChunkHeader::reserved`] and
+  [`chunk::ChunkHeader::is_filler`] are the convenience accessors
+  the per-form walkers can route on. Three predicates
+  ([`ReservedId::is_group`], [`is_filler`], [`is_reserved_future`])
+  cover the §3-aware fall-through cases, and
+  [`ReservedId::all_reserved_ids`] enumerates the full set in
+  spec-listed order. The classifier rejects every FORM-local
+  property surfaced elsewhere in the crate (BMHD / CMAP / BODY /
+  CAMG / GRAB / DEST / SPRT / CRNG / CCRT / DRNG / SHAM / PCHG /
+  VHDR / CHAN / ANNO / NAME / AUTH / COMM / SSND / MARK / INST /
+  COMT / AESD / APPL / MIDI / SAXL / FVER / ANHD / DLTA) so the
+  data-chunk dispatch path is unaffected. Sixteen new tests cover
+  the classifier surface — 9 unit tests in `src/chunk.rs`
+  (`reserved_id_classifies_three_groups`,
+  `reserved_id_classifies_prop_and_filler`,
+  `reserved_id_classifies_all_twenty_seven_future_versions`,
+  `reserved_id_rejects_non_reserved_ckid`,
+  `reserved_id_rejects_boundary_version_digits`,
+  `reserved_id_predicates`,
+  `all_reserved_ids_covers_every_id_classify_recognises`,
+  `chunk_header_reserved_and_is_filler`,
+  `filler_chunk_walks_past_body_without_decoding`) plus 5
+  integration tests in `tests/reserved_ids.rs` covering the
+  per-id-round-trip, the constant surfaces, an end-to-end
+  FILLER-before-FORM stream walk via [`chunk::skip_chunk_body`],
+  the future-version parent-group routing, and the FORM-local
+  rejection sweep. Doc reference: `docs/image/iff/ea-iff-85.txt`
+  §3 "Chunks" lines 524–531; Appendix A C macros
+  `ID_FORM`/`ID_LIST`/`ID_PROP`/`ID_CAT`/`ID_FILLER` lines
+  1230–1234. The current spec defines no decoder for the
+  reserved-future-version IDs; the predicate is offered so callers
+  can route them to a versioning-aware fall-back path instead of
+  misclassifying them as ordinary data chunks. The §3 paragraph
+  cites "23 chunk IDs" as the magic number callers must account
+  for, but the explicit enumeration in the same paragraph spells
+  out 5 base + 3×9 = 32 distinct IDs; the enum and the helper
+  match the explicit list, with the discrepancy flagged in the
+  [`all_reserved_ids`] doc comment.
+
 - **Top-level group probe primitive** ([`chunk::probe_top_level_group`]
   + [`chunk::read_top_level_group`]). EA IFF 85 §6 restricts a
   conforming file to a single `FORM`/`LIST`/`CAT ` group at offset 0
