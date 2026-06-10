@@ -318,6 +318,234 @@ pub fn read_top_level_group<R: Read + ?Sized>(r: &mut R) -> Result<Option<TopLev
     }))
 }
 
+/// One decoded child of a `LIST` or `CAT ` group body.
+///
+/// EA IFF 85 §5 closes the child grammar of the two outer group kinds
+/// (Appendix A productions):
+///
+/// ```text
+/// LIST ::= "LIST" #{ ContentsType PROP* (FORM | LIST | CAT)* }
+/// CAT  ::= "CAT " #{ ContentsType (FORM | LIST | CAT)* }
+/// PROP ::= "PROP" #{ FormType Property* }
+/// ```
+///
+/// so every child is either a `PROP` shared-property set (LIST only)
+/// or a nested group chunk. Both shapes are "a subtype ID followed by
+/// chunks" (§6 ¶ "Chunk types LIST, FORM, PROP, and CAT are generic
+/// groups. They always contain a subtype ID followed by chunks."); the
+/// `body` slice holds the bytes *after* that subtype ID, bounded by
+/// the child's own `ckSize`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupChild<'a> {
+    /// A §5 `PROP` shared-property set — "Here are the shared
+    /// properties for FORM type \<FormType\>." Only legal inside a
+    /// `LIST` (§5 ¶ "PROP chunks may appear in LISTs (not in FORMs or
+    /// CATs)"). `body` is the concatenated `Property*` chunk stream.
+    Prop {
+        /// The `FormType` the shared properties apply to.
+        form_type: [u8; 4],
+        /// The `Property*` chunk bytes following the FormType.
+        body: &'a [u8],
+    },
+    /// A nested `FORM` / `LIST` / `CAT ` group chunk. `body` is the
+    /// nested chunk stream following the group's own subtype ID.
+    Group {
+        /// Which group chunk this child is.
+        kind: GroupKind,
+        /// The child's subtype ID — `FormType` for FORM, the
+        /// `ContentsType` hint for LIST and CAT.
+        inner_type: [u8; 4],
+        /// The nested chunk bytes following the subtype ID.
+        body: &'a [u8],
+    },
+}
+
+impl GroupChild<'_> {
+    /// The child's subtype ID — the PROP's `FormType` or the nested
+    /// group's `FormType` / `ContentsType`, surfaced uniformly.
+    pub fn inner_type(&self) -> [u8; 4] {
+        match self {
+            GroupChild::Prop { form_type, .. } => *form_type,
+            GroupChild::Group { inner_type, .. } => *inner_type,
+        }
+    }
+
+    /// Convenience predicate — `true` for the [`GroupChild::Prop`]
+    /// variant.
+    pub fn is_prop(&self) -> bool {
+        matches!(self, GroupChild::Prop { .. })
+    }
+}
+
+/// Walk the children of a `LIST` or `CAT ` group body.
+///
+/// `children` is the group's payload *after* its 4-byte
+/// `ContentsType` — i.e. for a top-level group decoded by
+/// [`probe_top_level_group`], the `size - 4` bytes starting at file
+/// offset 12, truncated to the declared `ckSize` (§5 Group CAT ¶ "In
+/// reading a CAT, like any other chunk, programs must respect it's
+/// ckSize as a virtual end-of-file for reading the nested objects
+/// even if they're malformed or truncated" — the caller passes the
+/// already-bounded slice).
+///
+/// The walker enforces every structural rule §5 states for the two
+/// closed child grammars:
+///
+/// - **LIST**: children are `PROP* (FORM | LIST | CAT)*`, in that
+///   order — §5 ¶ "all the PROPs must appear before any of the FORMs
+///   or nested LISTs and CATs"; a PROP after the first nested group
+///   is an error.
+/// - **LIST**: "A LIST may have at most one PROP of a FORM type" —
+///   a duplicate `FormType` across the PROPs is an error.
+/// - **CAT**: children are `(FORM | LIST | CAT)*` only; a PROP is an
+///   error — §5 ¶ "PROP chunks may appear in LISTs (not in FORMs or
+///   CATs)" / Rules for Writer Programs ¶ "PROPs may only appear
+///   inside LISTs."
+/// - **FORM** is rejected outright: §4's production allows
+///   `LocalChunk` children whose IDs are FORM-type-specific, so a
+///   generic group-only walk cannot decode a FORM body — that is the
+///   per-form walker's job (`ilbm` / `svx` / `anim` / `aiff`).
+///
+/// §3 FILLER chunks ("chunks that fill space but have no meaningful
+/// contents") are walked past without being surfaced. The
+/// reserved-future-version IDs (`LIS1..9` / `FOR1..9` / `CAT1..9`)
+/// and any non-reserved ckID are errors — the §5 grammar admits no
+/// other child, and the future-version IDs have no defined decode.
+///
+/// A missing pad byte after the final odd-sized child is tolerated,
+/// matching [`read_chunk_header`]'s clean-EOF convention one level
+/// up.
+pub fn parse_group_children(kind: GroupKind, children: &[u8]) -> Result<Vec<GroupChild<'_>>> {
+    if kind == GroupKind::Form {
+        return Err(Error::invalid(
+            "IFF: FORM bodies mix LocalChunks with nested groups (EA IFF 85 §4); \
+             use the per-form walker instead of parse_group_children",
+        ));
+    }
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    // §5: "all the PROPs must appear before any of the FORMs or
+    // nested LISTs and CATs".
+    let mut group_seen = false;
+    // §5: "A LIST may have at most one PROP of a FORM type".
+    let mut prop_types: Vec<[u8; 4]> = Vec::new();
+    while pos < children.len() {
+        if children.len() - pos < 8 {
+            return Err(Error::invalid("IFF: truncated group-child chunk header"));
+        }
+        let id = [
+            children[pos],
+            children[pos + 1],
+            children[pos + 2],
+            children[pos + 3],
+        ];
+        let size = u32::from_be_bytes([
+            children[pos + 4],
+            children[pos + 5],
+            children[pos + 6],
+            children[pos + 7],
+        ]) as usize;
+        let body_start = pos + 8;
+        let body_end = body_start
+            .checked_add(size)
+            .filter(|&end| end <= children.len())
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "IFF: group child {:?} overruns the containing group's ckSize",
+                    std::str::from_utf8(&id).unwrap_or("????"),
+                ))
+            })?;
+        match ReservedId::classify(id) {
+            // §3 filler — "fills space but has no meaningful
+            // contents"; walk past without surfacing it.
+            Some(ReservedId::Filler) => {}
+            Some(ReservedId::Prop) => {
+                if kind == GroupKind::Cat {
+                    return Err(Error::invalid(
+                        "IFF: PROP chunks may appear in LISTs, not in CATs (EA IFF 85 §5)",
+                    ));
+                }
+                if group_seen {
+                    return Err(Error::invalid(
+                        "IFF: PROPs must appear before any FORM/LIST/CAT in a LIST \
+                         (EA IFF 85 §5)",
+                    ));
+                }
+                if size < 4 {
+                    return Err(Error::invalid("IFF: PROP chunk too short for a FormType"));
+                }
+                let form_type = [
+                    children[body_start],
+                    children[body_start + 1],
+                    children[body_start + 2],
+                    children[body_start + 3],
+                ];
+                if prop_types.contains(&form_type) {
+                    return Err(Error::invalid(format!(
+                        "IFF: a LIST may have at most one PROP of FORM type {:?} \
+                         (EA IFF 85 §5)",
+                        std::str::from_utf8(&form_type).unwrap_or("????"),
+                    )));
+                }
+                prop_types.push(form_type);
+                out.push(GroupChild::Prop {
+                    form_type,
+                    body: &children[body_start + 4..body_end],
+                });
+            }
+            Some(ReservedId::Group(child_kind)) => {
+                if size < 4 {
+                    return Err(Error::invalid(
+                        "IFF: group child too short for a subtype ID",
+                    ));
+                }
+                group_seen = true;
+                out.push(GroupChild::Group {
+                    kind: child_kind,
+                    inner_type: [
+                        children[body_start],
+                        children[body_start + 1],
+                        children[body_start + 2],
+                        children[body_start + 3],
+                    ],
+                    body: &children[body_start + 4..body_end],
+                });
+            }
+            Some(ReservedId::ReservedFuture { .. }) | None => {
+                return Err(Error::invalid(format!(
+                    "IFF: {:?} is not a legal LIST/CAT child \
+                     (EA IFF 85 §5 grammar: PROP / FORM / LIST / CAT)",
+                    std::str::from_utf8(&id).unwrap_or("????"),
+                )));
+            }
+        }
+        // Advance past the body plus the §3 pad byte after every
+        // odd-length chunk; a missing pad at the very end of the
+        // group is tolerated.
+        pos = (body_end + (size & 1)).min(children.len());
+    }
+    Ok(out)
+}
+
+/// Look up the shared-property body for `form_type` in a parsed
+/// LIST's children.
+///
+/// §5 ¶ "It means, 'Here are the shared properties for FORM type
+/// \<FormType\>.'" — returns the `Property*` chunk bytes of the PROP
+/// whose `FormType` matches, or `None` when the LIST shares nothing
+/// for that form type. [`parse_group_children`] has already enforced
+/// "at most one PROP of a FORM type", so the first match is the only
+/// match.
+pub fn prop_for_form_type<'a>(children: &[GroupChild<'a>], form_type: [u8; 4]) -> Option<&'a [u8]> {
+    children.iter().find_map(|c| match c {
+        GroupChild::Prop {
+            form_type: ft,
+            body,
+        } if *ft == form_type => Some(*body),
+        _ => None,
+    })
+}
+
 /// Header of a single IFF chunk.
 #[derive(Clone, Copy, Debug)]
 pub struct ChunkHeader {
@@ -736,6 +964,188 @@ mod tests {
         assert!(!h.is_group());
         assert!(!h.is_filler());
         assert!(h.reserved().is_none());
+    }
+
+    /// Build one child chunk: `id + ckSize + body (+ pad if odd)`.
+    fn child(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(8 + body.len() + 1);
+        v.extend_from_slice(id);
+        v.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        v.extend_from_slice(body);
+        if body.len() & 1 == 1 {
+            v.push(0);
+        }
+        v
+    }
+
+    /// Build a group child body: subtype ID + nested bytes.
+    fn typed_body(inner: &[u8; 4], rest: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + rest.len());
+        v.extend_from_slice(inner);
+        v.extend_from_slice(rest);
+        v
+    }
+
+    #[test]
+    fn parse_group_children_decodes_list_with_prop_and_forms() {
+        // The §5 worked example shape: LIST { PROP TEXT {..} FORM
+        // TEXT {..} FORM TEXT {..} } — children only, after the
+        // LIST's ContentsType.
+        let prop_body = typed_body(b"TEXT", &child(b"FONT", b"TimesRoman"));
+        let form1_body = typed_body(b"TEXT", &child(b"CHRS", b"Hello "));
+        let form2_body = typed_body(b"TEXT", &child(b"CHRS", b"there."));
+        let children: Vec<u8> = [
+            child(b"PROP", &prop_body),
+            child(b"FORM", &form1_body),
+            child(b"FORM", &form2_body),
+        ]
+        .concat();
+        let kids = parse_group_children(GroupKind::List, &children).unwrap();
+        assert_eq!(kids.len(), 3);
+        assert!(kids[0].is_prop());
+        assert_eq!(kids[0].inner_type(), *b"TEXT");
+        match kids[1] {
+            GroupChild::Group {
+                kind, inner_type, ..
+            } => {
+                assert_eq!(kind, GroupKind::Form);
+                assert_eq!(&inner_type, b"TEXT");
+            }
+            _ => panic!("expected nested FORM"),
+        }
+        // The PROP's body is the Property* stream after the FormType.
+        let shared = prop_for_form_type(&kids, *b"TEXT").unwrap();
+        let mut cur = Cursor::new(shared);
+        let h = read_chunk_header(&mut cur).unwrap().unwrap();
+        assert_eq!(&h.id, b"FONT");
+        assert_eq!(read_body(&mut cur, &h).unwrap(), b"TimesRoman");
+        // No shared properties for a form type the LIST doesn't cover.
+        assert!(prop_for_form_type(&kids, *b"ILBM").is_none());
+    }
+
+    #[test]
+    fn parse_group_children_rejects_prop_after_group() {
+        // §5: "all the PROPs must appear before any of the FORMs or
+        // nested LISTs and CATs".
+        let children: Vec<u8> = [
+            child(b"FORM", &typed_body(b"TEXT", &[])),
+            child(b"PROP", &typed_body(b"TEXT", &[])),
+        ]
+        .concat();
+        let err = parse_group_children(GroupKind::List, &children).unwrap_err();
+        assert!(format!("{err}").contains("before any FORM"), "{err}");
+    }
+
+    #[test]
+    fn parse_group_children_rejects_duplicate_prop_form_type() {
+        // §5: "A LIST may have at most one PROP of a FORM type" —
+        // two PROP TEXT children are an error, but PROP TEXT +
+        // PROP ILBM is fine.
+        let dup: Vec<u8> = [
+            child(b"PROP", &typed_body(b"TEXT", &[])),
+            child(b"PROP", &typed_body(b"TEXT", &[])),
+        ]
+        .concat();
+        let err = parse_group_children(GroupKind::List, &dup).unwrap_err();
+        assert!(format!("{err}").contains("at most one PROP"), "{err}");
+
+        let distinct: Vec<u8> = [
+            child(b"PROP", &typed_body(b"TEXT", &[])),
+            child(b"PROP", &typed_body(b"ILBM", &[])),
+        ]
+        .concat();
+        let kids = parse_group_children(GroupKind::List, &distinct).unwrap();
+        assert_eq!(kids.len(), 2);
+        assert!(prop_for_form_type(&kids, *b"ILBM").is_some());
+    }
+
+    #[test]
+    fn parse_group_children_rejects_prop_in_cat() {
+        // §5: "PROP chunks may appear in LISTs (not in FORMs or
+        // CATs)".
+        let children = child(b"PROP", &typed_body(b"TEXT", &[]));
+        let err = parse_group_children(GroupKind::Cat, &children).unwrap_err();
+        assert!(format!("{err}").contains("not in CATs"), "{err}");
+        // The same FORM-only CAT body is fine.
+        let children = child(b"FORM", &typed_body(b"ILBM", &[]));
+        let kids = parse_group_children(GroupKind::Cat, &children).unwrap();
+        assert_eq!(kids.len(), 1);
+    }
+
+    #[test]
+    fn parse_group_children_rejects_form_kind() {
+        // §4's FORM production admits LocalChunk children whose IDs
+        // are form-type-specific; the generic walker refuses rather
+        // than misreading them.
+        let err = parse_group_children(GroupKind::Form, &[]).unwrap_err();
+        assert!(format!("{err}").contains("per-form walker"), "{err}");
+    }
+
+    #[test]
+    fn parse_group_children_rejects_data_and_future_version_ids() {
+        // A bare data ckID is not in the §5 grammar…
+        let children = child(b"BMHD", &[0u8; 20]);
+        assert!(parse_group_children(GroupKind::List, &children).is_err());
+        // …and neither are the §3 reserved-future-version IDs.
+        let children = child(b"LIS1", &typed_body(b"TEXT", &[]));
+        assert!(parse_group_children(GroupKind::List, &children).is_err());
+    }
+
+    #[test]
+    fn parse_group_children_skips_filler() {
+        // §3 filler "fills space but has no meaningful contents" —
+        // walked past, not surfaced, and it doesn't trip the
+        // PROP-before-groups ordering check.
+        let children: Vec<u8> = [
+            child(b"    ", b"xxx"),
+            child(b"PROP", &typed_body(b"TEXT", &[])),
+            child(b"FORM", &typed_body(b"TEXT", &[])),
+        ]
+        .concat();
+        let kids = parse_group_children(GroupKind::List, &children).unwrap();
+        assert_eq!(kids.len(), 2);
+        assert!(kids[0].is_prop());
+    }
+
+    #[test]
+    fn parse_group_children_bounds_checks() {
+        // Empty body: zero children is legal (the grammar's * admits
+        // the empty sequence).
+        assert!(parse_group_children(GroupKind::List, &[])
+            .unwrap()
+            .is_empty());
+        // Truncated child header.
+        assert!(parse_group_children(GroupKind::Cat, b"FORM\x00\x00").is_err());
+        // Child ckSize overruns the containing group.
+        let mut children = child(b"FORM", &typed_body(b"ILBM", &[]));
+        children[7] = 0xFF; // declared size far past the slice end
+        assert!(parse_group_children(GroupKind::Cat, &children).is_err());
+        // Group child too short for its subtype ID.
+        let children = child(b"FORM", b"IL");
+        assert!(parse_group_children(GroupKind::Cat, &children).is_err());
+        // PROP too short for its FormType.
+        let children = child(b"PROP", b"TE");
+        assert!(parse_group_children(GroupKind::List, &children).is_err());
+    }
+
+    #[test]
+    fn parse_group_children_handles_odd_sized_children_and_missing_final_pad() {
+        // First child has an odd ckSize → 1 pad byte before the next
+        // child; the final child's pad byte is absent and tolerated.
+        let form1 = typed_body(b"TEXT", &child(b"CHRS", b"a")); // CHRS size 1 → padded
+        let mut children = child(b"FORM", &form1);
+        assert_eq!(children.len() % 2, 0, "even after pad");
+        // Second child with odd body and NO trailing pad.
+        let form2 = typed_body(b"TEXT", b"x"); // 5 bytes, odd
+        children.extend_from_slice(b"FORM");
+        children.extend_from_slice(&(form2.len() as u32).to_be_bytes());
+        children.extend_from_slice(&form2);
+        let kids = parse_group_children(GroupKind::Cat, &children).unwrap();
+        assert_eq!(kids.len(), 2);
+        match kids[1] {
+            GroupChild::Group { body, .. } => assert_eq!(body, b"x"),
+            _ => panic!("expected nested FORM"),
+        }
     }
 
     #[test]

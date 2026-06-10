@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **EA IFF 85 §5 LIST/CAT group-children walker**
+  ([`chunk::GroupChild`] + [`chunk::parse_group_children`] +
+  [`chunk::prop_for_form_type`]). Appendix A's productions close the
+  child grammar of the two outer group kinds — `LIST ::= "LIST"
+  #{ ContentsType PROP* (FORM | LIST | CAT)* }` and `CAT ::= "CAT "
+  #{ ContentsType (FORM | LIST | CAT)* }` — so a generic walker can
+  decode every LIST/CAT child without per-form knowledge. The new
+  [`chunk::parse_group_children`] takes a [`chunk::GroupKind`] plus
+  the group's payload after its ContentsType (the caller bounds the
+  slice by the declared ckSize per §5 Group CAT ¶ "programs must
+  respect it's ckSize as a virtual end-of-file for reading the nested
+  objects") and returns typed [`chunk::GroupChild`] entries — `Prop
+  { form_type, body }` for §5 shared-property sets, `Group { kind,
+  inner_type, body }` for nested FORM/LIST/CAT — enforcing every
+  structural rule §5 states: PROPs only in LISTs (¶ "PROP chunks may
+  appear in LISTs (not in FORMs or CATs)" / Rules for Writer Programs
+  ¶ "PROPs may only appear inside LISTs"), PROPs before any nested
+  group (¶ "all the PROPs must appear before any of the FORMs or
+  nested LISTs and CATs"), at most one PROP per FORM type (¶ "A LIST
+  may have at most one PROP of a FORM type"). §3 FILLER children are
+  walked past without being surfaced ("chunks that fill space but
+  have no meaningful contents"); reserved-future-version IDs and bare
+  data ckIDs are rejected since the grammar admits no other child.
+  `GroupKind::Form` is refused outright — §4's production admits
+  `LocalChunk` children whose IDs are form-type-specific, so FORM
+  bodies stay with the per-form walkers. [`chunk::prop_for_form_type`]
+  is the §5 ¶ "Here are the shared properties for FORM type
+  \<FormType\>" lookup joining a FORM type against the parsed child
+  list. Nine new unit tests in `src/chunk.rs` (worked-example LIST
+  decode, PROP-after-group rejection, duplicate-FormType rejection,
+  PROP-in-CAT rejection, FORM-kind rejection, data/future-version
+  ckID rejection, FILLER skip, bounds checks, odd-size pad handling)
+  plus 3 integration tests in `tests/group_children.rs` building the
+  §5 worked example (`LIST { PROP TEXT { FONT } FORM TEXT … }`), a
+  `CAT ` of heterogeneous FORMs with the blank `JJJJ` contents ID,
+  and a LIST nested inside a CAT walked recursively — all end-to-end
+  from `probe_top_level_group` through the child walk. Doc reference:
+  `docs/image/iff/ea-iff-85.txt` §5 "LISTs, CATs, and Shared
+  Properties" lines 842–986; §6 reader/writer rules lines 1119–1196;
+  Appendix A grammar lines 1244–1253.
+
 - **EA IFF 85 §3 universally-reserved ckID classifier
   (`chunk::ReservedId`).** §3 ¶ "the following ckIDs are universally
   reserved to identify chunks with particular IFF meanings: 'LIST',

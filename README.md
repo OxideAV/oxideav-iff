@@ -98,7 +98,16 @@ aware body walkers), `ReservedId` + `ReservedId::classify` /
 universally-reserved ckID classifier covering `FORM` / `LIST` /
 `CAT ` / `PROP` / four-space FILLER + the 27 reserved-future-version
 IDs `LIS1..9` / `FOR1..9` / `CAT1..9`), and the matching
-`FILLER_ID` / `PROP_ID` constants.
+`FILLER_ID` / `PROP_ID` constants. On top of the classifier sits the
+§5 group-children walker — `GroupChild` + `parse_group_children` +
+`prop_for_form_type` — which decodes the closed child grammars
+`LIST ::= ContentsType PROP* (FORM|LIST|CAT)*` and
+`CAT ::= ContentsType (FORM|LIST|CAT)*`, enforcing the §5 structural
+rules (PROPs before any nested group, at most one PROP per FORM
+type, no PROP inside a CAT, §3 FILLER skipped, reserved-future /
+data ckIDs rejected) and surfacing each child's subtype ID + body
+slice so LIST/CAT files walk recursively without any per-form
+knowledge.
 
 Zero C dependencies.
 
