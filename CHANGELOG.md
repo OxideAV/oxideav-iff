@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ANIM op-2 / op-3 (Long / Short Delta mode) decode + encode**
+  (spec §1.2.2 / §1.2.3, wire format §2.2.1). The DLTA opens with 8
+  big-endian u32 plane pointers (`0` = plane unchanged; the §2.2.1
+  worked value for the first list is 32); each plane's payload is a
+  list of groups whose offsets and counts are big-endian shorts and
+  whose data words are longs (op 2) or shorts (op 3). A word cursor
+  starts at the plane's first word; a positive offset advances the
+  cursor and places one data word, a negative offset (absolute value
+  = offset + 2) advances the cursor and a count short introduces that
+  many contiguous data words, and `0xFFFF` terminates the plane's
+  list. The bitplane is addressed as the contiguous `height ×
+  row_bytes` byte array it occupies in memory, so op-2 long words may
+  straddle row boundaries — the decoder gathers each plane into a
+  contiguous buffer, applies the groups, and scatters the rows back.
+  `parse_anim` / the `iff_anim` demuxer now accept `ANHD.operation`
+  2 and 3; the new write-side surface is [`anim::encode_anim_op2`] /
+  [`anim::encode_anim_op3`] (container-level, mirroring the op-5 /
+  op-7 encoders) plus the lower-level [`anim::encode_op23_body`].
+  The encoder collapses runs of ≥ 2 changed words into a
+  negative-offset group per §1.2.2 ¶ "Strings of 2 or more long-words
+  in a row which change can be run together", emits single-word
+  groups otherwise, and bridges offsets wider than a positive short
+  by rewriting an unchanged word in place. After a run group the
+  cursor convention is "last written word" (the spec prose tracks
+  the pointer at the position the data word "would be placed at" and
+  never says it advances past a write); the in-tree encoder and
+  decoder share that reading. 14 new integration tests in
+  `tests/anim_op23.rs` — hand-crafted DLTA byte vectors pinning the
+  group grammar (single words, runs, terminator, zero pointers,
+  straddling long words, truncation/overrun rejection) plus
+  encode → `parse_anim` round-trips for both modes.
+
 - **EA IFF 85 §5 LIST/CAT group-children walker**
   ([`chunk::GroupChild`] + [`chunk::parse_group_children`] +
   [`chunk::prop_for_form_type`]). Appendix A's productions close the

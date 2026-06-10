@@ -22,15 +22,21 @@ crate ships:
   validating or re-deriving the header hints after editing the
   change list**, CRNG / CCRT / DRNG colour-cycling descriptors).
 - **FORM/PBM** — read+round-trip (DPaint II / Brilliance chunky sibling).
-- **FORM/ANIM** — op-0 literal + op-5 byte-vertical delta
-  (encode+decode) + op-7 Short/Long Vertical Delta
-  (encode+decode). The op-7 encoder picks Skip / Same / Uniq ops
+- **FORM/ANIM** — op-0 literal + op-2/op-3 Long/Short Delta
+  (encode+decode) + op-5 byte-vertical delta (encode+decode) +
+  op-7 Short/Long Vertical Delta (encode+decode). The op-7 encoder
+  picks Skip / Same / Uniq ops
   per column to minimise byte cost (Same for runs ≥ 2, Uniq
   otherwise, Skip for unchanged runs); both short (2-byte items)
   and long (4-byte items, `ANHD.bits` bit 0 set) variants
-  round-trip through the in-tree decoder. The container walker
-  accepts both `BODY` and `DLTA` chunk ids so op-0 / op-5 / op-7
-  streams decode through the same path.
+  round-trip through the in-tree decoder. The op-2/op-3 group
+  grammar (§2.2.1 — positive offset + one data word, negative
+  offset + counted contiguous run, `0xFFFF` terminator) addresses
+  each bitplane as the contiguous word array it occupies in
+  memory, so op-2 long words may straddle row boundaries. The
+  container walker accepts both `BODY` and `DLTA` chunk ids so
+  op-0 / op-2 / op-3 / op-5 / op-7 streams decode through the
+  same path.
 - **FORM/AIFF and FORM/AIFC** — Apple AIFF / AIFF-C (read):
   COMM/SSND/FVER/MARK/INST/COMT/AESD/APPL/MIDI/SAXL/NAME/AUTH/(c) /ANNO
   walker, 80-bit IEEE-extended sample-rate decode, PCM
@@ -310,12 +316,19 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
 |------------------------------------------|:----:|:-----:|
 | `ANHD` Animation Header (40 bytes)       |  Y   |   Y   |
 | Op 0 — full literal BODY                 |  Y   |   Y   |
+| Op 1 — XOR ILBM mode                     |  N   |   N   |
+| Op 2 — Long Delta mode                   |  Y   |   Y   |
+| Op 3 — Short Delta mode                  |  Y   |   Y   |
+| Op 4 — Generalized short/long Delta      |  N   |   N   |
 | Op 5 — Byte Vertical Delta (DPaint III)  |  Y   |   Y   |
-| Op 7 — Short / Long Vertical Delta       |  Y   |   N   |
+| Op 7 — Short / Long Vertical Delta       |  Y   |   Y   |
 | Op 8 — Short / Long Vertical Delta (32b) |  N   |   N   |
 
 - Public API: [`anim::parse_anim`], [`anim::encode_anim_op0`],
+  [`anim::encode_anim_op2`], [`anim::encode_anim_op3`],
+  [`anim::encode_op23_body`],
   [`anim::encode_anim_op5`], [`anim::encode_op5_body`],
+  [`anim::encode_anim_op7`], [`anim::encode_op7_body`],
   [`anim::AnimImage`], [`anim::Anhd`].
 - Container id: `"iff_anim"`, probes `FORM....ANIM` and matches
   `.anim` by extension. Multi-frame `rawvideo` / `Rgba` stream;
@@ -339,8 +352,24 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
   literally from the data list, one per consecutive row) and Same
   (`0x00` byte followed by a count byte — copy one data item `count`
   times to consecutive rows). Advancing one row adds `row_bytes` to
-  the byte offset within the bitplane (not `data_size`). Op-7 encode
-  + op-8 are open follow-ups.
+  the byte offset within the bitplane (not `data_size`).
+- Op-2 (Long Delta) / op-3 (Short Delta) follow the §2.2.1 group
+  grammar: an 8-slot plane-pointer table (`0` = plane unchanged),
+  then per plane a list of groups — a positive offset short advances
+  a word cursor and places one data word, a negative offset short
+  (absolute value = offset + 2) advances the cursor and a count
+  short introduces that many contiguous data words, `0xFFFF`
+  terminates the plane. Data words are big-endian longs in op 2 and
+  shorts in op 3; the plane is addressed as its contiguous
+  `height × row_bytes` byte image, so op-2 long words may straddle
+  row boundaries. After a run the cursor convention is "last written
+  word" (the spec prose tracks the pointer at the position the data
+  word "would be placed at" and never says a write advances it);
+  encoder and decoder share that reading. The encoder collapses runs
+  of ≥ 2 changed words into one negative-offset group per §1.2.2 and
+  bridges gaps wider than a positive short by rewriting an unchanged
+  word in place. Op-1 (XOR), op-4 (Generalized Delta) and op-8 are
+  open follow-ups.
 
 #### Read an ILBM picture
 
@@ -594,11 +623,16 @@ and MAUD are natural follow-ons that reuse the same FORM/LIST/CAT
 reader. ANIM op-7 (short / long vertical delta) decode landed in
 r192; r209 ships the matching **op-7 encoder** (short + long data
 variants) and extends the container walker to accept the `DLTA`
-chunk id alongside `BODY` so op-0 / op-5 / op-7 streams decode
-through the same path. ANIM op-8 and DEEP / TVPP / RGB8 / RGBN
-true-colour IFF chunks remain unblocked on docs — neither has a
-spec section staged in `docs/image/iff/` yet (the only ANIM
-appendix present covers op-7).
+chunk id alongside `BODY` so all delta streams decode through the
+same path. r276 lands **op-2 / op-3 (Long / Short Delta mode)**
+decode + encode from the spec's §1.2.2 / §1.2.3 / §2.2.1 — see the
+ANIM section above. Remaining ANIM gaps: op-1 (XOR ILBM) and op-4
+(Generalized Delta) are documented in the staged spec and are
+natural next increments; op-8 and DEEP / TVPP / RGB8 / RGBN
+true-colour IFF chunks remain blocked on docs — none has a spec
+section staged in `docs/image/iff/` (the only ANIM appendix
+present covers op-7, and op-8 is name-dropped without a wire
+format).
 
 AIFF-side r209 surfaces the previously-skipped optional chunks
 end-to-end: **COMT** (timestamped comments, optional `MarkerId`

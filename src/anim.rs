@@ -17,6 +17,20 @@
 //!
 //! * **op 0** — full BODY (uncompressed, same shape as the leading
 //!   FORM ILBM frame). We treat this as a fresh frame.
+//! * **op 2 / op 3** — Long / Short Delta mode (spec §1.2.2 / §1.2.3,
+//!   wire format §2.2.1). The DLTA begins with 8 big-endian u32
+//!   pointers (one per bitplane; `0` = plane unchanged). Each plane's
+//!   data is a list of groups; offsets and counts are big-endian
+//!   shorts, data words are longs (op 2) or shorts (op 3). The
+//!   bitplane is treated as the contiguous word array Amiga memory
+//!   holds (`height * row_bytes` bytes — long words may straddle row
+//!   boundaries when `row_bytes` isn't a multiple of 4). A word
+//!   cursor starts pointing at the first word of the plane; per group
+//!   a positive offset advances the cursor and the following data
+//!   word is placed there, a negative offset (absolute value =
+//!   offset + 2) advances the cursor and the following count short
+//!   says how many contiguous data words follow; `0xFFFF` terminates
+//!   the plane's list.
 //! * **op 5** — Byte Vertical Delta. For each bitplane the delta is a
 //!   list of `width / 8` columns of "ops"; each op is a 1-byte count
 //!   plus N bytes of either repeats (top bit set) or literal columns
@@ -36,7 +50,8 @@
 //!   at byte offset `column_index * data_size` within the plane row.
 //!
 //! Round 2 implements op 0 + op 5 (the format DPaint III emits);
-//! round 192 adds op 7 (short / long vertical delta) decode. Other
+//! round 192 adds op 7 (short / long vertical delta) decode; round
+//! 276 adds op 2 / op 3 (Long / Short Delta) decode + encode. Other
 //! operations surface `Error::Unsupported` for diagnosability.
 //!
 //! Source: the public **ANIM IFF Cel Animation** spec (Gary Bonham,
@@ -252,8 +267,9 @@ pub fn probe(buf: &[u8]) -> u8 {
 /// Parse a FORM/ANIM container.
 ///
 /// Currently supports `ANHD.operation = 0` (literal full BODY),
+/// `ANHD.operation = 2` / `= 3` (Long / Short Delta mode),
 /// `ANHD.operation = 5` (Byte Vertical Delta) and `ANHD.operation = 7`
-/// (Short / Long Vertical Delta — read only). Other operations
+/// (Short / Long Vertical Delta). Other operations
 /// return `Error::Unsupported`.
 pub fn parse_anim(bytes: &[u8]) -> Result<AnimImage> {
     if bytes.len() < 12 {
@@ -581,6 +597,10 @@ fn apply_delta(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -
             }
             Ok(())
         }
+        // Op 2 = Long Delta (4-byte data words), op 3 = Short Delta
+        // (2-byte data words). Same group grammar otherwise (§2.2.1).
+        2 => apply_op23(planar, delta, bmhd, true),
+        3 => apply_op23(planar, delta, bmhd, false),
         5 => apply_op5(planar, delta, bmhd),
         7 => {
             // Op 7 honours bit 0 of ANHD.bits: 0 = short data (2 B),
@@ -589,7 +609,7 @@ fn apply_delta(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -
             apply_op7(planar, delta, bmhd, long_data)
         }
         other => Err(Error::unsupported(format!(
-            "ANIM: ANHD operation {other} not implemented (only 0, 5 and 7 supported)"
+            "ANIM: ANHD operation {other} not implemented (only 0, 2, 3, 5 and 7 supported)"
         ))),
     }
 }
@@ -857,6 +877,151 @@ pub fn apply_op7_for_test(
     long_data: bool,
 ) -> Result<()> {
     apply_op7(planar, delta, bmhd, long_data)
+}
+
+/// Op 2 / Op 3 — Long / Short Delta mode (spec §1.2.2 / §1.2.3; wire
+/// format §2.2.1, "Format for methods 2 & 3").
+///
+/// The DLTA payload starts with 8 big-endian u32 pointers, one per
+/// bitplane slot; each is a byte offset into the DLTA at which that
+/// plane's group list starts ("the pointer for the plane data starting
+/// immediately following these 8 pointers will have a value of 32").
+/// A zero pointer means "no changed words in this plane".
+///
+/// Per plane the payload is a list of *groups*. Offsets and counts
+/// are big-endian shorts in both modes; the data words are big-endian
+/// longs in Long Delta mode (`long_data = true`, op 2) and shorts in
+/// Short Delta mode (`long_data = false`, op 3). The bitplane is
+/// addressed as the contiguous word array it occupies in Amiga memory
+/// (`height * row_bytes` bytes) — for op 2 a long word may straddle a
+/// row boundary when `row_bytes` is not a multiple of 4, so we
+/// gather each plane into a contiguous buffer, apply the groups, and
+/// scatter the rows back.
+///
+/// Group grammar (§2.2.1): a word cursor starts out pointing at the
+/// first word of the bitplane. Each group opens with an offset short:
+///
+/// * `0xFFFF` — terminates the plane's group list.
+/// * positive (sign bit clear) — "it indicates the increment in long
+///   or short words through the bitplane": the offset is added to the
+///   cursor and the following data word is placed at that position.
+/// * negative (sign bit set) — "the absolute value is the offset+2",
+///   i.e. the cursor advances by `abs - 2`; the following short gives
+///   the number of contiguous data words that follow, which are
+///   placed in contiguous word locations starting at the cursor.
+///
+/// The spec describes the cursor as the pointer the data word "would
+/// be placed at"; we keep it pointing at the *last written word* after
+/// every group (for a run, the run's final word), and subsequent
+/// offsets accumulate from there. The in-tree encoder
+/// ([`encode_op23_body`]) emits offsets under the same convention.
+fn apply_op23(planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd, long_data: bool) -> Result<()> {
+    let n_planes = bmhd.n_planes as usize;
+    let has_mask = bmhd.masking == Masking::HasMask;
+    let planes_per_row = n_planes + has_mask as usize;
+    let row_bytes = bmhd.row_bytes();
+    let height = bmhd.height as usize;
+    let word_size = if long_data { 4 } else { 2 };
+
+    // Pointer table: 8 u32 BE pointers (max 8 colour planes).
+    if delta.len() < 32 {
+        return Err(Error::invalid("ANIM op 2/3: pointer table truncated"));
+    }
+    let read_u16 = |at: usize| -> Result<u16> {
+        if at + 2 > delta.len() {
+            return Err(Error::invalid("ANIM op 2/3: group list truncated"));
+        }
+        Ok(u16::from_be_bytes([delta[at], delta[at + 1]]))
+    };
+
+    for p in 0..n_planes.min(8) {
+        let off = u32::from_be_bytes([
+            delta[p * 4],
+            delta[p * 4 + 1],
+            delta[p * 4 + 2],
+            delta[p * 4 + 3],
+        ]) as usize;
+        if off == 0 {
+            continue; // plane unchanged
+        }
+        if off >= delta.len() {
+            return Err(Error::invalid("ANIM op 2/3: plane pointer out of range"));
+        }
+
+        // Gather the plane into the contiguous byte buffer the word
+        // offsets index into.
+        let mut buf = Vec::with_capacity(height * row_bytes);
+        for y in 0..height {
+            buf.extend_from_slice(&planar[y * planes_per_row + p]);
+        }
+        let word_count = buf.len() / word_size;
+
+        let mut cur = off; // byte cursor inside the DLTA payload
+        let mut wcursor: usize = 0; // word cursor inside the bitplane
+        loop {
+            let offset_word = read_u16(cur)?;
+            cur += 2;
+            if offset_word == 0xFFFF {
+                break; // plane terminator
+            }
+            if offset_word & 0x8000 == 0 {
+                // Positive offset: advance, then place ONE data word.
+                wcursor += offset_word as usize;
+                if wcursor >= word_count {
+                    return Err(Error::invalid("ANIM op 2/3: word offset past plane end"));
+                }
+                if cur + word_size > delta.len() {
+                    return Err(Error::invalid("ANIM op 2/3: data word truncated"));
+                }
+                buf[wcursor * word_size..(wcursor + 1) * word_size]
+                    .copy_from_slice(&delta[cur..cur + word_size]);
+                cur += word_size;
+            } else {
+                // Negative offset: abs = offset + 2, then a count
+                // short, then `count` contiguous data words.
+                let abs = 0x1_0000 - offset_word as usize; // 2..=0x8000
+                let advance = abs - 2;
+                wcursor += advance;
+                let count = read_u16(cur)? as usize;
+                cur += 2;
+                if count == 0 {
+                    return Err(Error::invalid("ANIM op 2/3: zero-length data run"));
+                }
+                if wcursor + count > word_count {
+                    return Err(Error::invalid("ANIM op 2/3: data run past plane end"));
+                }
+                if cur + count * word_size > delta.len() {
+                    return Err(Error::invalid("ANIM op 2/3: data run truncated"));
+                }
+                buf[wcursor * word_size..(wcursor + count) * word_size]
+                    .copy_from_slice(&delta[cur..cur + count * word_size]);
+                cur += count * word_size;
+                // Leave the cursor on the run's last written word so
+                // the next group's offset accumulates from there.
+                wcursor += count - 1;
+            }
+        }
+
+        // Scatter the contiguous buffer back into the per-row planar
+        // state.
+        for y in 0..height {
+            planar[y * planes_per_row + p]
+                .copy_from_slice(&buf[y * row_bytes..(y + 1) * row_bytes]);
+        }
+    }
+    Ok(())
+}
+
+/// Test-only re-export of [`apply_op23`] so integration tests can
+/// drive the op-2/3 decoder without rebuilding a full ANIM container.
+#[doc(hidden)]
+pub fn apply_op23_for_test(
+    planar: &mut [Vec<u8>],
+    delta: &[u8],
+    bmhd: &Bmhd,
+    long_data: bool,
+) -> Result<()> {
+    apply_op23(planar, delta, bmhd, long_data)
 }
 
 /// Encode a single op-5 (Byte Vertical Delta) BODY payload from a
@@ -1487,6 +1652,240 @@ pub fn encode_anim_op7(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
         };
         let anhd_bytes = anhd.write(dlta.len() as u32);
         // Inner FORM ILBM size = 4 ("ILBM") + 8+40 (ANHD) + 8 + dlta.
+        let inner_size = (4 + 8 + 40 + 8 + dlta.len()) as u32;
+        out.extend_from_slice(b"FORM");
+        out.extend_from_slice(&inner_size.to_be_bytes());
+        out.extend_from_slice(b"ILBM");
+        out.extend_from_slice(b"ANHD");
+        out.extend_from_slice(&40u32.to_be_bytes());
+        out.extend_from_slice(&anhd_bytes);
+        out.extend_from_slice(b"DLTA");
+        out.extend_from_slice(&(dlta.len() as u32).to_be_bytes());
+        out.extend_from_slice(&dlta);
+        if dlta.len() & 1 == 1 {
+            out.push(0);
+        }
+        prev_planar = cur_planar;
+    }
+
+    let form_size = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&form_size.to_be_bytes());
+    Ok(out)
+}
+
+/// Encode a single op-2 / op-3 (Long / Short Delta mode) DLTA payload
+/// from a previous and current planar frame.
+///
+/// `prev_planar` and `cur_planar` are the row-major flat arrays of
+/// bitplane rows in IFF order (`planes_per_row = n_planes +
+/// mask_plane`), each row being `row_bytes` long — the same shape the
+/// decoder ([`apply_op23_for_test`]) operates on.
+///
+/// `long_data` selects the data-word width: `true` = Long Delta mode
+/// (op 2, 4-byte data words) and `false` = Short Delta mode (op 3,
+/// 2-byte data words). Offsets and counts are big-endian shorts in
+/// both modes. The bitplane is addressed as one contiguous word
+/// array (`height * row_bytes` bytes), so for op 2 data words may
+/// straddle row boundaries; the total plane byte count MUST divide
+/// evenly by the word width or the trailing bytes would be
+/// unaddressable — mismatches are rejected as [`Error::Unsupported`].
+///
+/// The output is the DLTA chunk body per §2.2.1: a 32-byte pointer
+/// table (8 × u32 BE, one per bitplane; `0` = plane unchanged)
+/// followed by per-plane group lists. Per changed word run the
+/// encoder emits either a positive-offset group (offset short + one
+/// data word) for an isolated change, or a negative-offset group
+/// (offset short with `abs = offset + 2`, count short, `count`
+/// contiguous data words) for runs of ≥ 2 changed words — §1.2.2 ¶
+/// "Strings of 2 or more long-words in a row which change can be run
+/// together so offsets do not have to be saved for each one". Each
+/// plane's list ends with the `0xFFFF` terminator. Gaps wider than a
+/// positive short can express are bridged by rewriting an unchanged
+/// word (a semantic no-op costing one group).
+///
+/// Used by [`encode_anim_op2`] / [`encode_anim_op3`] but exposed
+/// publicly so callers driving the lower-level container can build
+/// their own ANIM2 / ANIM3 streams.
+pub fn encode_op23_body(
+    prev_planar: &[Vec<u8>],
+    cur_planar: &[Vec<u8>],
+    bmhd: &Bmhd,
+    long_data: bool,
+) -> Result<Vec<u8>> {
+    let n_planes = bmhd.n_planes as usize;
+    let has_mask = bmhd.masking == Masking::HasMask;
+    let planes_per_row = n_planes + has_mask as usize;
+    let row_bytes = bmhd.row_bytes();
+    let height = bmhd.height as usize;
+    let word_size = if long_data { 4 } else { 2 };
+    let expected = height * planes_per_row;
+    if prev_planar.len() != expected || cur_planar.len() != expected {
+        return Err(Error::invalid(format!(
+            "ANIM op 2/3 encode: planar buffers have {} / {} rows, expected {expected}",
+            prev_planar.len(),
+            cur_planar.len()
+        )));
+    }
+    if n_planes > 8 {
+        // The §2.2.1 pointer table has 8 slots (one u32 per colour
+        // plane); deeper formats can't be addressed by ops 2/3.
+        return Err(Error::unsupported(format!(
+            "ANIM op 2/3 encode: requires ≤ 8 colour planes (got {n_planes})"
+        )));
+    }
+    let plane_bytes = height * row_bytes;
+    if plane_bytes % word_size != 0 {
+        return Err(Error::unsupported(format!(
+            "ANIM op 2/3 encode: plane size {plane_bytes} not a multiple of word size {word_size}"
+        )));
+    }
+    let word_count = plane_bytes / word_size;
+
+    let mut out = vec![0u8; 32];
+    for p in 0..n_planes {
+        // Gather both frames' plane `p` into contiguous buffers so
+        // word offsets address the same flat array the decoder uses.
+        let mut prev_buf = Vec::with_capacity(plane_bytes);
+        let mut cur_buf = Vec::with_capacity(plane_bytes);
+        for y in 0..height {
+            prev_buf.extend_from_slice(&prev_planar[y * planes_per_row + p]);
+            cur_buf.extend_from_slice(&cur_planar[y * planes_per_row + p]);
+        }
+        fn word_at(buf: &[u8], w: usize, word_size: usize) -> &[u8] {
+            &buf[w * word_size..(w + 1) * word_size]
+        }
+
+        let mut list: Vec<u8> = Vec::new();
+        let mut wcursor: usize = 0; // last written word (starts at word 0)
+        let mut any_change = false;
+        let mut i = 0usize;
+        while i < word_count {
+            if word_at(&prev_buf, i, word_size) == word_at(&cur_buf, i, word_size) {
+                i += 1;
+                continue;
+            }
+            // Contiguous run of changed words [i, end).
+            let mut end = i + 1;
+            while end < word_count
+                && word_at(&prev_buf, end, word_size) != word_at(&cur_buf, end, word_size)
+            {
+                end += 1;
+            }
+            // Bridge gaps a positive offset short can't express by
+            // rewriting an unchanged word in place (cur == prev
+            // there, so the write is a no-op on the plane state).
+            while i - wcursor > 0x7FFF {
+                wcursor += 0x7FFF;
+                list.extend_from_slice(&0x7FFFu16.to_be_bytes());
+                list.extend_from_slice(word_at(&cur_buf, wcursor, word_size));
+            }
+            while i < end {
+                let run = end - i;
+                // Offset is ≤ 0x7FFF after bridging. A run group's
+                // offset must satisfy `abs = offset + 2 ≤ 0x8000`
+                // (0xFFFF is the terminator); offset 0x7FFF would
+                // overflow that, so fall back to a single-word group
+                // for the run's first word.
+                let offset = i - wcursor;
+                if run >= 2 && offset <= 0x7FFE {
+                    let count = run.min(0xFFFF);
+                    let encoded = (0x1_0000 - (offset + 2)) as u16;
+                    list.extend_from_slice(&encoded.to_be_bytes());
+                    list.extend_from_slice(&(count as u16).to_be_bytes());
+                    for w in i..i + count {
+                        list.extend_from_slice(word_at(&cur_buf, w, word_size));
+                    }
+                    wcursor = i + count - 1;
+                    i += count;
+                } else {
+                    list.extend_from_slice(&(offset as u16).to_be_bytes());
+                    list.extend_from_slice(word_at(&cur_buf, i, word_size));
+                    wcursor = i;
+                    i += 1;
+                }
+            }
+            any_change = true;
+        }
+        if any_change {
+            list.extend_from_slice(&0xFFFFu16.to_be_bytes());
+            let offset = out.len() as u32;
+            out[p * 4..p * 4 + 4].copy_from_slice(&offset.to_be_bytes());
+            out.extend_from_slice(&list);
+        }
+        // Unchanged plane: pointer slot stays 0 per §2.2.1 ¶ "If there
+        // are no changed words in a given plane, then the pointer in
+        // the first 32 bytes of the chunk is =0".
+    }
+    Ok(out)
+}
+
+/// Encode a sequence of ILBM frames as a FORM/ANIM file using
+/// `operation = 2` (Long Delta mode — 4-byte data words) for every
+/// delta frame. See [`encode_op23_body`] for the payload layout.
+///
+/// Compatible with the in-tree [`parse_anim`] op-2 decoder; tested
+/// via `tests/anim_op23.rs`.
+pub fn encode_anim_op2(frames: &[IlbmImage]) -> Result<Vec<u8>> {
+    encode_anim_op23(frames, true)
+}
+
+/// Encode a sequence of ILBM frames as a FORM/ANIM file using
+/// `operation = 3` (Short Delta mode — 2-byte data words) for every
+/// delta frame. See [`encode_op23_body`] for the payload layout.
+///
+/// Compatible with the in-tree [`parse_anim`] op-3 decoder; tested
+/// via `tests/anim_op23.rs`.
+pub fn encode_anim_op3(frames: &[IlbmImage]) -> Result<Vec<u8>> {
+    encode_anim_op23(frames, false)
+}
+
+/// Shared op-2 / op-3 container assembly: a leading full FORM ILBM
+/// seed frame followed by ANHD + DLTA delta frames, mirroring the
+/// op-5 / op-7 encoders' shape. `ANHD.bits` stays 0 — the spec
+/// defines option bits for methods 4 and 5 only and recommends zero
+/// elsewhere.
+fn encode_anim_op23(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>> {
+    let operation = if long_data { 2 } else { 3 };
+    if frames.is_empty() {
+        return Err(Error::invalid(format!(
+            "ANIM op {operation} encode: at least one frame required"
+        )));
+    }
+    if frames[0].bmhd.n_planes > 8 {
+        return Err(Error::unsupported(format!(
+            "ANIM op {operation} encode: requires ≤ 8 colour planes (got {})",
+            frames[0].bmhd.n_planes
+        )));
+    }
+    let leading = crate::ilbm::encode_ilbm(&frames[0])?;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"FORM");
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(b"ANIM");
+    out.extend_from_slice(&leading);
+    if leading.len() & 1 == 1 {
+        out.push(0);
+    }
+
+    let mut prev_planar = rgba_to_planar(&frames[0]);
+
+    for frame in &frames[1..] {
+        let cur_planar = rgba_to_planar(frame);
+        let dlta = encode_op23_body(&prev_planar, &cur_planar, &frame.bmhd, long_data)?;
+        let anhd = Anhd {
+            operation,
+            mask: 0,
+            w: frame.bmhd.width,
+            h: frame.bmhd.height,
+            x: frame.bmhd.x_origin,
+            y: frame.bmhd.y_origin,
+            abs_time: 0,
+            rel_time: 1,
+            interleave: 0,
+            pad0: 0,
+            bits: 0,
+        };
+        let anhd_bytes = anhd.write(dlta.len() as u32);
         let inner_size = (4 + 8 + 40 + 8 + dlta.len()) as u32;
         out.extend_from_slice(b"FORM");
         out.extend_from_slice(&inner_size.to_be_bytes());
