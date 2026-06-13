@@ -319,7 +319,7 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
 | Op 1 — XOR ILBM mode                     |  N   |   N   |
 | Op 2 — Long Delta mode                   |  Y   |   Y   |
 | Op 3 — Short Delta mode                  |  Y   |   Y   |
-| Op 4 — Generalized short/long Delta      |  N   |   N   |
+| Op 4 — Generalized short/long Delta      |  Y   |   Y   |
 | Op 5 — Byte Vertical Delta (DPaint III)  |  Y   |   Y   |
 | Op 7 — Short / Long Vertical Delta       |  Y   |   Y   |
 | Op 8 — Short / Long Vertical Delta (32b) |  N   |   N   |
@@ -327,6 +327,7 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
 - Public API: [`anim::parse_anim`], [`anim::encode_anim_op0`],
   [`anim::encode_anim_op2`], [`anim::encode_anim_op3`],
   [`anim::encode_op23_body`],
+  [`anim::encode_anim_op4`], [`anim::encode_op4_body`],
   [`anim::encode_anim_op5`], [`anim::encode_op5_body`],
   [`anim::encode_anim_op7`], [`anim::encode_op7_body`],
   [`anim::AnimImage`], [`anim::Anhd`].
@@ -368,8 +369,26 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
   encoder and decoder share that reading. The encoder collapses runs
   of ≥ 2 changed words into one negative-offset group per §1.2.2 and
   bridges gaps wider than a positive short by rewriting an unchanged
-  word in place. Op-1 (XOR), op-4 (Generalized Delta) and op-8 are
-  open follow-ups.
+  word in place.
+- Op-4 (Generalized short/long Delta) follows the §2.2.2
+  `SetDLTAshort` reference routine. The DLTA opens with 16 big-endian
+  u32 pointers — 8 data-list pointers then 8 op-list pointers — and,
+  crucially, those pointers (and the per-op column offsets) are
+  measured in **16-bit words**, not bytes (the routine does `WORD*`
+  arithmetic `data = deltaword + deltadata[i]`, `dest = planeptr +
+  *ptr`), unlike ops 5/7 whose pointers are byte offsets. Each plane's
+  op list is a flat run of `(offset, size)` pairs terminated by
+  `0xFFFF`: `offset` is the *absolute* word position of the run's first
+  row (each op restarts from its own offset, non-cumulative), `size > 0`
+  is a Uniq run of `size` per-row data words, `size < 0` is a Same run
+  writing one data word to `|size|` rows; descending a column steps the
+  dest by `nw = row_bytes / word_size` words per row. `ANHD.bits`
+  selects the variant — bit 0 short/long data, bit 2 separate-vs-shared
+  info list (both supported), bit 5 short/long op offsets; the decoder
+  rejects the XOR (bit 1) and horizontal (bit 4 clear) variants the
+  spec gives no separate wire description for, plus any reserved high
+  bit per §2.1 "Player code should check undefined bits … to assure
+  they are zero". Op-1 (XOR) and op-8 are open follow-ups.
 
 #### Read an ILBM picture
 
@@ -626,13 +645,16 @@ variants) and extends the container walker to accept the `DLTA`
 chunk id alongside `BODY` so all delta streams decode through the
 same path. r276 lands **op-2 / op-3 (Long / Short Delta mode)**
 decode + encode from the spec's §1.2.2 / §1.2.3 / §2.2.1 — see the
-ANIM section above. Remaining ANIM gaps: op-1 (XOR ILBM) and op-4
-(Generalized Delta) are documented in the staged spec and are
-natural next increments; op-8 and DEEP / TVPP / RGB8 / RGBN
-true-colour IFF chunks remain blocked on docs — none has a spec
-section staged in `docs/image/iff/` (the only ANIM appendix
-present covers op-7, and op-8 is name-dropped without a wire
-format).
+ANIM section above. r287 lands **op-4 (Generalized short/long
+Delta mode)** decode + encode from §1.2.4 / §2.2.2 (the
+`SetDLTAshort` reference routine — word-unit pointers, absolute
+`(offset, size)` op pairs, Same/Uniq run classes, `ANHD.bits`
+variant selection). Remaining ANIM gaps: op-1 (XOR ILBM) is
+documented in the staged spec (§1.2.1 / §1.3) and is the natural
+next increment; op-8 and DEEP / TVPP / RGB8 / RGBN true-colour IFF
+chunks remain blocked on docs — none has a spec section staged in
+`docs/image/iff/` (the only ANIM appendix present covers op-7, and
+op-8 is name-dropped without a wire format).
 
 AIFF-side r209 surfaces the previously-skipped optional chunks
 end-to-end: **COMT** (timestamped comments, optional `MarkerId`

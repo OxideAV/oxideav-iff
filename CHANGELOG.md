@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ANIM op-4 (Generalized short/long Delta mode) decode + encode**
+  (spec §1.2.4, wire format §2.2.2). Implemented from the §2.2.2
+  `SetDLTAshort` reference routine, the only normative description of
+  the op-4 wire format. The DLTA opens with 16 big-endian u32
+  pointers — 8 data-list pointers then 8 op-list pointers — and these
+  pointers (plus the per-op column offsets) are measured in **16-bit
+  words**, not bytes, because the reference routine performs `WORD*`
+  pointer arithmetic (`data = deltaword + deltadata[i]`, `dest =
+  planeptr + *ptr`); this is the key behavioural difference from the
+  byte-offset ops 5 / 7. Each plane's op list is a flat run of
+  `(offset, size)` pairs terminated by `0xFFFF`: `offset` is the
+  *absolute* word position where the run begins (non-cumulative),
+  `size > 0` copies `size` data words one-per-row (Uniq) and
+  `size < 0` copies one data word to `|size|` rows (Same), with the
+  dest stepping `nw = row_bytes / word_size` words per row down each
+  vertical column. `ANHD.bits` selects the variant — bit 0
+  short/long data, bit 2 separate-vs-shared info list (both
+  supported), bit 5 short/long op offsets — while the XOR (bit 1) and
+  horizontal (bit 4 clear) variants and any reserved high bit are
+  rejected with `Error::Unsupported` since the spec gives them no
+  separate wire format (§2.1 directs players to verify undefined bits
+  are zero). `parse_anim` / the `iff_anim` demuxer now accept
+  `ANHD.operation = 4`; the write-side surface is
+  [`anim::encode_anim_op4`] (container-level) plus the lower-level
+  [`anim::encode_op4_body`], both emitting the short/long-data,
+  vertical, RLC, separate-info, non-XOR configuration the reference
+  routine reads. Covered by `tests/anim_op4.rs` (10 tests:
+  hand-built Same / Uniq decode in short + long data modes, word-unit
+  pointer semantics, shared-info-list, unsupported-variant rejection,
+  and encode→decode + full-container round-trips).
 - **ANIM op-2 / op-3 (Long / Short Delta mode) decode + encode**
   (spec §1.2.2 / §1.2.3, wire format §2.2.1). The DLTA opens with 8
   big-endian u32 plane pointers (`0` = plane unchanged; the §2.2.1

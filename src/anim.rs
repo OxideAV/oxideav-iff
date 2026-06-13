@@ -601,6 +601,11 @@ fn apply_delta(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -
         // (2-byte data words). Same group grammar otherwise (§2.2.1).
         2 => apply_op23(planar, delta, bmhd, true),
         3 => apply_op23(planar, delta, bmhd, false),
+        // Op 4 = Generalized short/long Delta (§2.2.2). The §2.2.2
+        // `SetDLTAshort` reference routine documents the
+        // short-data / vertical / RLC / separate-info / non-XOR
+        // configuration; `ANHD.bits` selects the variant.
+        4 => apply_op4(anhd, planar, delta, bmhd),
         5 => apply_op5(planar, delta, bmhd),
         7 => {
             // Op 7 honours bit 0 of ANHD.bits: 0 = short data (2 B),
@@ -609,7 +614,7 @@ fn apply_delta(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -
             apply_op7(planar, delta, bmhd, long_data)
         }
         other => Err(Error::unsupported(format!(
-            "ANIM: ANHD operation {other} not implemented (only 0, 2, 3, 5 and 7 supported)"
+            "ANIM: ANHD operation {other} not implemented (only 0, 2, 3, 4, 5 and 7 supported)"
         ))),
     }
 }
@@ -877,6 +882,285 @@ pub fn apply_op7_for_test(
     long_data: bool,
 ) -> Result<()> {
     apply_op7(planar, delta, bmhd, long_data)
+}
+
+/// The subset of `ANHD.bits` options op-4 (Generalized Delta) accepts.
+///
+/// The §2.2.2 `SetDLTAshort` reference routine is the only normative
+/// description of the op-4 wire format, and it documents one
+/// configuration: short-word data, vertical columns, run-length-coded,
+/// separate info list per plane, non-XOR. The `bits` field
+/// (`docs/image/iff/anim.txt` §2.1) flags every option:
+///
+/// ```text
+/// bit #        set =0                       set =1
+/// 0            short data                   long data
+/// 1            (non-XOR)                    XOR
+/// 2            separate info per plane      one info list for all planes
+/// 3            not RLC                      RLC (run length coded)
+/// 4            horizontal                   vertical
+/// 5            short info offsets           long info offsets
+/// ```
+///
+/// We support the variants the reference routine covers directly:
+/// `bit0` chooses the data-word width (short 2 B / long 4 B), `bit2`
+/// chooses whether each plane has its own info list or all planes
+/// share one, `bit3` must be set (RLC — the only documented op
+/// grammar), and `bit4` must be set (vertical — the routine's `nw`
+/// column stride; the spec notes horizontal "simply set[s] nw=1" but
+/// gives no separate wire description so we don't guess). XOR mode
+/// (`bit1`) has no documented data-merge semantics in this spec and is
+/// rejected.
+#[derive(Clone, Copy, Debug)]
+struct Op4Options {
+    long_data: bool,
+    /// `bit5`: info-list offsets within the op stream are long (4 B)
+    /// rather than short (2 B). The §2.2.2 routine reads `*ptr` as a
+    /// `WORD` (short offsets); this flag widens that read.
+    long_offsets: bool,
+}
+
+impl Op4Options {
+    /// Decode the `bits` word into the supported-option set, rejecting
+    /// the configurations the §2.2.2 reference routine does not
+    /// describe.
+    fn from_bits(bits: u32) -> Result<Self> {
+        let long_data = (bits & 0b0000_0001) != 0;
+        let xor = (bits & 0b0000_0010) != 0;
+        let shared_info = (bits & 0b0000_0100) != 0;
+        let rlc = (bits & 0b0000_1000) != 0;
+        let vertical = (bits & 0b0001_0000) != 0;
+        let long_offsets = (bits & 0b0010_0000) != 0;
+        // Bits 6..=31 are reserved "set =0" per §2.1; a player should
+        // "check undefined bits in options 4 and 5 to assure they are
+        // zero". Honour that.
+        if bits & !0b0011_1111 != 0 {
+            return Err(Error::unsupported(format!(
+                "ANIM op 4: reserved ANHD.bits set (0x{bits:08X}); spec requires bits 6..=31 = 0"
+            )));
+        }
+        if xor {
+            return Err(Error::unsupported(
+                "ANIM op 4: XOR mode (ANHD.bits bit 1) has no documented data-merge wire format",
+            ));
+        }
+        if !rlc {
+            return Err(Error::unsupported(
+                "ANIM op 4: non-RLC mode (ANHD.bits bit 3 clear) has no documented op grammar",
+            ));
+        }
+        if !vertical {
+            return Err(Error::unsupported(
+                "ANIM op 4: horizontal mode (ANHD.bits bit 4 clear) has no separate documented wire format",
+            ));
+        }
+        let _ = shared_info; // both shared and separate handled below
+        Ok(Self {
+            long_data,
+            long_offsets,
+        })
+    }
+}
+
+/// Op 4 — Generalized short/long Delta mode (§1.2.4; wire format
+/// §2.2.2, "Format for method 4").
+///
+/// The DLTA payload opens with 16 big-endian u32 pointers: 8 *data*
+/// list pointers (one per plane) followed by 8 *offset/numbers* (op)
+/// list pointers. Per the §2.2.2 reference routine `SetDLTAshort`,
+/// these pointers — and the per-op column offsets inside the op
+/// lists — are measured in **16-bit words** (the routine does
+/// `WORD*`-pointer arithmetic: `data = deltaword + deltadata[i]`,
+/// `dest = planeptr + *ptr`), NOT in bytes as ops 5/7 do.
+///
+/// For each plane `p` whose op-list pointer is non-zero the op list is
+/// a flat sequence of `(offset, size)` pairs terminated by an offset
+/// word equal to `0xFFFF`:
+///
+/// * `offset` (UWORD) — the **absolute** word position within the
+///   plane where this op's vertical run begins (`dest = planeptr +
+///   offset`). Each op restarts from its own absolute offset; offsets
+///   are not cumulative.
+/// * `size` (WORD, signed):
+///   * `size > 0` — copy `size` data words from the data list, one per
+///     consecutive row (`*dest = *data++; dest += nw`), advancing the
+///     dest pointer by `nw = row_bytes / word_size` words per row.
+///   * `size < 0` — copy ONE data word to `|size|` consecutive rows
+///     (`*dest = *data` repeated; `data++` once afterwards). This is
+///     the run-length "Same" op.
+///
+/// `nw` is the vertical column stride in words. When `row_bytes` is not
+/// a multiple of the word size the plane has trailing bytes the word
+/// stride can't address; we reject that as [`Error::invalid`] (the
+/// reference routine implicitly assumes `BytesPerRow` is even/quad).
+///
+/// `opts` carries the `ANHD.bits` decode: `long_data` widens the data
+/// word to 4 bytes; `long_offsets` widens the in-op `offset`/`size`
+/// fields to 4 bytes (`bit5`). The plane-pointer table is always
+/// 16 × u32. When `bit2` (shared info list) is set the same op-list
+/// pointer is simply repeated across plane slots, which this routine
+/// handles transparently since it dereferences each slot independently.
+fn apply_op4(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -> Result<()> {
+    let opts = Op4Options::from_bits(anhd.bits)?;
+    let n_planes = bmhd.n_planes as usize;
+    let has_mask = bmhd.masking == Masking::HasMask;
+    let planes_per_row = n_planes + has_mask as usize;
+    let row_bytes = bmhd.row_bytes();
+    let height = bmhd.height as usize;
+    let word_size = if opts.long_data { 4 } else { 2 };
+    let off_size = if opts.long_offsets { 4 } else { 2 };
+
+    if row_bytes % word_size != 0 {
+        return Err(Error::invalid(format!(
+            "ANIM op 4: row_bytes {row_bytes} not a multiple of data-word size {word_size}"
+        )));
+    }
+    // Vertical column stride in words (`nw` in the §2.2.2 routine).
+    let nw = row_bytes / word_size;
+    let words_per_plane = height * nw;
+
+    // 16 big-endian u32 pointers — data lists then op (offset/number)
+    // lists. Per the §2.2.2 routine the pointer value is a *word*
+    // offset from the DLTA start.
+    if delta.len() < 64 {
+        return Err(Error::invalid("ANIM op 4: pointer table truncated"));
+    }
+    let read_ptr = |slot: usize| -> usize {
+        u32::from_be_bytes([
+            delta[slot * 4],
+            delta[slot * 4 + 1],
+            delta[slot * 4 + 2],
+            delta[slot * 4 + 3],
+        ]) as usize
+    };
+    // Read an `off_size`-byte big-endian field at byte position `at`.
+    let read_off = |at: usize| -> Result<u32> {
+        if at + off_size > delta.len() {
+            return Err(Error::invalid("ANIM op 4: op list truncated"));
+        }
+        Ok(match off_size {
+            2 => u16::from_be_bytes([delta[at], delta[at + 1]]) as u32,
+            _ => u32::from_be_bytes([delta[at], delta[at + 1], delta[at + 2], delta[at + 3]]),
+        })
+    };
+    // The op-list terminator is the all-ones offset word at the active
+    // offset width (0xFFFF for short, 0xFFFF_FFFF for long).
+    let term: u32 = if opts.long_offsets {
+        0xFFFF_FFFF
+    } else {
+        0xFFFF
+    };
+    // The §2.2.2 routine reads `size` as a signed WORD; sign-extend the
+    // `off_size`-wide field.
+    let sign_extend = |v: u32| -> i64 {
+        if opts.long_offsets {
+            v as i32 as i64
+        } else {
+            v as u16 as i16 as i64
+        }
+    };
+
+    for p in 0..n_planes.min(8) {
+        // Slots 0..=7 are the data-list pointers; 8..=15 the op-list
+        // pointers (§2.2.2 ¶ "The first 8 are as before … The next 8
+        // are pointers to the start of the offset/numbers data list").
+        let data_word_ptr = read_ptr(p);
+        let op_word_ptr = read_ptr(8 + p);
+        if op_word_ptr == 0 {
+            continue; // plane unchanged
+        }
+        // Word offsets → byte offsets.
+        let data_byte0 = data_word_ptr
+            .checked_mul(2)
+            .ok_or_else(|| Error::invalid("ANIM op 4: data pointer overflow"))?;
+        let op_byte0 = op_word_ptr
+            .checked_mul(2)
+            .ok_or_else(|| Error::invalid("ANIM op 4: op pointer overflow"))?;
+        if data_byte0 > delta.len() || op_byte0 >= delta.len() {
+            return Err(Error::invalid("ANIM op 4: list pointer out of range"));
+        }
+
+        // Gather the plane into a contiguous word buffer the absolute
+        // word offsets index into, mirroring the op-2/3 decoder's
+        // gather/scatter.
+        let mut buf = Vec::with_capacity(height * row_bytes);
+        for y in 0..height {
+            buf.extend_from_slice(&planar[y * planes_per_row + p]);
+        }
+
+        let mut op_cur = op_byte0;
+        let mut data_cur = data_byte0;
+        loop {
+            let offset = read_off(op_cur)?;
+            op_cur += off_size;
+            if offset == term {
+                break;
+            }
+            let size_raw = read_off(op_cur)?;
+            op_cur += off_size;
+            let size = sign_extend(size_raw);
+
+            // `dest = planeptr + offset` — absolute word position.
+            let start_word = offset as usize;
+            if size < 0 {
+                // Same op: one data word → |size| consecutive rows.
+                let rows = (-size) as usize;
+                if data_cur + word_size > delta.len() {
+                    return Err(Error::invalid("ANIM op 4: Same op data word truncated"));
+                }
+                let item = &delta[data_cur..data_cur + word_size];
+                data_cur += word_size;
+                for r in 0..rows {
+                    let w = start_word + r * nw;
+                    if w >= words_per_plane {
+                        return Err(Error::invalid("ANIM op 4: Same op writes past plane end"));
+                    }
+                    buf[w * word_size..(w + 1) * word_size].copy_from_slice(item);
+                }
+            } else {
+                // Uniq op: `size` data words, one per consecutive row.
+                let rows = size as usize;
+                if data_cur + rows * word_size > delta.len() {
+                    return Err(Error::invalid("ANIM op 4: Uniq op data words truncated"));
+                }
+                for r in 0..rows {
+                    let w = start_word + r * nw;
+                    if w >= words_per_plane {
+                        return Err(Error::invalid("ANIM op 4: Uniq op writes past plane end"));
+                    }
+                    let item_start = data_cur + r * word_size;
+                    buf[w * word_size..(w + 1) * word_size]
+                        .copy_from_slice(&delta[item_start..item_start + word_size]);
+                }
+                data_cur += rows * word_size;
+            }
+        }
+
+        // Scatter the contiguous buffer back into the planar rows.
+        for y in 0..height {
+            planar[y * planes_per_row + p]
+                .copy_from_slice(&buf[y * row_bytes..(y + 1) * row_bytes]);
+        }
+    }
+    Ok(())
+}
+
+/// Test-only re-export of [`apply_op4`] so integration tests can drive
+/// the op-4 decoder without rebuilding a full ANIM container. `bits`
+/// is the `ANHD.bits` option word the §2.2.2 routine keys off.
+#[doc(hidden)]
+pub fn apply_op4_for_test(
+    bits: u32,
+    planar: &mut [Vec<u8>],
+    delta: &[u8],
+    bmhd: &Bmhd,
+) -> Result<()> {
+    let anhd = Anhd {
+        operation: 4,
+        bits,
+        ..Anhd::default()
+    };
+    apply_op4(&anhd, planar, delta, bmhd)
 }
 
 /// Op 2 / Op 3 — Long / Short Delta mode (spec §1.2.2 / §1.2.3; wire
@@ -1652,6 +1936,300 @@ pub fn encode_anim_op7(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
         };
         let anhd_bytes = anhd.write(dlta.len() as u32);
         // Inner FORM ILBM size = 4 ("ILBM") + 8+40 (ANHD) + 8 + dlta.
+        let inner_size = (4 + 8 + 40 + 8 + dlta.len()) as u32;
+        out.extend_from_slice(b"FORM");
+        out.extend_from_slice(&inner_size.to_be_bytes());
+        out.extend_from_slice(b"ILBM");
+        out.extend_from_slice(b"ANHD");
+        out.extend_from_slice(&40u32.to_be_bytes());
+        out.extend_from_slice(&anhd_bytes);
+        out.extend_from_slice(b"DLTA");
+        out.extend_from_slice(&(dlta.len() as u32).to_be_bytes());
+        out.extend_from_slice(&dlta);
+        if dlta.len() & 1 == 1 {
+            out.push(0);
+        }
+        prev_planar = cur_planar;
+    }
+
+    let form_size = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&form_size.to_be_bytes());
+    Ok(out)
+}
+
+/// Encode a single op-4 (Generalized Delta mode) DLTA payload from a
+/// previous and current planar frame, in the short/long-data, vertical,
+/// RLC, separate-info-per-plane, non-XOR configuration the §2.2.2
+/// `SetDLTAshort` reference routine documents.
+///
+/// `prev_planar` and `cur_planar` are the row-major flat arrays of
+/// bitplane rows in IFF order (`planes_per_row = n_planes +
+/// mask_plane`), each row `row_bytes` long — the same shape
+/// [`apply_op4`] consumes. `long_data` selects the data-word width
+/// (`false` = short 2-byte words → `ANHD.bits` bit 0 clear, `true` =
+/// long 4-byte words → bit 0 set).
+///
+/// The output is the DLTA chunk body per §2.2.2: a 64-byte pointer
+/// table (16 × u32 BE — 8 data-list pointers then 8 op-list pointers,
+/// each a **word** offset from the DLTA start per the reference
+/// routine's `WORD*` arithmetic) followed by per-plane op lists and
+/// data lists. An unchanged plane gets `0` in both its op- and
+/// data-pointer slots.
+///
+/// Each plane's op list is a flat run of `(offset, size)` short pairs
+/// terminated by `0xFFFF`. `offset` is the absolute word position of
+/// the column run's first row; `size > 0` is a Uniq run of `size`
+/// per-row data words and `size < 0` is a Same run writing one data
+/// word to `|size|` rows. The encoder walks each vertical column
+/// (stride `nw = row_bytes / word_size`), splits it into changed runs,
+/// and within each run picks Same (one data word) for repeats of ≥ 2
+/// equal words and Uniq otherwise — the §2.2.2 routine's two op
+/// classes. Runs longer than a signed-short can express (`> 0x7FFF`
+/// rows) split into multiple ops at the same column.
+///
+/// This encoder always emits short (2-byte) op offsets (`ANHD.bits`
+/// bit 5 clear) and separate per-plane info lists (bit 2 clear), the
+/// configuration the reference routine reads. Compatible with the
+/// in-tree [`apply_op4`] decoder.
+pub fn encode_op4_body(
+    prev_planar: &[Vec<u8>],
+    cur_planar: &[Vec<u8>],
+    bmhd: &Bmhd,
+    long_data: bool,
+) -> Result<Vec<u8>> {
+    let n_planes = bmhd.n_planes as usize;
+    let has_mask = bmhd.masking == Masking::HasMask;
+    let planes_per_row = n_planes + has_mask as usize;
+    let row_bytes = bmhd.row_bytes();
+    let height = bmhd.height as usize;
+    let word_size = if long_data { 4 } else { 2 };
+    let expected = height * planes_per_row;
+    if prev_planar.len() != expected || cur_planar.len() != expected {
+        return Err(Error::invalid(format!(
+            "ANIM op 4 encode: planar buffers have {} / {} rows, expected {expected}",
+            prev_planar.len(),
+            cur_planar.len()
+        )));
+    }
+    if n_planes > 8 {
+        return Err(Error::unsupported(format!(
+            "ANIM op 4 encode: requires ≤ 8 colour planes (got {n_planes})"
+        )));
+    }
+    if row_bytes % word_size != 0 {
+        return Err(Error::unsupported(format!(
+            "ANIM op 4 encode: row_bytes {row_bytes} not a multiple of word size {word_size}"
+        )));
+    }
+    let nw = row_bytes / word_size; // words per row = vertical stride
+
+    fn word_at(row: &[u8], w: usize, word_size: usize) -> &[u8] {
+        &row[w * word_size..(w + 1) * word_size]
+    }
+
+    let mut plane_op: Vec<Vec<u8>> = vec![Vec::new(); 8];
+    let mut plane_data: Vec<Vec<u8>> = vec![Vec::new(); 8];
+    let mut plane_dirty = [false; 8];
+
+    for p in 0..n_planes {
+        let mut op_list: Vec<u8> = Vec::new();
+        let mut data_list: Vec<u8> = Vec::new();
+        let mut any_change = false;
+
+        // Walk vertical columns: column `c` is word index `c` within
+        // each row; descending the column adds `nw` to the absolute
+        // word position.
+        for c in 0..nw {
+            let mut row = 0usize;
+            while row < height {
+                let prev_w = word_at(&prev_planar[row * planes_per_row + p], c, word_size);
+                let cur_w = word_at(&cur_planar[row * planes_per_row + p], c, word_size);
+                if prev_w == cur_w {
+                    row += 1;
+                    continue;
+                }
+                // Changed run [row, end) in this column.
+                let mut end = row + 1;
+                while end < height {
+                    let pw = word_at(&prev_planar[end * planes_per_row + p], c, word_size);
+                    let cw = word_at(&cur_planar[end * planes_per_row + p], c, word_size);
+                    if pw == cw {
+                        break;
+                    }
+                    end += 1;
+                }
+                // Emit ops for the run, each anchored at its absolute
+                // word offset `c + r * nw`.
+                let mut r = row;
+                while r < end {
+                    let abs_word = c + r * nw;
+                    let v = word_at(&cur_planar[r * planes_per_row + p], c, word_size);
+                    // Maximal repeat of `v` from r.
+                    let mut rep_end = r + 1;
+                    while rep_end < end {
+                        let cand = word_at(&cur_planar[rep_end * planes_per_row + p], c, word_size);
+                        if cand != v {
+                            break;
+                        }
+                        rep_end += 1;
+                    }
+                    let rep_len = rep_end - r;
+                    if rep_len >= 2 {
+                        // Same op: split into ≤ 0x7FFF-row chunks (signed
+                        // short size field).
+                        let mut remaining = rep_len;
+                        let mut at = r;
+                        while remaining > 0 {
+                            let chunk = remaining.min(0x7FFF);
+                            let start_word = c + at * nw;
+                            op_list.extend_from_slice(&(start_word as u16).to_be_bytes());
+                            let size = -(chunk as i32) as i16;
+                            op_list.extend_from_slice(&size.to_be_bytes());
+                            data_list.extend_from_slice(word_at(
+                                &cur_planar[at * planes_per_row + p],
+                                c,
+                                word_size,
+                            ));
+                            at += chunk;
+                            remaining -= chunk;
+                        }
+                        let _ = abs_word;
+                        r = rep_end;
+                    } else {
+                        // Uniq run: extend until a 2-run appears or the
+                        // changed run ends, capped at 0x7FFF rows.
+                        let lit_start = r;
+                        let mut lit_end = r + 1;
+                        while lit_end < end && lit_end - lit_start < 0x7FFF {
+                            let lv =
+                                word_at(&cur_planar[lit_end * planes_per_row + p], c, word_size);
+                            let next = lit_end + 1 < end
+                                && word_at(
+                                    &cur_planar[(lit_end + 1) * planes_per_row + p],
+                                    c,
+                                    word_size,
+                                ) == lv;
+                            if next {
+                                break;
+                            }
+                            lit_end += 1;
+                        }
+                        let lit_len = lit_end - lit_start;
+                        let start_word = c + lit_start * nw;
+                        op_list.extend_from_slice(&(start_word as u16).to_be_bytes());
+                        op_list.extend_from_slice(&(lit_len as i16).to_be_bytes());
+                        for rr in lit_start..lit_end {
+                            data_list.extend_from_slice(word_at(
+                                &cur_planar[rr * planes_per_row + p],
+                                c,
+                                word_size,
+                            ));
+                        }
+                        r = lit_end;
+                    }
+                }
+                any_change = true;
+                row = end;
+            }
+        }
+        if any_change {
+            // Terminate the plane's op list with 0xFFFF.
+            op_list.extend_from_slice(&0xFFFFu16.to_be_bytes());
+            plane_op[p] = op_list;
+            plane_data[p] = data_list;
+            plane_dirty[p] = true;
+        }
+    }
+
+    // Assemble: 64-byte pointer table (8 data ptrs then 8 op ptrs) +
+    // per-plane op lists + per-plane data lists. Pointers are **word**
+    // offsets from the DLTA start per the §2.2.2 routine; the layout
+    // therefore starts on a word boundary (64 is even) and every list
+    // is appended at an even byte offset so the word offset is exact.
+    let mut out = vec![0u8; 64];
+
+    // Op lists first (so we can compute their offsets), recording the
+    // op-pointer slots (8..=15).
+    let mut op_word_offsets = [0u32; 8];
+    for (slot, list) in plane_op.iter_mut().enumerate().take(8) {
+        if !plane_dirty[slot] {
+            continue;
+        }
+        debug_assert!(out.len() % 2 == 0, "op list must start word-aligned");
+        op_word_offsets[slot] = (out.len() / 2) as u32;
+        out.append(list);
+    }
+    // Data lists next, recording the data-pointer slots (0..=7).
+    let mut data_word_offsets = [0u32; 8];
+    for (slot, list) in plane_data.iter_mut().enumerate().take(8) {
+        if !plane_dirty[slot] {
+            continue;
+        }
+        debug_assert!(out.len() % 2 == 0, "data list must start word-aligned");
+        data_word_offsets[slot] = (out.len() / 2) as u32;
+        out.append(list);
+    }
+    // Fill the pointer table: slots 0..=7 = data, 8..=15 = op.
+    for slot in 0..8 {
+        out[slot * 4..slot * 4 + 4].copy_from_slice(&data_word_offsets[slot].to_be_bytes());
+        out[(8 + slot) * 4..(8 + slot) * 4 + 4]
+            .copy_from_slice(&op_word_offsets[slot].to_be_bytes());
+    }
+    Ok(out)
+}
+
+/// Encode a sequence of ILBM frames as a FORM/ANIM file using
+/// `operation = 4` (Generalized short/long Delta mode) for every delta
+/// frame. See [`encode_op4_body`] for the payload layout. `long_data`
+/// selects the short (2-byte words; `ANHD.bits` bit 0 clear) vs long
+/// (4-byte words; bit 0 set) data variant.
+///
+/// Compatible with the in-tree [`parse_anim`] op-4 decoder; tested via
+/// `tests/anim_op4.rs`.
+pub fn encode_anim_op4(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>> {
+    if frames.is_empty() {
+        return Err(Error::invalid(
+            "ANIM op 4 encode: at least one frame required",
+        ));
+    }
+    if frames[0].bmhd.n_planes > 8 {
+        return Err(Error::unsupported(format!(
+            "ANIM op 4 encode: requires ≤ 8 colour planes (got {})",
+            frames[0].bmhd.n_planes
+        )));
+    }
+    let leading = crate::ilbm::encode_ilbm(&frames[0])?;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"FORM");
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(b"ANIM");
+    out.extend_from_slice(&leading);
+    if leading.len() & 1 == 1 {
+        out.push(0);
+    }
+
+    let mut prev_planar = rgba_to_planar(&frames[0]);
+
+    for frame in &frames[1..] {
+        let cur_planar = rgba_to_planar(frame);
+        let dlta = encode_op4_body(&prev_planar, &cur_planar, &frame.bmhd, long_data)?;
+        let anhd = Anhd {
+            operation: 4,
+            mask: 0,
+            w: frame.bmhd.width,
+            h: frame.bmhd.height,
+            x: frame.bmhd.x_origin,
+            y: frame.bmhd.y_origin,
+            abs_time: 0,
+            rel_time: 1,
+            interleave: 0,
+            pad0: 0,
+            // bit 0 = data width, bit 3 = RLC, bit 4 = vertical — the
+            // configuration `encode_op4_body` emits and `apply_op4`
+            // reads.
+            bits: (if long_data { 0b1 } else { 0 }) | 0b0000_1000 | 0b0001_0000,
+        };
+        let anhd_bytes = anhd.write(dlta.len() as u32);
         let inner_size = (4 + 8 + 40 + 8 + dlta.len()) as u32;
         out.extend_from_slice(b"FORM");
         out.extend_from_slice(&inner_size.to_be_bytes());
