@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-iff/compare/v0.0.8...v0.0.9) - 2026-06-14
+
+### Added
+
+- *(aiff)* fold oxideav-aiff into oxideav-iff::aiff
+
+### Other
+
+- ANIM op-1 (XOR ILBM mode) full-frame decode + encode
+- COMM chunk writer + public 80-bit extended sample-rate encoder (§2.1/§3.2)
+- ANIM op-4 (Generalized short/long Delta) decode + encode
+- op-2/op-3 Long/Short Delta mode decode + encode (spec §1.2.2-§1.2.3, §2.2.1)
+- EA IFF 85 §5 LIST/CAT group-children walker
+- surface chunk::ReservedId §3 reserved-ckID classifier
+- surface EA IFF 85 §3 universally-reserved ckID classifier
+- generic top-level group probe primitive (FORM/LIST/CAT envelope)
+- typed PCHG header surface + derived-hint consistency check
+- typed Sham row-palette accessors mirroring Pchg::palette_at_line
+- drop release-plz.toml — use release-plz defaults across the workspace
+- cargo-fuzz harness — aiff_decode + anim_decode + pchg_parse
+- §14 chunk-precedence surface (ChunkClass + Form helpers)
+- structured SPRT (sprite-precedence) chunk surfacing
+- structured DEST (destination-merge) chunk surfacing
+- structured SAXL (Sound Accelerator) chunk surfacing
+- structured §13.0 text chunks (NAME / AUTH / (c) / ANNO)
+- structured MIDI (MIDI Data) chunk surfacing
+- ANIM op-7 encoder + AIFF COMT/AESD/APPL surfacing + MARK/INST write
+- structured INST (Instrument) chunk parsing
+- structured MARK (Marker) chunk parsing
+
 ### Added
 
 - **ANIM op-1 (XOR ILBM mode) decode + encode** for the full-frame
