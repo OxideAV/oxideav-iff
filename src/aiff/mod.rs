@@ -27,11 +27,14 @@
 //!   header with odd-size pad-byte handling, slice-based zero-copy
 //!   iterator (distinct from the stream-based walker in the parent
 //!   `oxideav_iff::chunk` module used by svx/ilbm/anim).
-//! * 80-bit IEEE 754 extended-precision sample-rate decode
-//!   ([`extended::decode_sample_rate`] / [`extended::decode_extended`]).
-//! * `COMM` parser ([`common::parse_common`]) for both AIFF and
-//!   AIFF-C forms, including the AIFF-C `compressionType` + Pascal-
-//!   string compression name.
+//! * 80-bit IEEE 754 extended-precision sample-rate decode **and
+//!   encode** ([`extended::decode_sample_rate`] /
+//!   [`extended::decode_extended`] /
+//!   [`extended::encode_sample_rate`] / [`extended::encode_extended`]).
+//! * `COMM` parser ([`common::parse_common`]) **and writer**
+//!   ([`common::write_common_chunk`]) for both AIFF and AIFF-C forms,
+//!   including the AIFF-C `compressionType` + Pascal-string
+//!   compression name.
 //! * `FVER` + `SSND` + the top-level FORM walker ([`form::parse`]).
 //! * PCM compression-flavour readers ([`pcm::decode_pcm`]) for the
 //!   uncompressed AIFF-C `compressionType` FourCCs **`NONE`**,
@@ -160,11 +163,12 @@ pub use appl::{parse_appl_chunk, write_appl_chunk, ApplicationChunk, Application
 pub use chunk::{Chunk, ChunkIter};
 pub use comment::{parse_comments_chunk, write_comments_chunk, Comment, CommentsChunk};
 pub use common::{
-    parse_common, CommonChunk, COMPRESSION_FL32, COMPRESSION_FL32_UC, COMPRESSION_FL64,
-    COMPRESSION_FL64_UC, COMPRESSION_NONE, COMPRESSION_RAW, COMPRESSION_SOWT, COMPRESSION_TWOS,
+    parse_common, write_common_chunk, CommonChunk, COMPRESSION_FL32, COMPRESSION_FL32_UC,
+    COMPRESSION_FL64, COMPRESSION_FL64_UC, COMPRESSION_NONE, COMPRESSION_RAW, COMPRESSION_SOWT,
+    COMPRESSION_TWOS,
 };
 pub use error::{AiffError, Result};
-pub use extended::{decode_extended, decode_sample_rate};
+pub use extended::{decode_extended, decode_sample_rate, encode_extended, encode_sample_rate};
 pub use form::{parse, Form, SoundData};
 pub use instrument::{
     parse_instrument_chunk, write_instrument_chunk, InstrumentChunk, Loop, PlayMode, ResolvedLoop,

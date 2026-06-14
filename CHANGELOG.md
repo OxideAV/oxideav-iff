@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AIFF / AIFF-C `COMM` chunk writer + 80-bit extended sample-rate
+  encoder** (`docs/audio/aiff/aiff-aifc-format.md` §2.1, §3.2). Adds
+  `aiff::write_common_chunk`, the round-trip inverse of
+  `parse_common`: it emits the fixed 18-byte AIFF body
+  (`numChannels` / `numSampleFrames` / `sampleSize` / 10-byte
+  `sampleRate`) and, when the `CommonChunk` carries a
+  `compression_type`, the AIFF-C extension — the 4-byte
+  `compressionType` FourCC followed by the `compressionName` Pascal
+  string padded so its total length (length byte + chars) is even per
+  §3.2. A `None` compression name collapses to the canonical
+  zero-length pstring. The writer follows the body-only convention of
+  the other `write_*_chunk` functions (the FORM header / whole-chunk
+  pad byte are the muxer's job). Backing this, the 80-bit IEEE-754
+  extended encoder previously available only to the test suite was
+  promoted to the public `aiff::encode_extended` (the exact inverse
+  of `decode_extended` for finite normalised values) plus
+  `aiff::encode_sample_rate`, the validating wrapper that rejects
+  NaN / infinite / non-positive rates with `InvalidSampleRate` so a
+  writer can never emit a COMM the parser would refuse. With this the
+  required `COMM` chunk joins the existing optional-chunk writers, so
+  every AIFF chunk class except the top-level FORM/SSND muxer now has
+  symmetric read + write paths.
 - **ANIM op-4 (Generalized short/long Delta mode) decode + encode**
   (spec §1.2.4, wire format §2.2.2). Implemented from the §2.2.2
   `SetDLTAshort` reference routine, the only normative description of

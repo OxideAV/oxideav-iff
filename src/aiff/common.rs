@@ -29,7 +29,7 @@
 //! (2 bytes total).
 
 use crate::aiff::error::{AiffError, Result};
-use crate::aiff::extended::decode_sample_rate;
+use crate::aiff::extended::{decode_sample_rate, encode_sample_rate};
 
 /// AIFF-C compressionType meaning "uncompressed, big-endian".
 /// Used when an `'AIFC'` FORM carries unaltered PCM samples.
@@ -198,6 +198,57 @@ fn parse_pstring(data: &[u8]) -> Result<String> {
     // we just lossy-decode any non-ASCII bytes into U+FFFD, which is
     // safe for the public `compressionName: String` field.
     Ok(String::from_utf8_lossy(&data[1..1 + len]).into_owned())
+}
+
+/// Serialise a [`CommonChunk`] back into the COMM chunk **body**
+/// (ckData) — the bytes that follow the `'COMM'` ckID and the
+/// `ckSize` length word. The chunk-level header and any whole-chunk
+/// pad byte are the FORM muxer's responsibility, matching the
+/// convention of the other `write_*_chunk` writers in this module.
+///
+/// The form is selected by [`CommonChunk::is_aifc`]:
+///
+/// * AIFF (`compression_type == None`) emits the fixed 18-byte body
+///   (`numChannels`, `numSampleFrames`, `sampleSize`, 10-byte
+///   `sampleRate`) per §2.1.
+/// * AIFF-C (`compression_type == Some(..)`) appends the 4-byte
+///   `compressionType` FourCC followed by the `compressionName`
+///   Pascal string (1 length byte + chars), zero-padded so the
+///   pstring's total length (including the length byte) is even, per
+///   §3.2. `compression_name == None` is treated as an empty name
+///   (the canonical `"not compressed"`-style encoding collapses to a
+///   zero-length pstring).
+///
+/// The result round-trips through [`parse_common`] when given the
+/// matching `form_type`. Returns [`AiffError::InvalidSampleRate`] when
+/// `sample_rate` is not a positive finite value, so a writer cannot
+/// emit a COMM the parser would reject.
+pub fn write_common_chunk(common: &CommonChunk) -> Result<Vec<u8>> {
+    let rate = encode_sample_rate(common.sample_rate)?;
+    let mut out = Vec::with_capacity(if common.is_aifc() { 24 } else { 18 });
+    // The 18 fixed bytes, shared by both forms. `numChannels` and
+    // `sampleSize` are signed `int16` on disk; our fields are the
+    // already-validated unsigned values, so the cast is exact for the
+    // legal 1..=32 / >=1 ranges.
+    out.extend_from_slice(&(common.num_channels as i16).to_be_bytes());
+    out.extend_from_slice(&common.num_sample_frames.to_be_bytes());
+    out.extend_from_slice(&(common.sample_size as i16).to_be_bytes());
+    out.extend_from_slice(&rate);
+
+    if let Some(ct) = common.compression_type {
+        out.extend_from_slice(&ct);
+        let name = common.compression_name.as_deref().unwrap_or("");
+        let name_bytes = name.as_bytes();
+        let name_len = name_bytes.len().min(u8::MAX as usize);
+        out.push(name_len as u8);
+        out.extend_from_slice(&name_bytes[..name_len]);
+        // pstring even-total rule (§3.2 / §6.0): 1 length byte +
+        // name_len chars must be padded to an even count.
+        if (1 + name_len) % 2 == 1 {
+            out.push(0);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -376,6 +427,121 @@ mod tests {
         assert!(matches!(
             parse_pstring(&[5, b'A', b'B', b'C']),
             Err(AiffError::Truncated(_))
+        ));
+    }
+
+    #[test]
+    fn write_aiff_comm_is_18_bytes() {
+        let c = CommonChunk {
+            num_channels: 2,
+            num_sample_frames: 100,
+            sample_size: 16,
+            sample_rate: 44_100.0,
+            compression_type: None,
+            compression_name: None,
+        };
+        let body = write_common_chunk(&c).unwrap();
+        assert_eq!(body.len(), 18);
+        // Round-trips back through the parser as an AIFF form.
+        let back = parse_common(&body, *b"AIFF").unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn write_aiff_comm_round_trips_24bit_mono() {
+        let c = CommonChunk {
+            num_channels: 1,
+            num_sample_frames: 4096,
+            sample_size: 24,
+            sample_rate: 48_000.0,
+            compression_type: None,
+            compression_name: None,
+        };
+        let body = write_common_chunk(&c).unwrap();
+        assert_eq!(parse_common(&body, *b"AIFF").unwrap(), c);
+    }
+
+    #[test]
+    fn write_aifc_none_empty_name_round_trips() {
+        let c = CommonChunk {
+            num_channels: 1,
+            num_sample_frames: 50,
+            sample_size: 16,
+            sample_rate: 48_000.0,
+            compression_type: Some(*b"NONE"),
+            compression_name: Some(String::new()),
+        };
+        let body = write_common_chunk(&c).unwrap();
+        // 18 fixed + 4 FourCC + 2-byte empty pstring (len 0 + 1 pad).
+        assert_eq!(body.len(), 24);
+        assert_eq!(&body[18..22], b"NONE");
+        assert_eq!(&body[22..24], &[0x00, 0x00]);
+        assert_eq!(parse_common(&body, *b"AIFC").unwrap(), c);
+    }
+
+    #[test]
+    fn write_aifc_none_name_field_is_optional() {
+        // `compression_name: None` must encode like an empty name.
+        let c = CommonChunk {
+            num_channels: 2,
+            num_sample_frames: 10,
+            sample_size: 16,
+            sample_rate: 44_100.0,
+            compression_type: Some(*b"NONE"),
+            compression_name: None,
+        };
+        let body = write_common_chunk(&c).unwrap();
+        let back = parse_common(&body, *b"AIFC").unwrap();
+        assert_eq!(back.compression_type, Some(*b"NONE"));
+        assert_eq!(back.compression_name.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn write_aifc_sowt_named_round_trips() {
+        let c = CommonChunk {
+            num_channels: 2,
+            num_sample_frames: 88_200,
+            sample_size: 16,
+            sample_rate: 44_100.0,
+            compression_type: Some(*b"sowt"),
+            compression_name: Some("little endian".to_string()),
+        };
+        let body = write_common_chunk(&c).unwrap();
+        // "little endian" is 13 chars: 1 + 13 = 14 (even) → no pad.
+        assert_eq!(body.len(), 18 + 4 + 1 + 13);
+        assert_eq!(parse_common(&body, *b"AIFC").unwrap(), c);
+    }
+
+    #[test]
+    fn write_aifc_odd_name_gets_padded() {
+        // 14-char name: 1 + 14 = 15 (odd) → one pad byte appended.
+        let c = CommonChunk {
+            num_channels: 1,
+            num_sample_frames: 1,
+            sample_size: 8,
+            sample_rate: 8_000.0,
+            compression_type: Some(*b"alaw"),
+            compression_name: Some("ALaw 2:1 alaw!".to_string()), // 14 chars
+        };
+        let body = write_common_chunk(&c).unwrap();
+        assert_eq!(body.len(), 18 + 4 + 1 + 14 + 1);
+        assert_eq!(*body.last().unwrap(), 0x00, "odd pstring must be padded");
+        assert_eq!(parse_common(&body, *b"AIFC").unwrap(), c);
+    }
+
+    #[test]
+    fn write_rejects_bad_sample_rate() {
+        let c = CommonChunk {
+            num_channels: 1,
+            num_sample_frames: 1,
+            sample_size: 16,
+            sample_rate: 0.0,
+            compression_type: None,
+            compression_name: None,
+        };
+        assert!(matches!(
+            write_common_chunk(&c),
+            Err(AiffError::InvalidSampleRate)
         ));
     }
 }

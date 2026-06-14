@@ -110,6 +110,76 @@ pub fn decode_sample_rate(bytes: [u8; 10]) -> Result<f64> {
     Ok(v)
 }
 
+/// Encode an [`f64`] into the 10-byte 80-bit IEEE 754 extended-
+/// precision big-endian form AIFF stores in `COMM.sampleRate`. This is
+/// the exact inverse of [`decode_extended`] for finite normalised
+/// values (the sample rates a writer emits all round-trip exactly).
+///
+/// Special cases mirror the decoder: NaN encodes to a quiet NaN
+/// (integer bit + a fraction bit set), `+/-0.0` to all-zero mantissa
+/// with the sign bit, and `+/-inf` to the exponent-all-ones / mantissa-
+/// zero pattern. The integer (most-significant mantissa) bit is set
+/// **explicitly** for normalised values, as the 80-bit format requires.
+///
+/// # Panics
+///
+/// Never panics — the output is exactly 10 bytes by type.
+pub fn encode_extended(v: f64) -> [u8; 10] {
+    if v.is_nan() {
+        // Quiet NaN with the integer bit set.
+        return [0x7f, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    }
+    if v == 0.0 {
+        let mut o = [0u8; 10];
+        if v.is_sign_negative() {
+            o[0] = 0x80;
+        }
+        return o;
+    }
+    let sign = v.is_sign_negative();
+    let mag = v.abs();
+    if mag.is_infinite() {
+        let mut o = [0u8; 10];
+        o[0] = if sign { 0xff } else { 0x7f };
+        o[1] = 0xff;
+        return o;
+    }
+    // Pull the f64 fields out and re-bias for the extended format.
+    let bits = mag.to_bits();
+    let f64_exp = ((bits >> 52) & 0x7ff) as i32;
+    let f64_frac = bits & 0x000f_ffff_ffff_ffff;
+    let (mantissa_64, exp_unbiased): (u64, i32) = if f64_exp == 0 {
+        // f64 denormal -> renormalise into 80-bit normal.
+        let lead = f64_frac.leading_zeros() as i32 - 11;
+        let mantissa = f64_frac << (12 + lead);
+        let true_exp = -1022 - lead;
+        (mantissa, true_exp)
+    } else {
+        // Normal: include the implicit f64 leading 1.
+        let mantissa = (1_u64 << 63) | (f64_frac << 11);
+        let true_exp = f64_exp - 1023;
+        (mantissa, true_exp)
+    };
+    let biased_ext = exp_unbiased + 16_383;
+    let exp_field = biased_ext as u16 & 0x7fff;
+    let mut o = [0u8; 10];
+    o[0] = ((exp_field >> 8) as u8) | if sign { 0x80 } else { 0 };
+    o[1] = (exp_field & 0xff) as u8;
+    o[2..10].copy_from_slice(&mantissa_64.to_be_bytes());
+    o
+}
+
+/// Encode a positive, finite sample rate (Hz) into the 80-bit extended
+/// form. The validating inverse of [`decode_sample_rate`]: rejects NaN,
+/// infinities, and `<= 0` with [`AiffError::InvalidSampleRate`] so a
+/// writer never emits a COMM the reader would reject.
+pub fn encode_sample_rate(rate: f64) -> Result<[u8; 10]> {
+    if !rate.is_finite() || rate <= 0.0 {
+        return Err(AiffError::InvalidSampleRate);
+    }
+    Ok(encode_extended(rate))
+}
+
 /// `2.0_f64.powi(n)` without going through libm — keeps the
 /// crate free of any C-runtime float dependency for small builds.
 fn pow2(exp: i32) -> f64 {
@@ -145,55 +215,6 @@ fn pow2(exp: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Encode an `f64` *back* into 80-bit extended so the round-trip
-    /// tests don't need a pre-computed table. The encoder is a
-    /// separate, simpler routine — it's used here only as a test
-    /// helper, not exported.
-    fn encode_extended(v: f64) -> [u8; 10] {
-        if v.is_nan() {
-            // Quiet NaN with the integer bit set.
-            return [0x7f, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        }
-        if v == 0.0 {
-            let mut o = [0u8; 10];
-            if v.is_sign_negative() {
-                o[0] = 0x80;
-            }
-            return o;
-        }
-        let sign = v.is_sign_negative();
-        let mag = v.abs();
-        if mag.is_infinite() {
-            let mut o = [0u8; 10];
-            o[0] = if sign { 0xff } else { 0x7f };
-            o[1] = 0xff;
-            return o;
-        }
-        // Pull the f64 fields out and re-bias for the extended format.
-        let bits = mag.to_bits();
-        let f64_exp = ((bits >> 52) & 0x7ff) as i32;
-        let f64_frac = bits & 0x000f_ffff_ffff_ffff;
-        let (mantissa_64, exp_unbiased): (u64, i32) = if f64_exp == 0 {
-            // f64 denormal -> renormalise into 80-bit normal.
-            let lead = f64_frac.leading_zeros() as i32 - 11;
-            let mantissa = f64_frac << (12 + lead);
-            let true_exp = -1022 - lead;
-            (mantissa, true_exp)
-        } else {
-            // Normal: include the implicit f64 leading 1.
-            let mantissa = (1_u64 << 63) | (f64_frac << 11);
-            let true_exp = f64_exp - 1023;
-            (mantissa, true_exp)
-        };
-        let biased_ext = exp_unbiased + 16_383;
-        let exp_field = biased_ext as u16 & 0x7fff;
-        let mut o = [0u8; 10];
-        o[0] = ((exp_field >> 8) as u8) | if sign { 0x80 } else { 0 };
-        o[1] = (exp_field & 0xff) as u8;
-        o[2..10].copy_from_slice(&mantissa_64.to_be_bytes());
-        o
-    }
 
     #[test]
     fn decode_zero_is_zero() {
@@ -321,5 +342,61 @@ mod tests {
     fn sample_rate_accepts_44_1k() {
         let bytes = encode_extended(44_100.0);
         assert_eq!(decode_sample_rate(bytes).unwrap(), 44_100.0);
+    }
+
+    #[test]
+    fn encode_one_matches_known_bytes() {
+        // 1.0: sign=0, exponent=16383 (0x3fff), integer bit set.
+        assert_eq!(
+            encode_extended(1.0),
+            [0x3f, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn encode_negative_one_matches_known_bytes() {
+        assert_eq!(
+            encode_extended(-1.0),
+            [0xbf, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn encode_zero_and_neg_zero() {
+        assert_eq!(encode_extended(0.0), [0u8; 10]);
+        let mut neg = [0u8; 10];
+        neg[0] = 0x80;
+        assert_eq!(encode_extended(-0.0), neg);
+    }
+
+    #[test]
+    fn encode_sample_rate_rejects_non_positive() {
+        assert!(matches!(
+            encode_sample_rate(0.0),
+            Err(AiffError::InvalidSampleRate)
+        ));
+        assert!(matches!(
+            encode_sample_rate(-48_000.0),
+            Err(AiffError::InvalidSampleRate)
+        ));
+        assert!(matches!(
+            encode_sample_rate(f64::NAN),
+            Err(AiffError::InvalidSampleRate)
+        ));
+        assert!(matches!(
+            encode_sample_rate(f64::INFINITY),
+            Err(AiffError::InvalidSampleRate)
+        ));
+    }
+
+    #[test]
+    fn public_encoder_round_trips_common_rates() {
+        for rate in [
+            8_000.0, 11_025.0, 16_000.0, 22_050.0, 24_000.0, 32_000.0, 44_100.0, 48_000.0,
+            88_200.0, 96_000.0, 176_400.0, 192_000.0,
+        ] {
+            let enc = encode_extended(rate);
+            assert_eq!(decode_extended(enc), rate, "rate {rate} did not round-trip");
+        }
     }
 }

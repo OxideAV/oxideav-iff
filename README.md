@@ -83,7 +83,13 @@ crate ships:
   singletons surfaced via `Form::name` / `Form::author` /
   `Form::copyright`, `ANNO` is "any-number-per-FORM" per §13.0 and
   surfaced via `Form::annotations` in document order). Write-side
-  encoders for `MARK`, `INST`, `COMT`, `AESD`, `APPL`, `MIDI`,
+  encoders for the required `COMM` chunk (`write_common_chunk`,
+  emitting the 18-byte AIFF body or the AIFF-C body with
+  `compressionType` FourCC + even-padded Pascal-string
+  `compressionName`, round-trippable through `parse_common`; backed
+  by `encode_sample_rate` / `encode_extended`, the validating inverse
+  of the 80-bit IEEE-extended sample-rate decoder) plus `MARK`,
+  `INST`, `COMT`, `AESD`, `APPL`, `MIDI`,
   `SAXL`, and the four §13.0 text chunks are also available so
   callers building an AIFF / AIFC file can emit every chunk class
   round-trippably. Codec-bearing
