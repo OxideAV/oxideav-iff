@@ -92,7 +92,14 @@ crate ships:
   `INST`, `COMT`, `AESD`, `APPL`, `MIDI`,
   `SAXL`, and the four §13.0 text chunks are also available so
   callers building an AIFF / AIFC file can emit every chunk class
-  round-trippably. Codec-bearing
+  round-trippably, with `write_fver_chunk` (the `FVER` Format Version
+  body, `AIFC_VERSION_1 = 0xA2805140`) closing the last write-side gap.
+  Each `write_*` helper emits a chunk *body*; the `frame_chunk(id,
+  body)` helper is the exact inverse of the `ChunkIter` walker —
+  prepending the 8-byte `ckID + ckSize` header and appending the §1
+  odd-length `0x00` pad byte — so a caller assembling a FORM does not
+  re-derive the big-endian size encoding and the pad rule per chunk.
+  Codec-bearing
   `compressionType` FourCCs (`ima4`, `ulaw`, `alaw`, …) are
   recognised in the parser but routed through sibling codec crates
   rather than decoded here.

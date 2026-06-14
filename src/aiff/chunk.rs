@@ -132,6 +132,69 @@ impl<'a> Iterator for ChunkIter<'a> {
     }
 }
 
+/// The `timestamp` value of version 1 of the AIFF-C specification —
+/// the 8/26/91 draft — as carried by the `FVER` Format Version chunk.
+///
+/// Per `docs/audio/aiff/aiff-aifc-format.md` §3.1 and the AIFF-C draft
+/// (`docs/audio/aiff/aiff-c.txt`, `#define AIFCVersion1 0xA2805140`),
+/// the value is `0xA280_5140` — the number of seconds since the
+/// 1904-01-01 Macintosh epoch at which that AIFF-C release was issued.
+/// Every AIFF-C file carries exactly this timestamp; §3.1 instructs
+/// applications not to alter it.
+pub const AIFC_VERSION_1: u32 = 0xA280_5140;
+
+/// Frame a chunk body in EA IFF 85 wire format — the exact inverse of
+/// [`ChunkIter`].
+///
+/// Prepends the 8-byte header (4-byte `ckID` + big-endian `int32`
+/// `ckSize`, where `ckSize == body.len()`) to `body`, then appends a
+/// single `0x00` pad byte iff `body.len()` is odd. Per
+/// `docs/audio/aiff/aiff-aifc-format.md` §1 the pad byte enforces
+/// 16-bit alignment and is **not** counted in `ckSize`.
+///
+/// Every per-chunk `write_*` helper in this module emits a chunk
+/// *body* and documents that "the chunk header (`ckID + ckSize`) and
+/// any odd-length pad byte are the caller's responsibility." This is
+/// that responsibility, factored into one place so a caller building a
+/// FORM does not have to re-derive the big-endian size encoding and
+/// the odd-length pad rule by hand for every chunk.
+///
+/// Returns [`AiffError::OversizedChunk`] when `body.len()` exceeds
+/// `u32::MAX` and therefore cannot be represented in the 32-bit
+/// `ckSize` field (`available` carries the actual body length, clamped
+/// to `u32::MAX` for display).
+pub fn frame_chunk(id: &[u8; 4], body: &[u8]) -> Result<Vec<u8>> {
+    let size = u32::try_from(body.len()).map_err(|_| AiffError::OversizedChunk {
+        id: *id,
+        declared: u32::MAX,
+        available: u32::MAX,
+    })?;
+
+    let pad = (size & 1) as usize;
+    let mut out = Vec::with_capacity(8 + body.len() + pad);
+    out.extend_from_slice(id);
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(body);
+    if pad == 1 {
+        out.push(0);
+    }
+    Ok(out)
+}
+
+/// Encode an `FVER` (Format Version) chunk *body* — the 4-byte
+/// big-endian `timestamp`.
+///
+/// `timestamp` is [`AIFC_VERSION_1`] for any AIFF-C file Apple's draft
+/// describes (§3.1 ¶ "ckSize is always 4. timeStamp ... = AIFCVersion1
+/// = 0xA2805140"). The body is exactly 4 bytes; the chunk header
+/// (`'FVER' + ckSize`) is the caller's responsibility, matching every
+/// other write-side helper in this module — pair this with
+/// [`frame_chunk`] (which never needs a pad byte here since the body
+/// is even-length).
+pub fn write_fver_chunk(timestamp: u32) -> [u8; 4] {
+    timestamp.to_be_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +279,62 @@ mod tests {
         let buf = [0x00, 0xff, 0x10, 0x80, 0, 0, 0, 0];
         let c = ChunkIter::new(&buf).next().unwrap().unwrap();
         assert_eq!(c.id_str(), None);
+    }
+
+    #[test]
+    fn frame_chunk_even_body_has_no_pad() {
+        let framed = frame_chunk(b"COMT", &[0xde, 0xad, 0xbe, 0xef]).unwrap();
+        // 8-byte header + 4-byte body, no pad.
+        assert_eq!(framed.len(), 12);
+        assert_eq!(&framed[..4], b"COMT");
+        assert_eq!(&framed[4..8], &4u32.to_be_bytes());
+        assert_eq!(&framed[8..], &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn frame_chunk_odd_body_gets_pad_byte() {
+        let framed = frame_chunk(b"NAME", b"ABC").unwrap();
+        // 8-byte header + 3-byte body + 1 pad byte = 12; ckSize stays 3.
+        assert_eq!(framed.len(), 12);
+        assert_eq!(&framed[4..8], &3u32.to_be_bytes());
+        assert_eq!(&framed[8..11], b"ABC");
+        assert_eq!(framed[11], 0x00);
+    }
+
+    #[test]
+    fn frame_chunk_empty_body() {
+        let framed = frame_chunk(b"FVER", &[]).unwrap();
+        assert_eq!(framed.len(), 8);
+        assert_eq!(&framed[..4], b"FVER");
+        assert_eq!(&framed[4..8], &0u32.to_be_bytes());
+    }
+
+    #[test]
+    fn frame_chunk_is_inverse_of_iter() {
+        // Frame two chunks (odd then even), then walk them back with
+        // ChunkIter — the pad byte must be transparent to the reader.
+        let mut buf = frame_chunk(b"NAME", b"hello").unwrap(); // odd → pad
+        buf.extend(frame_chunk(b"AUTH", b"me!!").unwrap()); // even → no pad
+        let chunks: Vec<_> = ChunkIter::new(&buf).collect::<Result<_>>().unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(&chunks[0].id, b"NAME");
+        assert_eq!(chunks[0].size, 5);
+        assert_eq!(chunks[0].data, b"hello");
+        assert_eq!(&chunks[1].id, b"AUTH");
+        assert_eq!(chunks[1].size, 4);
+        assert_eq!(chunks[1].data, b"me!!");
+    }
+
+    #[test]
+    fn write_fver_round_trips_through_frame_and_iter() {
+        let body = write_fver_chunk(AIFC_VERSION_1);
+        assert_eq!(body, AIFC_VERSION_1.to_be_bytes());
+        let framed = frame_chunk(b"FVER", &body).unwrap();
+        let c = ChunkIter::new(&framed).next().unwrap().unwrap();
+        assert_eq!(&c.id, b"FVER");
+        assert_eq!(c.size, 4);
+        let ts = u32::from_be_bytes([c.data[0], c.data[1], c.data[2], c.data[3]]);
+        assert_eq!(ts, AIFC_VERSION_1);
+        assert_eq!(ts, 0xA280_5140);
     }
 }

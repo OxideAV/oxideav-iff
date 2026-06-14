@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AIFF/AIFF-C `frame_chunk` framing helper + `write_fver_chunk`
+  (FVER) writer** (`docs/audio/aiff/aiff-aifc-format.md` §1 / §3.1).
+  Every per-chunk `aiff::write_*` helper emits a chunk *body* and
+  leaves the 8-byte `ckID + ckSize` header and the odd-length pad byte
+  to the caller. `aiff::frame_chunk(id, body)` factors that into one
+  place — the exact inverse of `aiff::ChunkIter`: it prepends the
+  4-byte `ckID` + big-endian `int32` `ckSize` header and appends a
+  single `0x00` pad byte iff the body length is odd (the §1 16-bit
+  alignment rule; the pad is not counted in `ckSize`), returning
+  `AiffError::OversizedChunk` when the body exceeds `u32::MAX`. This
+  closes the last write-side gap: `FVER` was the one read-path chunk
+  class (`Form::fver_timestamp`) without a body writer.
+  `aiff::write_fver_chunk(timestamp)` emits the 4-byte big-endian
+  `timestamp`, and `aiff::AIFC_VERSION_1` (`0xA280_5140`) is the §3.1
+  AIFF-C v1 spec timestamp every AIFC file carries. Covered by 6 new
+  unit tests in `src/aiff/chunk.rs` (even/odd/empty framing, pad
+  transparency through a `frame_chunk` → `ChunkIter` round-trip, and an
+  `FVER` framed round-trip).
 - **ANIM op-1 (XOR ILBM mode) decode + encode** for the full-frame
   case (`docs/image/iff/anim.txt` §1.2.1 / §1.3 / §2.1). op-1 is the
   original ANIM compression method: the encoder XORs every byte of the

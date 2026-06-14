@@ -160,7 +160,7 @@ pub mod demuxer;
 
 pub use aesd::{parse_aesd_chunk, write_aesd_chunk, AesdChunk, Emphasis};
 pub use appl::{parse_appl_chunk, write_appl_chunk, ApplicationChunk, ApplicationDialect};
-pub use chunk::{Chunk, ChunkIter};
+pub use chunk::{frame_chunk, write_fver_chunk, Chunk, ChunkIter, AIFC_VERSION_1};
 pub use comment::{parse_comments_chunk, write_comments_chunk, Comment, CommentsChunk};
 pub use common::{
     parse_common, write_common_chunk, CommonChunk, COMPRESSION_FL32, COMPRESSION_FL32_UC,
