@@ -74,8 +74,9 @@ use oxideav_core::{
 
 use crate::chunk::{read_chunk_header, read_form_type, GROUP_FORM};
 use crate::ilbm::{
-    byterun1_decode_row, expand_ehb_palette, expand_ham_row, indices_to_planar_row, parse_ilbm,
-    planar_row_to_indices, Bmhd, Camg, Compression, IlbmImage, Masking,
+    byterun1_decode_row, byterun1_encode_row, expand_ehb_palette, expand_ham_row,
+    indices_to_planar_row, parse_ilbm, planar_row_to_indices, Bmhd, Camg, Compression, IlbmImage,
+    Masking,
 };
 
 /// Install the FORM/ANIM demuxer into a container registry. The
@@ -267,7 +268,9 @@ pub fn probe(buf: &[u8]) -> u8 {
 /// Parse a FORM/ANIM container.
 ///
 /// Currently supports `ANHD.operation = 0` (literal full BODY),
+/// `ANHD.operation = 1` (XOR ILBM mode, full-frame case),
 /// `ANHD.operation = 2` / `= 3` (Long / Short Delta mode),
+/// `ANHD.operation = 4` (Generalized short/long Delta mode),
 /// `ANHD.operation = 5` (Byte Vertical Delta) and `ANHD.operation = 7`
 /// (Short / Long Vertical Delta). Other operations
 /// return `Error::Unsupported`.
@@ -566,6 +569,18 @@ pub fn apply_op5_for_test(
     apply_op5(planar, delta, bmhd)
 }
 
+/// Test-only re-export of [`apply_op1`] so integration tests can drive
+/// the XOR decoder without rebuilding a full ANIM container.
+#[doc(hidden)]
+pub fn apply_op1_for_test(
+    anhd: &Anhd,
+    planar: &mut [Vec<u8>],
+    delta: &[u8],
+    bmhd: &Bmhd,
+) -> Result<()> {
+    apply_op1(anhd, planar, delta, bmhd)
+}
+
 /// Apply a single ANHD-tagged delta to the running planar state.
 fn apply_delta(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -> Result<()> {
     match anhd.operation {
@@ -597,6 +612,9 @@ fn apply_delta(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -
             }
             Ok(())
         }
+        // Op 1 = XOR ILBM mode (§1.2.1) — the BODY decodes to a planar
+        // XOR-bitmap that is XOR'd into the running state.
+        1 => apply_op1(anhd, planar, delta, bmhd),
         // Op 2 = Long Delta (4-byte data words), op 3 = Short Delta
         // (2-byte data words). Same group grammar otherwise (§2.2.1).
         2 => apply_op23(planar, delta, bmhd, true),
@@ -614,7 +632,7 @@ fn apply_delta(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -
             apply_op7(planar, delta, bmhd, long_data)
         }
         other => Err(Error::unsupported(format!(
-            "ANIM: ANHD operation {other} not implemented (only 0, 2, 3, 4, 5 and 7 supported)"
+            "ANIM: ANHD operation {other} not implemented (only 0, 1, 2, 3, 4, 5 and 7 supported)"
         ))),
     }
 }
@@ -720,6 +738,93 @@ fn apply_op5(planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Op 1 — XOR ILBM mode (§1.2.1 / §1.3, the original ANIM mode).
+///
+/// Per §1.2.1: the encoder XORs every corresponding byte of the new
+/// frame against the reference frame, producing a bitmap that is `0`
+/// wherever the two frames agreed and the differing bits elsewhere;
+/// that XOR-bitmap is then stored "using run-length-encoding" (a
+/// ByteRun1 BODY, or an uncompressed BODY per `BMHD.compression`).
+/// §1.3: "the usual run-length-decoding routine can be easily modified
+/// to do the exclusive-or operation required. Note that runs of zero
+/// bytes, which will be very common, can be ignored, as an exclusive or
+/// of any byte value to a byte of zero will not alter the original byte
+/// value." This decoder expands the BODY into the full planar bitmap
+/// and XORs it byte-for-byte into the running planar state.
+///
+/// **Scope.** This implements the §1.2.1 *full-frame* XOR case the
+/// spec describes byte-exactly: the BODY covers the whole bitmap and
+/// every colour plane participates. The §2.1 ANHD "XOR mode only"
+/// fields (`mask` plane-selector, `w`/`h`/`x`/`y` rectangular
+/// changed-area) narrow the BODY to a sub-rectangle / plane subset to
+/// "eliminate unnecessary un-changed data", but the staged spec gives
+/// no wire description of how the resulting partial BODY is laid out
+/// (row stride within the rectangle, plane interleave order under a
+/// sparse `mask`). Rather than guess that layout, a partial-rectangle
+/// or plane-masked ANHD is rejected with `Error::unsupported` and
+/// surfaced as a docs gap; full-frame XOR (`mask` all-planes-or-zero,
+/// `w == width`, `h == height`, `x == 0`, `y == 0`) is decoded.
+fn apply_op1(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -> Result<()> {
+    let n_planes = bmhd.n_planes as usize;
+    let has_mask = bmhd.masking == Masking::HasMask;
+    let planes_per_row = n_planes + has_mask as usize;
+    let row_bytes = bmhd.row_bytes();
+    let height = bmhd.height as usize;
+
+    // Reject the partial-rectangle / plane-mask variant whose BODY
+    // layout the staged spec does not describe (see doc comment).
+    let full_plane_mask = anhd.mask == 0 || anhd.mask == op1_full_plane_mask(n_planes);
+    let full_rect = anhd.w == bmhd.width && anhd.h == bmhd.height && anhd.x == 0 && anhd.y == 0;
+    if !full_plane_mask || !full_rect {
+        return Err(Error::unsupported(
+            "ANIM op 1: partial-rectangle / plane-masked XOR BODY layout is not described in the staged spec (full-frame XOR only)",
+        ));
+    }
+
+    let total_rows = height * planes_per_row;
+
+    // Expand the BODY into the full planar XOR-bitmap, then XOR it into
+    // the running state. ByteRun1 rows decode independently; an
+    // uncompressed BODY is a flat stack of `row_bytes`-sized rows.
+    if bmhd.compression == Compression::None {
+        let need = total_rows * row_bytes;
+        if delta.len() < need {
+            return Err(Error::invalid("ANIM op 1: uncompressed XOR BODY too short"));
+        }
+        for (i, chunk) in delta[..need].chunks_exact(row_bytes).enumerate() {
+            xor_row_into(&mut planar[i], chunk);
+        }
+    } else {
+        let mut input = delta;
+        for row in planar.iter_mut().take(total_rows) {
+            let mut decoded = Vec::with_capacity(row_bytes);
+            let consumed = byterun1_decode_row(input, row_bytes, &mut decoded)?;
+            input = &input[consumed..];
+            xor_row_into(row, &decoded);
+        }
+    }
+    Ok(())
+}
+
+/// XOR `src` into `dst` byte-for-byte over the overlapping prefix.
+/// A zero byte in `src` leaves `dst` unchanged (§1.3).
+fn xor_row_into(dst: &mut [u8], src: &[u8]) {
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        *d ^= s;
+    }
+}
+
+/// The all-planes-present `mask` value for `n_planes` colour planes:
+/// the low `n_planes` bits set (§2.1 "plane mask where each bit is set
+/// =1 if there is data"). `n_planes >= 8` saturates to `0xFF`.
+fn op1_full_plane_mask(n_planes: usize) -> u8 {
+    if n_planes >= 8 {
+        0xFF
+    } else {
+        ((1u16 << n_planes) - 1) as u8
+    }
 }
 
 /// Op 7 — Short / Long Vertical Delta.
@@ -1567,6 +1672,124 @@ pub fn encode_anim_op5(frames: &[IlbmImage]) -> Result<Vec<u8>> {
             h: frame.bmhd.height,
             x: frame.bmhd.x_origin,
             y: frame.bmhd.y_origin,
+            abs_time: 0,
+            rel_time: 1,
+            interleave: 0,
+            pad0: 0,
+            bits: 0,
+        };
+        let anhd_bytes = anhd.write(body.len() as u32);
+        let inner_size = (4 + 8 + 40 + 8 + body.len()) as u32;
+        out.extend_from_slice(b"FORM");
+        out.extend_from_slice(&inner_size.to_be_bytes());
+        out.extend_from_slice(b"ILBM");
+        out.extend_from_slice(b"ANHD");
+        out.extend_from_slice(&40u32.to_be_bytes());
+        out.extend_from_slice(&anhd_bytes);
+        out.extend_from_slice(b"BODY");
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        if body.len() & 1 == 1 {
+            out.push(0);
+        }
+        prev_planar = cur_planar;
+    }
+
+    let form_size = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&form_size.to_be_bytes());
+    Ok(out)
+}
+
+/// Encode a single op-1 (XOR ILBM mode) BODY from a previous and
+/// current planar frame.
+///
+/// Per §1.2.1 the BODY is the byte-for-byte XOR of the two frames'
+/// planar bitmaps, then run-length-encoded. `prev_planar` and
+/// `cur_planar` are the row-major flat arrays of bitplane rows in IFF
+/// order (`planes_per_row = n_planes + mask_plane`), each row
+/// `row_bytes` long — the same shape the decoder ([`apply_op1`])
+/// produces. The output is a ByteRun1 BODY: each XOR row is packed
+/// independently, exactly as the seed-frame BODY would be, so the
+/// running [`parse_anim`] op-1 path decodes it directly.
+pub fn encode_op1_body(
+    prev_planar: &[Vec<u8>],
+    cur_planar: &[Vec<u8>],
+    bmhd: &Bmhd,
+) -> Result<Vec<u8>> {
+    let n_planes = bmhd.n_planes as usize;
+    let has_mask = bmhd.masking == Masking::HasMask;
+    let planes_per_row = n_planes + has_mask as usize;
+    let row_bytes = bmhd.row_bytes();
+    let height = bmhd.height as usize;
+    let expected = height * planes_per_row;
+    if prev_planar.len() != expected || cur_planar.len() != expected {
+        return Err(Error::invalid(format!(
+            "ANIM op 1 encode: planar buffers have {} / {} rows, expected {expected}",
+            prev_planar.len(),
+            cur_planar.len()
+        )));
+    }
+    // The XOR BODY honours `BMHD.compression` (the spec says the
+    // XOR-bitmap is "saved using run-length-encoding", i.e. ByteRun1,
+    // but an uncompressed seed BMHD keeps the BODY uncompressed so the
+    // decoder's `compression`-driven expansion stays consistent).
+    let compress = bmhd.compression != Compression::None;
+    let mut out = Vec::new();
+    for (prev_row, cur_row) in prev_planar.iter().zip(cur_planar.iter()) {
+        if prev_row.len() != row_bytes || cur_row.len() != row_bytes {
+            return Err(Error::invalid("ANIM op 1 encode: row length mismatch"));
+        }
+        let mut xor_row = vec![0u8; row_bytes];
+        for ((d, &a), &b) in xor_row.iter_mut().zip(prev_row.iter()).zip(cur_row.iter()) {
+            *d = a ^ b;
+        }
+        if compress {
+            out.extend_from_slice(&byterun1_encode_row(&xor_row));
+        } else {
+            out.extend_from_slice(&xor_row);
+        }
+    }
+    Ok(out)
+}
+
+/// Encode a sequence of frames as a FORM/ANIM using op-1 (XOR ILBM
+/// mode, §1.2.1). The first frame is the literal seed ILBM; every
+/// subsequent frame is stored as a ByteRun1 BODY of its XOR against
+/// the previous frame's planar state, tagged with an `ANHD.operation
+/// = 1` header carrying the full-frame `mask` / `w` / `h` / `x` / `y`
+/// fields. Compatible with the in-tree [`parse_anim`] op-1 decoder;
+/// tested via `tests/anim_op1.rs`.
+pub fn encode_anim_op1(frames: &[IlbmImage]) -> Result<Vec<u8>> {
+    if frames.is_empty() {
+        return Err(Error::invalid(
+            "ANIM op 1 encode: at least one frame required",
+        ));
+    }
+    let leading = crate::ilbm::encode_ilbm(&frames[0])?;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"FORM");
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(b"ANIM");
+    out.extend_from_slice(&leading);
+    if leading.len() & 1 == 1 {
+        out.push(0);
+    }
+
+    let mut prev_planar = rgba_to_planar(&frames[0]);
+
+    for frame in &frames[1..] {
+        let cur_planar = rgba_to_planar(frame);
+        let body = encode_op1_body(&prev_planar, &cur_planar, &frame.bmhd)?;
+        let n_planes = frame.bmhd.n_planes as usize;
+        let anhd = Anhd {
+            operation: 1,
+            // Full-plane mask: every colour plane participates in the
+            // full-frame XOR BODY (§2.1 "bit set =1 if there is data").
+            mask: op1_full_plane_mask(n_planes),
+            w: frame.bmhd.width,
+            h: frame.bmhd.height,
+            x: 0,
+            y: 0,
             abs_time: 0,
             rel_time: 1,
             interleave: 0,

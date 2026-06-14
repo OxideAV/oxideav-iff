@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ANIM op-1 (XOR ILBM mode) decode + encode** for the full-frame
+  case (`docs/image/iff/anim.txt` §1.2.1 / §1.3 / §2.1). op-1 is the
+  original ANIM compression method: the encoder XORs every byte of the
+  new frame against the previous frame's planar bitmap, producing a
+  bitmap that is `0` where the frames agreed, and stores it
+  run-length-encoded (`anim::encode_op1_body` / `anim::encode_anim_op1`,
+  honouring `BMHD.compression` for ByteRun1 or uncompressed BODY). The
+  decoder (`apply_op1`, wired into `parse_anim` via `ANHD.operation =
+  1`) expands the BODY and XORs it into the running planar state — a
+  zero byte in the XOR bitmap leaves the running state unchanged per
+  §1.3. The §2.1 "XOR mode only" `mask` / `w` / `h` / `x` / `y` ANHD
+  fields narrow the BODY to a plane subset / sub-rectangle "to
+  eliminate unnecessary un-changed data"; the staged spec gives no wire
+  description of that partial-BODY layout, so a plane-masked or
+  partial-rectangle ANHD is rejected with `Error::unsupported` and the
+  full-frame case (all planes, whole bitmap) is decoded. Covered by
+  `tests/anim_op1.rs` (8 tests: ByteRun1 + uncompressed round-trips,
+  sparse / 2-plane / multi-frame sequences, all-plane-mask tagging,
+  no-op-XOR on identical planar buffers, partial-rectangle rejection).
+
 - **AIFF / AIFF-C `COMM` chunk writer + 80-bit extended sample-rate
   encoder** (`docs/audio/aiff/aiff-aifc-format.md` §2.1, §3.2). Adds
   `aiff::write_common_chunk`, the round-trip inverse of

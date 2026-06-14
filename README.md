@@ -322,7 +322,7 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
 |------------------------------------------|:----:|:-----:|
 | `ANHD` Animation Header (40 bytes)       |  Y   |   Y   |
 | Op 0 — full literal BODY                 |  Y   |   Y   |
-| Op 1 — XOR ILBM mode                     |  N   |   N   |
+| Op 1 — XOR ILBM mode (full-frame)        |  Y   |   Y   |
 | Op 2 — Long Delta mode                   |  Y   |   Y   |
 | Op 3 — Short Delta mode                  |  Y   |   Y   |
 | Op 4 — Generalized short/long Delta      |  Y   |   Y   |
@@ -331,6 +331,7 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
 | Op 8 — Short / Long Vertical Delta (32b) |  N   |   N   |
 
 - Public API: [`anim::parse_anim`], [`anim::encode_anim_op0`],
+  [`anim::encode_anim_op1`], [`anim::encode_op1_body`],
   [`anim::encode_anim_op2`], [`anim::encode_anim_op3`],
   [`anim::encode_op23_body`],
   [`anim::encode_anim_op4`], [`anim::encode_op4_body`],
@@ -340,6 +341,20 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
 - Container id: `"iff_anim"`, probes `FORM....ANIM` and matches
   `.anim` by extension. Multi-frame `rawvideo` / `Rgba` stream;
   every frame is emitted as a keyframe packet.
+- Op-1 (XOR ILBM mode) is the original ANIM compression method
+  (§1.2.1 / §1.3): a delta frame stores the byte-for-byte XOR of the
+  new frame against the previous frame's planar bitmap, run-length-
+  encoded (ByteRun1 or uncompressed per `BMHD.compression`). The
+  decoder expands that BODY and XORs it into the running planar state;
+  a zero byte in the XOR bitmap leaves the running byte unchanged
+  (§1.3). Only the **full-frame** case (whole bitmap, all colour
+  planes) is decoded — the §2.1 "XOR mode only" ANHD `mask` plane-
+  selector and `w`/`h`/`x`/`y` rectangular changed-area narrow the BODY
+  to a plane subset / sub-rectangle whose wire layout the staged spec
+  does not describe, so a plane-masked or partial-rectangle ANHD is
+  rejected with `Error::unsupported`. The encoder tags each delta with
+  the all-planes `mask` and full-frame `w`/`h` so a round-trip stays in
+  the documented case.
 - Op-0 (full literal BODY) and op-5 (Byte Vertical Delta) round-trip
   through the public encoder. Op-5 emits the canonical
   pointer-table + per-plane column op-stream: each column's run-
@@ -655,12 +670,15 @@ ANIM section above. r287 lands **op-4 (Generalized short/long
 Delta mode)** decode + encode from §1.2.4 / §2.2.2 (the
 `SetDLTAshort` reference routine — word-unit pointers, absolute
 `(offset, size)` op pairs, Same/Uniq run classes, `ANHD.bits`
-variant selection). Remaining ANIM gaps: op-1 (XOR ILBM) is
-documented in the staged spec (§1.2.1 / §1.3) and is the natural
-next increment; op-8 and DEEP / TVPP / RGB8 / RGBN true-colour IFF
-chunks remain blocked on docs — none has a spec section staged in
-`docs/image/iff/` (the only ANIM appendix present covers op-7, and
-op-8 is name-dropped without a wire format).
+variant selection). r302 lands **op-1 (XOR ILBM mode)** decode +
+encode for the full-frame case from §1.2.1 / §1.3 / §2.1 — see the
+ANIM section above. Remaining ANIM gaps: the op-1 partial-rectangle
+/ plane-masked variant (§2.1 `mask` / `w` / `h` / `x` / `y` "XOR mode
+only" fields) needs a staged wire description of how the partial BODY
+is laid out before it can be decoded; op-8 and DEEP / TVPP / RGB8 /
+RGBN true-colour IFF chunks remain blocked on docs — none has a spec
+section staged in `docs/image/iff/` (the only ANIM appendix present
+covers op-7, and op-8 is name-dropped without a wire format).
 
 AIFF-side r209 surfaces the previously-skipped optional chunks
 end-to-end: **COMT** (timestamped comments, optional `MarkerId`
