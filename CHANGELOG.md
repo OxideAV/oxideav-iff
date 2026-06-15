@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AIFF/AIFF-C `SSND` (Sound Data) chunk writer**
+  (`docs/audio/aiff/aiff-c.txt` §5.0). `aiff::write_sound_data(&SoundData)`
+  emits the §5.0 `SoundDataChunk` data portion — `offset` (u32) +
+  `blockSize` (u32) + `offset` bytes of block-alignment padding +
+  `soundData` — completing the AIFF round-trip story: `SSND` was the
+  one read-path chunk class (`Form::sound`) without a body writer. Per
+  §5.0 "offset determines where the first sample frame in the soundData
+  starts", a non-zero `offset` inserts that many zero alignment bytes
+  before the samples (the §5.0 "Block-Aligning Sound Data" mechanism),
+  so the result round-trips through the `SSND` reader, whose `samples`
+  slice begins at byte `8 + offset`. The common case
+  (§5.0 "Applications that don't care about block alignment should set
+  blockSize and offset to zero") emits eight zero header bytes followed
+  by the raw samples. Like every other `aiff::write_*` helper it emits a
+  chunk *body*; pair it with `aiff::frame_chunk(b"SSND", body)` for the
+  full header + odd-length pad. Covered by 4 new unit tests in
+  `src/aiff/form.rs` (zero-offset layout, full-FORM `parse` round-trip,
+  non-zero-offset alignment-gap round-trip, and a `frame_chunk` →
+  `ChunkIter` framing round-trip).
 - **AIFF/AIFF-C `frame_chunk` framing helper + `write_fver_chunk`
   (FVER) writer** (`docs/audio/aiff/aiff-aifc-format.md` §1 / §3.1).
   Every per-chunk `aiff::write_*` helper emits a chunk *body* and

@@ -88,7 +88,13 @@ crate ships:
   `compressionType` FourCC + even-padded Pascal-string
   `compressionName`, round-trippable through `parse_common`; backed
   by `encode_sample_rate` / `encode_extended`, the validating inverse
-  of the 80-bit IEEE-extended sample-rate decoder) plus `MARK`,
+  of the 80-bit IEEE-extended sample-rate decoder) plus the core
+  `SSND` sound-data chunk (`write_sound_data`, emitting the §5.0
+  `offset` + `blockSize` + alignment-padding + `soundData` body — a
+  non-zero `offset` inserts that many zero block-alignment bytes
+  before the first sample frame per §5.0 "Block-Aligning Sound Data",
+  round-trippable through the `SSND` reader whose `samples` slice
+  begins at byte `8 + offset`), `MARK`,
   `INST`, `COMT`, `AESD`, `APPL`, `MIDI`,
   `SAXL`, and the four §13.0 text chunks are also available so
   callers building an AIFF / AIFC file can emit every chunk class

@@ -41,6 +41,46 @@ pub struct SoundData<'a> {
     pub samples: &'a [u8],
 }
 
+/// Encode an SSND (Sound Data) chunk *body* in wire format — the bytes
+/// that would follow an `SSND` chunk header. The layout is the §5.0
+/// `SoundDataChunk` data portion: `offset(4) + blockSize(4) +
+/// alignmentPadding(offset bytes) + soundData`.
+///
+/// Per §5.0 ¶ "offset determines where the first sample frame in the
+/// soundData starts. offset is in bytes", a non-zero `offset` means
+/// the first sample frame does *not* start immediately after the
+/// `blockSize` field; `offset` bytes intervene so the samples land on
+/// a `blockSize` disk-block boundary (the §5.0 "Block-Aligning Sound
+/// Data" mechanism). This encoder emits exactly that many zero bytes
+/// before the sample payload so the result round-trips through the
+/// `SSND` reader in [`parse`], whose `samples` slice begins at
+/// byte `8 + offset` of the body.
+///
+/// The §5.0 caller convention — "Applications that don't care about
+/// block alignment should set blockSize and offset to zero" — is the
+/// common case and emits a body that is just `0,0,0,0,0,0,0,0` followed
+/// by the samples.
+///
+/// As with every other AIFF write-side helper in this module, this
+/// returns a chunk *body*; the 8-byte chunk header (`'SSND' + ckSize`)
+/// and any outer odd-length pad byte (§5.0 ¶ "If soundData[] contains
+/// an odd number of bytes, a zero pad byte is added at the end") are
+/// the caller's responsibility — see [`crate::aiff::frame_chunk`],
+/// which applies both.
+pub fn write_sound_data(sound: &SoundData<'_>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + sound.offset as usize + sound.samples.len());
+    out.extend_from_slice(&sound.offset.to_be_bytes());
+    out.extend_from_slice(&sound.block_size.to_be_bytes());
+    // §5.0: `offset` bytes of block-alignment padding precede the
+    // first sample frame. The spec assigns no meaning to these bytes
+    // beyond "where the first sample frame [...] starts", so we emit
+    // zeros — matching the reader, which slices `samples` from
+    // `8 + offset` and never inspects this gap.
+    out.resize(8 + sound.offset as usize, 0);
+    out.extend_from_slice(sound.samples);
+    out
+}
+
 /// Result of walking a FORM chunk.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Form<'a> {
@@ -1101,5 +1141,124 @@ mod tests {
             .map(|a| a.as_str().unwrap())
             .collect();
         assert_eq!(annos, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn write_sound_data_zero_offset_layout() {
+        // The §5.0 common case: offset == blockSize == 0, so the body
+        // is eight zero bytes followed by the raw samples.
+        let pcm: &[u8] = &[0x11, 0x22, 0x33, 0x44];
+        let sd = SoundData {
+            offset: 0,
+            block_size: 0,
+            samples: pcm,
+        };
+        let body = write_sound_data(&sd);
+        let mut expected = vec![0u8; 8];
+        expected.extend_from_slice(pcm);
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn write_sound_data_round_trips_through_parse() {
+        // A full FORM/AIFF assembled with the SSND body emitted by
+        // write_sound_data must parse back to an identical SoundData.
+        let pcm: Vec<u8> = (0..8u8).collect();
+        let frames = (pcm.len() / 2) as u32; // mono, 16-bit
+        let mut comm_body = Vec::new();
+        comm_body.extend_from_slice(&1_i16.to_be_bytes());
+        comm_body.extend_from_slice(&frames.to_be_bytes());
+        comm_body.extend_from_slice(&16_i16.to_be_bytes());
+        comm_body.extend_from_slice(&ext(44_100.0));
+
+        let sd = SoundData {
+            offset: 0,
+            block_size: 0,
+            samples: &pcm,
+        };
+        let ssnd_body = write_sound_data(&sd);
+
+        let mut inner = Vec::new();
+        inner.extend_from_slice(b"AIFF");
+        inner.extend_from_slice(&pack(b"COMM", &comm_body));
+        inner.extend_from_slice(&pack(b"SSND", &ssnd_body));
+        let mut f = Vec::new();
+        f.extend_from_slice(b"FORM");
+        f.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        f.extend_from_slice(&inner);
+
+        let parsed = parse(&f).unwrap();
+        let sound = parsed.sound.unwrap();
+        assert_eq!(sound.offset, 0);
+        assert_eq!(sound.block_size, 0);
+        assert_eq!(sound.samples, &pcm[..]);
+    }
+
+    #[test]
+    fn write_sound_data_nonzero_offset_aligns_samples() {
+        // A non-zero `offset` inserts that many alignment bytes before
+        // the first sample frame (§5.0 Block-Aligning Sound Data). The
+        // reader slices `samples` from `8 + offset`, so a round-trip
+        // must recover the original samples exactly while preserving
+        // offset/blockSize.
+        let pcm: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let offset = 6u32;
+        let block_size = 512u32;
+        let sd = SoundData {
+            offset,
+            block_size,
+            samples: &pcm,
+        };
+        let body = write_sound_data(&sd);
+        // 8 header bytes + `offset` alignment bytes + samples.
+        assert_eq!(body.len(), 8 + offset as usize + pcm.len());
+        // The alignment gap is all zeros.
+        assert!(body[8..8 + offset as usize].iter().all(|&b| b == 0));
+        // offset/blockSize fields are the big-endian header words.
+        assert_eq!(&body[0..4], &offset.to_be_bytes());
+        assert_eq!(&body[4..8], &block_size.to_be_bytes());
+
+        // Round-trip through a full FORM.
+        let frames = (pcm.len() / 2) as u32;
+        let mut comm_body = Vec::new();
+        comm_body.extend_from_slice(&1_i16.to_be_bytes());
+        comm_body.extend_from_slice(&frames.to_be_bytes());
+        comm_body.extend_from_slice(&16_i16.to_be_bytes());
+        comm_body.extend_from_slice(&ext(44_100.0));
+
+        let mut inner = Vec::new();
+        inner.extend_from_slice(b"AIFF");
+        inner.extend_from_slice(&pack(b"COMM", &comm_body));
+        inner.extend_from_slice(&pack(b"SSND", &body));
+        let mut f = Vec::new();
+        f.extend_from_slice(b"FORM");
+        f.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        f.extend_from_slice(&inner);
+
+        let parsed = parse(&f).unwrap();
+        let sound = parsed.sound.unwrap();
+        assert_eq!(sound.offset, offset);
+        assert_eq!(sound.block_size, block_size);
+        assert_eq!(sound.samples, &pcm[..]);
+    }
+
+    #[test]
+    fn write_sound_data_pairs_with_frame_chunk() {
+        // frame_chunk(b"SSND", write_sound_data(..)) must be the exact
+        // inverse of the ChunkIter walk: header + body + odd-length pad.
+        use crate::aiff::chunk::{frame_chunk, ChunkIter};
+        let pcm: &[u8] = &[1, 2, 3]; // odd sample length → forces the pad byte
+        let sd = SoundData {
+            offset: 0,
+            block_size: 0,
+            samples: pcm,
+        };
+        let body = write_sound_data(&sd);
+        let framed = frame_chunk(b"SSND", &body).unwrap();
+        let mut it = ChunkIter::new(&framed);
+        let chunk = it.next().unwrap().unwrap();
+        assert_eq!(&chunk.id, b"SSND");
+        assert_eq!(chunk.data, &body[..]);
+        assert!(it.next().is_none());
     }
 }

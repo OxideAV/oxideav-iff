@@ -36,6 +36,10 @@
 //!   including the AIFF-C `compressionType` + Pascal-string
 //!   compression name.
 //! * `FVER` + `SSND` + the top-level FORM walker ([`form::parse`]).
+//!   The `SSND` body also has a matching writer
+//!   ([`form::write_sound_data`]) emitting the §5.0 `offset` +
+//!   `blockSize` + alignment-padding + `soundData` layout, the
+//!   block-aligning inverse of the `SSND` reader.
 //! * PCM compression-flavour readers ([`pcm::decode_pcm`]) for the
 //!   uncompressed AIFF-C `compressionType` FourCCs **`NONE`**,
 //!   **`twos`**, **`sowt`**, **`raw `**, **`fl32`**/`FL32`, and
@@ -169,7 +173,7 @@ pub use common::{
 };
 pub use error::{AiffError, Result};
 pub use extended::{decode_extended, decode_sample_rate, encode_extended, encode_sample_rate};
-pub use form::{parse, Form, SoundData};
+pub use form::{parse, write_sound_data, Form, SoundData};
 pub use instrument::{
     parse_instrument_chunk, write_instrument_chunk, InstrumentChunk, Loop, PlayMode, ResolvedLoop,
 };
