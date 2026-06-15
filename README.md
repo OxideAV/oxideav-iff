@@ -313,11 +313,11 @@ list).
   literal-RGB BODY and the decoder rejects it; alpha is always
   `0xFF` on decode and is dropped on encode (24-bit ILBM has no
   transparent-colour key either).
-- Cross-validated end-to-end against ImageMagick's `magick convert`
-  (delegate `ilbmtoppm` → PPM → pixel-compare). Set
+- Cross-validated end-to-end against an external ILBM-capable image
+  tool (decode → PPM → pixel-compare; black-box validator only). Set
   `OXIDEAV_IFF_MAGICK_CROSS=1` to enable the cross-decode tests; they
   silently skip when the binary or its delegate isn't installed so CI
-  stays green on hosts without ImageMagick.
+  stays green on hosts without it.
 
 ### PBM — DPaint II / Brilliance chunky sibling
 
@@ -673,58 +673,27 @@ order they appear in the FORM" requires.
 
 The chunk walker (`chunk.rs`) is format-agnostic; SMUS (music score)
 and MAUD are natural follow-ons that reuse the same FORM/LIST/CAT
-reader. ANIM op-7 (short / long vertical delta) decode landed in
-r192; r209 ships the matching **op-7 encoder** (short + long data
-variants) and extends the container walker to accept the `DLTA`
-chunk id alongside `BODY` so all delta streams decode through the
-same path. r276 lands **op-2 / op-3 (Long / Short Delta mode)**
-decode + encode from the spec's §1.2.2 / §1.2.3 / §2.2.1 — see the
-ANIM section above. r287 lands **op-4 (Generalized short/long
-Delta mode)** decode + encode from §1.2.4 / §2.2.2 (the
-`SetDLTAshort` reference routine — word-unit pointers, absolute
-`(offset, size)` op pairs, Same/Uniq run classes, `ANHD.bits`
-variant selection). r302 lands **op-1 (XOR ILBM mode)** decode +
-encode for the full-frame case from §1.2.1 / §1.3 / §2.1 — see the
-ANIM section above. Remaining ANIM gaps: the op-1 partial-rectangle
-/ plane-masked variant (§2.1 `mask` / `w` / `h` / `x` / `y` "XOR mode
-only" fields) needs a staged wire description of how the partial BODY
-is laid out before it can be decoded; op-8 and DEEP / TVPP / RGB8 /
-RGBN true-colour IFF chunks remain blocked on docs — none has a spec
-section staged in `docs/image/iff/` (the only ANIM appendix present
-covers op-7, and op-8 is name-dropped without a wire format).
+reader.
 
-AIFF-side r209 surfaces the previously-skipped optional chunks
-end-to-end: **COMT** (timestamped comments, optional `MarkerId`
-linkage), **AESD** (24-byte AES channel-status block with the
-recording-emphasis field exposed), and **APPL** (application-
-specific, `pdos` / `stoc` / Macintosh dialect classification).
-r215 adds **MIDI** (§10.0 MIDI Data) chunk surfacing — multiple
-chunks per FORM in document order, raw byte stream preserved
-verbatim with `is_sysex` / `len` / `is_empty` classifiers plus a
-write-side helper; the SMF event-level decode lives in the
-`oxideav-midi` sibling crate. r220 surfaces the §13.0 **text
-chunks** (`NAME` / `AUTH` / `(c) ` / `ANNO`) — see the dedicated
-section above. r227 surfaces **SAXL** (§8.0 / Appendix D Sound
-Accelerator) chunks — `SaxelChunk` → `Vec<Saxel>` with each entry
-linking a `MarkerId` to a compression-type-specific priming-data
-byte stream, multiple chunks per FORM in document order, plus a
-write-side helper and a `Saxel::resolve_marker` / `SaxelChunk::by_marker_id`
-lookup pair. The §8.0 ¶ "Under Construction" / Appendix D ¶
-"Caution" status of the mechanism means the parser preserves
-`data` verbatim rather than interpreting it against any specific
-compression algorithm. Write-side encoders for **MARK**, **INST**,
-**COMT**, **AESD**, **APPL**, **MIDI**, **SAXL**, and the §13.0
-text chunks complete the round-trip story; encoders building a
-FORM AIFF / AIFC can now emit every chunk class the read path
-surfaces. The remaining AIFF-C §x.x surfaces are saturated — Apple
-shipped 13 chunk classes (FVER, COMM, SSND, MARK, INST, COMT,
-AESD, APPL, MIDI, SAXL, NAME, AUTH, (c)  + ANNO) and this crate
-now reads + writes every one of them. r243 surfaces the §14
-**chunk-precedence** rules through the [`aiff::ChunkClass`]
-ranked enum and the [`aiff::Form::precedence_order`] /
-[`aiff::Form::highest_precedence_class`] helpers — see the
-"AIFF-C §14 chunk precedence" section above for the ranked
-table and the §14 worked example mapping.
+ANIM coverage spans op-0 (literal), op-1 (XOR ILBM, full-frame),
+op-2/op-3 (Long/Short Delta), op-4 (Generalized short/long Delta),
+op-5 (Byte Vertical Delta), and op-7 (Short/Long Vertical Delta) —
+decode + encode for each. Remaining ANIM gaps: the op-1
+partial-rectangle / plane-masked variant (§2.1 `mask` / `w` / `h` /
+`x` / `y` "XOR mode only" fields) needs a staged wire description of
+the partial BODY layout; op-8 and the DEEP / TVPP / RGB8 / RGBN
+true-colour IFF chunks remain blocked on docs — none has a spec
+section staged in `docs/image/iff/`.
+
+AIFF-C coverage is saturated: Apple shipped 13 chunk classes (FVER,
+COMM, SSND, MARK, INST, COMT, AESD, APPL, MIDI, SAXL, NAME, AUTH,
+`(c) ` + ANNO) and this crate reads + writes every one, including the
+§14 chunk-precedence ranking via [`aiff::ChunkClass`] and the
+[`aiff::Form::precedence_order`] /
+[`aiff::Form::highest_precedence_class`] helpers. The SMF event-level
+MIDI decode lives in the `oxideav-midi` sibling crate; codec-bearing
+`compressionType` FourCCs are routed to sibling codec crates rather
+than decoded here.
 
 ## Fuzzing
 
