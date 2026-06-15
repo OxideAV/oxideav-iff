@@ -268,7 +268,8 @@ pub fn probe(buf: &[u8]) -> u8 {
 /// Parse a FORM/ANIM container.
 ///
 /// Currently supports `ANHD.operation = 0` (literal full BODY),
-/// `ANHD.operation = 1` (XOR ILBM mode, full-frame case),
+/// `ANHD.operation = 1` (XOR ILBM mode, full-frame rectangle —
+/// all-planes or §2.1 `mask` plane-subset),
 /// `ANHD.operation = 2` / `= 3` (Long / Short Delta mode),
 /// `ANHD.operation = 4` (Generalized short/long Delta mode),
 /// `ANHD.operation = 5` (Byte Vertical Delta) and `ANHD.operation = 7`
@@ -754,18 +755,34 @@ fn apply_op5(planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -> Result<()> {
 /// value." This decoder expands the BODY into the full planar bitmap
 /// and XORs it byte-for-byte into the running planar state.
 ///
-/// **Scope.** This implements the §1.2.1 *full-frame* XOR case the
-/// spec describes byte-exactly: the BODY covers the whole bitmap and
-/// every colour plane participates. The §2.1 ANHD "XOR mode only"
-/// fields (`mask` plane-selector, `w`/`h`/`x`/`y` rectangular
-/// changed-area) narrow the BODY to a sub-rectangle / plane subset to
-/// "eliminate unnecessary un-changed data", but the staged spec gives
-/// no wire description of how the resulting partial BODY is laid out
-/// (row stride within the rectangle, plane interleave order under a
-/// sparse `mask`). Rather than guess that layout, a partial-rectangle
-/// or plane-masked ANHD is rejected with `Error::unsupported` and
-/// surfaced as a docs gap; full-frame XOR (`mask` all-planes-or-zero,
-/// `w == width`, `h == height`, `x == 0`, `y == 0`) is decoded.
+/// **Scope.** This implements the §1.2.1 XOR case for the *full-frame
+/// rectangle* (`x == 0`, `y == 0`, `w == width`, `h == height`),
+/// covering both the all-planes BODY and the §2.1 `mask` plane-subset
+/// BODY. §2.1 defines `mask` byte-exactly — "plane mask where each bit
+/// is set =1 if there is data and =0 if not." When the rectangle is the
+/// whole bitmap there is no intra-rectangle stride or `x` bit-alignment
+/// to resolve: the BODY is simply the stack of full-width
+/// (`row_bytes`-wide) scanline rows for *only the planes whose mask bit
+/// is set*, in ascending plane order, interleaved scanline-by-scanline
+/// exactly as a full ILBM BODY is — so plane `p`'s row for scanline `y`
+/// is present iff `mask` bit `p` is set. Run-length (ByteRun1) or
+/// uncompressed per `BMHD.compression`; a `0` byte in the XOR bitmap
+/// leaves the running byte untouched (§1.3).
+///
+/// What stays rejected is the genuine *sub-rectangle* (`x != 0 ||
+/// y != 0 || w != width || h != height`): the staged spec gives no wire
+/// description of the row stride within a narrower rectangle nor of how
+/// the rectangle's left edge `x` aligns to a byte/bit boundary inside
+/// each plane row, so decoding it would require guessing that layout.
+/// Such an ANHD returns `Error::unsupported` and is surfaced as a docs
+/// gap.
+///
+/// The optional `HasMask` scanline plane (ILBM mask plane) is *not* a
+/// colour plane and is not addressed by the ANHD `mask` bits; whether
+/// it participates in a plane-subset XOR BODY is undocumented, so a
+/// sparse plane mask is only accepted when the bitmap carries no
+/// `HasMask` plane. A `HasMask` bitmap may still use the all-planes
+/// XOR BODY (every row, including the mask scanline, present).
 fn apply_op1(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -> Result<()> {
     let n_planes = bmhd.n_planes as usize;
     let has_mask = bmhd.masking == Masking::HasMask;
@@ -773,36 +790,80 @@ fn apply_op1(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -> 
     let row_bytes = bmhd.row_bytes();
     let height = bmhd.height as usize;
 
-    // Reject the partial-rectangle / plane-mask variant whose BODY
-    // layout the staged spec does not describe (see doc comment).
-    let full_plane_mask = anhd.mask == 0 || anhd.mask == op1_full_plane_mask(n_planes);
+    // The genuine sub-rectangle layout is undocumented (see doc comment).
     let full_rect = anhd.w == bmhd.width && anhd.h == bmhd.height && anhd.x == 0 && anhd.y == 0;
-    if !full_plane_mask || !full_rect {
+    if !full_rect {
         return Err(Error::unsupported(
-            "ANIM op 1: partial-rectangle / plane-masked XOR BODY layout is not described in the staged spec (full-frame XOR only)",
+            "ANIM op 1: sub-rectangle XOR BODY layout is not described in the staged spec (full-frame rectangle only)",
         ));
     }
 
-    let total_rows = height * planes_per_row;
+    // `mask == 0` is treated as "all colour planes present" (the
+    // encoder's all-planes tag and the historical full-frame BODY both
+    // map here); a non-zero mask selects the §2.1 plane subset.
+    let all_planes_mask = op1_full_plane_mask(n_planes);
+    let plane_mask = if anhd.mask == 0 {
+        all_planes_mask
+    } else {
+        anhd.mask
+    };
 
-    // Expand the BODY into the full planar XOR-bitmap, then XOR it into
-    // the running state. ByteRun1 rows decode independently; an
-    // uncompressed BODY is a flat stack of `row_bytes`-sized rows.
-    if bmhd.compression == Compression::None {
-        let need = total_rows * row_bytes;
-        if delta.len() < need {
-            return Err(Error::invalid("ANIM op 1: uncompressed XOR BODY too short"));
+    // Decide which interleaved rows the BODY carries. For the all-planes
+    // case every row participates (colour planes + any HasMask scanline).
+    // For a sparse plane subset only the selected colour-plane rows are
+    // present; the HasMask scanline's participation is undocumented, so a
+    // sparse mask on a HasMask bitmap is rejected rather than guessed.
+    let sparse = plane_mask != all_planes_mask;
+    if sparse && has_mask {
+        return Err(Error::unsupported(
+            "ANIM op 1: plane-masked XOR BODY on a HasMask bitmap is not described in the staged spec",
+        ));
+    }
+
+    // `row_present[k]` for the `k`-th interleaved row within a scanline
+    // (`0..planes_per_row`): a colour plane is present iff its mask bit
+    // is set; the HasMask scanline (only reachable in the all-planes
+    // case here) is always present.
+    let row_present = |k: usize| -> bool {
+        if k < n_planes {
+            (plane_mask >> k) & 1 != 0
+        } else {
+            true // HasMask scanline (all-planes case only)
         }
-        for (i, chunk) in delta[..need].chunks_exact(row_bytes).enumerate() {
-            xor_row_into(&mut planar[i], chunk);
+    };
+
+    // Expand the BODY into the XOR-bitmap rows the mask selects and XOR
+    // each into the running state. ByteRun1 rows decode independently;
+    // an uncompressed BODY is a flat stack of `row_bytes`-sized rows in
+    // the same scanline-interleaved order, skipping unselected planes.
+    if bmhd.compression == Compression::None {
+        let mut input = delta;
+        for y in 0..height {
+            for k in 0..planes_per_row {
+                if !row_present(k) {
+                    continue;
+                }
+                if input.len() < row_bytes {
+                    return Err(Error::invalid("ANIM op 1: uncompressed XOR BODY too short"));
+                }
+                let idx = y * planes_per_row + k;
+                xor_row_into(&mut planar[idx], &input[..row_bytes]);
+                input = &input[row_bytes..];
+            }
         }
     } else {
         let mut input = delta;
-        for row in planar.iter_mut().take(total_rows) {
-            let mut decoded = Vec::with_capacity(row_bytes);
-            let consumed = byterun1_decode_row(input, row_bytes, &mut decoded)?;
-            input = &input[consumed..];
-            xor_row_into(row, &decoded);
+        for y in 0..height {
+            for k in 0..planes_per_row {
+                if !row_present(k) {
+                    continue;
+                }
+                let mut decoded = Vec::with_capacity(row_bytes);
+                let consumed = byterun1_decode_row(input, row_bytes, &mut decoded)?;
+                input = &input[consumed..];
+                let idx = y * planes_per_row + k;
+                xor_row_into(&mut planar[idx], &decoded);
+            }
         }
     }
     Ok(())

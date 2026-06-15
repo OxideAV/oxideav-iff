@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(anim)* op-1 XOR ILBM mode now decodes the §2.1 `mask` plane-subset
+  BODY for the full-frame rectangle, not just the all-planes BODY.
+  A sparse `mask` carries the scanline-interleaved rows of only the
+  selected colour planes (ascending plane order); genuine
+  sub-rectangles and plane-masked `HasMask` bitmaps stay rejected as
+  undocumented wire layouts.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-iff/compare/v0.0.8...v0.0.9) - 2026-06-15
 
 ### Added

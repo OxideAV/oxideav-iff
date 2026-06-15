@@ -335,7 +335,7 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
 |------------------------------------------|:----:|:-----:|
 | `ANHD` Animation Header (40 bytes)       |  Y   |   Y   |
 | Op 0 — full literal BODY                 |  Y   |   Y   |
-| Op 1 — XOR ILBM mode (full-frame)        |  Y   |   Y   |
+| Op 1 — XOR ILBM mode (full-rect, masked planes) |  Y   |   Y   |
 | Op 2 — Long Delta mode                   |  Y   |   Y   |
 | Op 3 — Short Delta mode                  |  Y   |   Y   |
 | Op 4 — Generalized short/long Delta      |  Y   |   Y   |
@@ -360,14 +360,20 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
   encoded (ByteRun1 or uncompressed per `BMHD.compression`). The
   decoder expands that BODY and XORs it into the running planar state;
   a zero byte in the XOR bitmap leaves the running byte unchanged
-  (§1.3). Only the **full-frame** case (whole bitmap, all colour
-  planes) is decoded — the §2.1 "XOR mode only" ANHD `mask` plane-
-  selector and `w`/`h`/`x`/`y` rectangular changed-area narrow the BODY
-  to a plane subset / sub-rectangle whose wire layout the staged spec
-  does not describe, so a plane-masked or partial-rectangle ANHD is
-  rejected with `Error::unsupported`. The encoder tags each delta with
-  the all-planes `mask` and full-frame `w`/`h` so a round-trip stays in
-  the documented case.
+  (§1.3). The **full-frame rectangle** is decoded in both forms: the
+  all-planes BODY and the §2.1 `mask` plane-subset BODY ("plane mask
+  where each bit is set =1 if there is data and =0 if not"). When the
+  rectangle is the whole bitmap there is no intra-rectangle stride or
+  `x` bit-alignment to resolve, so a sparse `mask` simply means the
+  BODY carries the scanline-interleaved rows of only the selected
+  colour planes, in ascending plane order. The genuine **sub-rectangle**
+  (`x`/`y` non-zero or `w`/`h` narrower than the bitmap) stays rejected
+  with `Error::unsupported` — the staged spec gives no wire description
+  of the narrower row stride or the rectangle's `x` byte/bit alignment.
+  A plane-masked BODY on a `HasMask` bitmap is also rejected because the
+  mask scanline's participation in the §2.1 plane mask is undocumented.
+  The encoder tags each delta with the all-planes `mask` and full-frame
+  `w`/`h` so a round-trip always emits the unambiguous case.
 - Op-0 (full literal BODY) and op-5 (Byte Vertical Delta) round-trip
   through the public encoder. Op-5 emits the canonical
   pointer-table + per-plane column op-stream: each column's run-
@@ -678,11 +684,13 @@ reader.
 ANIM coverage spans op-0 (literal), op-1 (XOR ILBM, full-frame),
 op-2/op-3 (Long/Short Delta), op-4 (Generalized short/long Delta),
 op-5 (Byte Vertical Delta), and op-7 (Short/Long Vertical Delta) —
-decode + encode for each. Remaining ANIM gaps: the op-1
-partial-rectangle / plane-masked variant (§2.1 `mask` / `w` / `h` /
-`x` / `y` "XOR mode only" fields) needs a staged wire description of
-the partial BODY layout; op-8 and the DEEP / TVPP / RGB8 / RGBN
-true-colour IFF chunks remain blocked on docs — none has a spec
+decode + encode for each. Op-1 now decodes both the all-planes and the
+§2.1 `mask` plane-subset XOR BODY for the full-frame rectangle.
+Remaining ANIM gaps: the op-1 genuine **sub-rectangle** variant (§2.1
+`w` / `h` / `x` / `y` narrower-than-bitmap "XOR mode only" fields)
+needs a staged wire description of the narrower row stride + the
+rectangle `x` byte/bit alignment; op-8 and the DEEP / TVPP / RGB8 /
+RGBN true-colour IFF chunks remain blocked on docs — none has a spec
 section staged in `docs/image/iff/`.
 
 AIFF-C coverage is saturated: Apple shipped 13 chunk classes (FVER,

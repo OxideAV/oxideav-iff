@@ -217,6 +217,140 @@ fn op1_decoder_rejects_partial_rectangle() {
     );
 }
 
+/// Build the planar (interleaved scanline) bitmap of a frame so a test
+/// can hand-construct an XOR BODY against it. Returns `height *
+/// planes_per_row` rows of `row_bytes` bytes each. No `HasMask`.
+fn frame_planar(frame: &IlbmImage) -> Vec<Vec<u8>> {
+    let bmhd = &frame.bmhd;
+    let n_planes = bmhd.n_planes as usize;
+    let row_bytes = bmhd.row_bytes();
+    let w = bmhd.width as usize;
+    let h = bmhd.height as usize;
+    // Recover a palette index per pixel by matching the RGBA against the
+    // frame palette (test palettes are distinct so this is exact).
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(h * n_planes);
+    for y in 0..h {
+        let mut rows: Vec<Vec<u8>> = (0..n_planes).map(|_| vec![0u8; row_bytes]).collect();
+        for x in 0..w {
+            let off = (y * w + x) * 4;
+            let rgb = [frame.rgba[off], frame.rgba[off + 1], frame.rgba[off + 2]];
+            let idx = frame.palette.iter().position(|p| *p == rgb).unwrap_or(0) as u32;
+            for (p, row) in rows.iter_mut().enumerate() {
+                if (idx >> p) & 1 != 0 {
+                    row[x / 8] |= 0x80 >> (x % 8);
+                }
+            }
+        }
+        out.extend(rows);
+    }
+    out
+}
+
+#[test]
+fn op1_plane_masked_full_rectangle_decodes() {
+    // §2.1 `mask` plane-subset XOR BODY, full-frame rectangle. Two
+    // 3-plane frames differ only in plane 1's bits, so a valid XOR BODY
+    // can carry just that plane (mask = 0b010) and the decoder must
+    // reconstruct the new frame exactly.
+    let pal: Vec<[u8; 3]> = (0..8)
+        .map(|i| [i as u8 * 32, i as u8, 255 - i as u8])
+        .collect();
+    // frame0: index bit0 = (x&1), bit2 = (y&1); plane 1 always 0.
+    let frame0 = make_frame_planes(16, 4, 3, Compression::None, &pal, |x, y| {
+        ((x & 1) | ((y & 1) << 2)) as u8
+    });
+    // frame1: same bit0/bit2 pattern, but plane 1 = (x>>1)&1 toggled in.
+    let frame1 = make_frame_planes(16, 4, 3, Compression::None, &pal, |x, y| {
+        ((x & 1) | (((x >> 1) & 1) << 1) | ((y & 1) << 2)) as u8
+    });
+
+    let pl0 = frame_planar(&frame0);
+    let pl1 = frame_planar(&frame1);
+    let bmhd = &frame1.bmhd;
+    let n_planes = bmhd.n_planes as usize;
+    let row_bytes = bmhd.row_bytes();
+    let h = bmhd.height as usize;
+
+    // Build an uncompressed XOR BODY that carries ONLY plane 1 (the only
+    // changed plane), scanline-interleaved: for each scanline emit the
+    // single masked plane-1 row of (new XOR old).
+    let masked_plane = 1usize;
+    let mut body = Vec::new();
+    for y in 0..h {
+        let idx = y * n_planes + masked_plane;
+        let xor: Vec<u8> = pl1[idx]
+            .iter()
+            .zip(pl0[idx].iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
+        body.extend_from_slice(&xor);
+    }
+    assert_eq!(body.len(), h * row_bytes);
+
+    // Sanity: planes 0 and 2 are identical between the two frames, so the
+    // mask correctly excludes them.
+    for p in [0usize, 2] {
+        for y in 0..h {
+            let idx = y * n_planes + p;
+            assert_eq!(pl0[idx], pl1[idx], "plane {p} must be unchanged");
+        }
+    }
+
+    let anhd = Anhd {
+        operation: 1,
+        mask: 1 << masked_plane, // 0b010
+        w: 16,
+        h: h as u16,
+        x: 0,
+        y: 0,
+        ..Default::default()
+    };
+    let mut state = pl0.clone();
+    apply_op1_for_test(&anhd, &mut state, &body, bmhd).unwrap();
+    assert_eq!(state, pl1, "plane-masked XOR reconstructs frame1 planar");
+}
+
+#[test]
+fn op1_plane_masked_byterun1_decodes() {
+    // Same idea but with a ByteRun1-compressed single-plane XOR BODY.
+    let pal: Vec<[u8; 3]> = (0..4).map(|i| [i as u8 * 64, 0, 0]).collect();
+    let frame0 = make_frame_planes(24, 3, 2, Compression::ByteRun1, &pal, |_x, _y| 0);
+    let frame1 = make_frame_planes(24, 3, 2, Compression::ByteRun1, &pal, |x, _y| {
+        (((x >> 2) & 1) << 1) as u8 // toggles plane 1 only
+    });
+    let pl0 = frame_planar(&frame0);
+    let pl1 = frame_planar(&frame1);
+    let bmhd = &frame1.bmhd;
+    let n_planes = bmhd.n_planes as usize;
+    let h = bmhd.height as usize;
+
+    // ByteRun1-encode each scanline's plane-1 XOR row.
+    let masked_plane = 1usize;
+    let mut body = Vec::new();
+    for y in 0..h {
+        let idx = y * n_planes + masked_plane;
+        let xor: Vec<u8> = pl1[idx]
+            .iter()
+            .zip(pl0[idx].iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
+        body.extend_from_slice(&oxideav_iff::ilbm::byterun1_encode_row(&xor));
+    }
+
+    let anhd = Anhd {
+        operation: 1,
+        mask: 1 << masked_plane,
+        w: 24,
+        h: h as u16,
+        x: 0,
+        y: 0,
+        ..Default::default()
+    };
+    let mut state = pl0.clone();
+    apply_op1_for_test(&anhd, &mut state, &body, bmhd).unwrap();
+    assert_eq!(state, pl1);
+}
+
 #[test]
 fn op1_anhd_full_plane_mask_roundtrips() {
     // The encoder tags the delta ANHD with the all-planes mask; the
