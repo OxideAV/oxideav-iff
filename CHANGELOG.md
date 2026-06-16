@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(anim)* the §2.1 ANHD `interleave` field is now honoured during
+  delta-frame reconstruction. A delta modifies the frame `interleave`
+  frames back — `0` defaults to **two** frames back (the DeluxePaint
+  double-buffering convention), `n` means n frames back — instead of
+  always the immediately-previous frame. The decoder keeps a per-frame
+  planar history and selects the referenced buffer (clamped to the seed
+  for the first delta(s) per the §1.3 bootstrap). This corrects decode
+  of standard double-buffered ANIMs whose deltas were computed against
+  the 2-back frame. The in-tree multi-frame encoders, which compute each
+  frame as a delta against the immediately-previous frame, now tag
+  `interleave = 1` so a full encode → decode round-trip stays
+  pixel-exact.
+
 ### Added
 
 - *(anim)* op-1 XOR ILBM mode now decodes the §2.1 `mask` plane-subset

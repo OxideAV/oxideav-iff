@@ -275,6 +275,13 @@ pub fn probe(buf: &[u8]) -> u8 {
 /// `ANHD.operation = 5` (Byte Vertical Delta) and `ANHD.operation = 7`
 /// (Short / Long Vertical Delta). Other operations
 /// return `Error::Unsupported`.
+///
+/// Each delta frame's §2.1 `ANHD.interleave` field selects which earlier
+/// frame the delta modifies: `interleave = n` references the buffer `n`
+/// frames back, and `interleave = 0` defaults to **two** frames back
+/// (the DeluxePaint double-buffering convention). The reference is
+/// clamped to the seed frame for the first delta(s), matching the §1.3
+/// bootstrap where both double-buffers hold a copy of frame 0.
 pub fn parse_anim(bytes: &[u8]) -> Result<AnimImage> {
     if bytes.len() < 12 {
         return Err(Error::invalid("ANIM: file shorter than FORM header"));
@@ -293,7 +300,12 @@ pub fn parse_anim(bytes: &[u8]) -> Result<AnimImage> {
 
     // Walk the outer FORM. Children are nested FORM ILBM groups.
     let mut frames: Vec<IlbmImage> = Vec::new();
-    let mut prev_planar: Option<Vec<Vec<u8>>> = None;
+    // Per-frame planar history. `planar_history[i]` is the reconstructed
+    // planar bitmap for output frame `i`. A delta frame modifies the
+    // buffer `interleave` frames back (§2.1 ANHD `interleave`; `0`
+    // defaults to two frames back — the DeluxePaint double-buffering
+    // convention) rather than always the immediately-previous frame.
+    let mut planar_history: Vec<Vec<Vec<u8>>> = Vec::new();
     let mut bmhd: Option<Bmhd> = None;
     let mut palette: Vec<[u8; 3]> = Vec::new();
     let mut camg = Camg::default();
@@ -342,7 +354,7 @@ pub fn parse_anim(bytes: &[u8]) -> Result<AnimImage> {
                     camg = img.camg;
                     // Recover the planar form so we can apply deltas
                     // against it. Re-encode by walking the BODY.
-                    prev_planar = Some(rgba_to_planar(&img));
+                    planar_history.push(rgba_to_planar(&img));
                     frames.push(img);
                 } else {
                     // Subsequent ILBM: delta. Walk the inner FORM for
@@ -386,12 +398,28 @@ pub fn parse_anim(bytes: &[u8]) -> Result<AnimImage> {
                     let delta = delta_body.ok_or_else(|| {
                         Error::invalid("ANIM: delta frame missing BODY/DLTA chunk")
                     })?;
-                    let mut planar = prev_planar.clone().ok_or_else(|| {
+                    // §2.1: `interleave` is how many frames back this
+                    // delta modifies. `0` defaults to two frames back
+                    // (double-buffering). The reference is clamped to the
+                    // seed frame for the first delta(s), which is exactly
+                    // the §1.3 bootstrap where both double-buffers hold a
+                    // copy of frame 0 before the first delta is applied.
+                    let back = if anhd.interleave == 0 {
+                        2
+                    } else {
+                        anhd.interleave as usize
+                    };
+                    let cur_index = frames.len();
+                    // Saturating: when `back` would point before frame 0
+                    // (the first one or two deltas) the seed buffer is the
+                    // referenced double-buffer per §1.3.
+                    let src_index = cur_index.saturating_sub(back);
+                    let mut planar = planar_history.get(src_index).cloned().ok_or_else(|| {
                         Error::invalid("ANIM: delta frame with no prior planar state")
                     })?;
                     apply_delta(&anhd, &mut planar, &delta, &bmhd)?;
                     let img = planar_to_rgba(&planar, &bmhd, &palette, &camg)?;
-                    prev_planar = Some(planar);
+                    planar_history.push(planar);
                     frames.push(img);
                 }
             }
@@ -1735,7 +1763,11 @@ pub fn encode_anim_op5(frames: &[IlbmImage]) -> Result<Vec<u8>> {
             y: frame.bmhd.y_origin,
             abs_time: 0,
             rel_time: 1,
-            interleave: 0,
+            // These encoders compute each frame as a delta against the
+            // immediately-previous frame, so the §2.1 `interleave` tag
+            // is `1` (modify one frame back), not the `0` double-buffer
+            // default that means two frames back.
+            interleave: 1,
             pad0: 0,
             bits: 0,
         };
@@ -1853,7 +1885,10 @@ pub fn encode_anim_op1(frames: &[IlbmImage]) -> Result<Vec<u8>> {
             y: 0,
             abs_time: 0,
             rel_time: 1,
-            interleave: 0,
+            // Delta computed against the immediately-previous frame:
+            // tag `interleave = 1` so the decoder applies it one frame
+            // back (not the §2.1 `0` double-buffer default of two).
+            interleave: 1,
             pad0: 0,
             bits: 0,
         };
@@ -2214,7 +2249,9 @@ pub fn encode_anim_op7(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
             y: frame.bmhd.y_origin,
             abs_time: 0,
             rel_time: 1,
-            interleave: 0,
+            // Delta against the immediately-previous frame ⇒ one frame
+            // back (§2.1 `interleave`), not the `0` two-back default.
+            interleave: 1,
             pad0: 0,
             bits: if long_data { 1 } else { 0 },
         };
@@ -2506,7 +2543,9 @@ pub fn encode_anim_op4(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
             y: frame.bmhd.y_origin,
             abs_time: 0,
             rel_time: 1,
-            interleave: 0,
+            // Delta against the immediately-previous frame ⇒ one frame
+            // back (§2.1 `interleave`), not the `0` two-back default.
+            interleave: 1,
             pad0: 0,
             // bit 0 = data width, bit 3 = RLC, bit 4 = vertical — the
             // configuration `encode_op4_body` emits and `apply_op4`
@@ -2743,7 +2782,9 @@ fn encode_anim_op23(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>> {
             y: frame.bmhd.y_origin,
             abs_time: 0,
             rel_time: 1,
-            interleave: 0,
+            // Delta against the immediately-previous frame ⇒ one frame
+            // back (§2.1 `interleave`), not the `0` two-back default.
+            interleave: 1,
             pad0: 0,
             bits: 0,
         };
@@ -2806,7 +2847,10 @@ pub fn encode_anim_op0(frames: &[IlbmImage]) -> Result<Vec<u8>> {
             y: frame.bmhd.y_origin,
             abs_time: 0,
             rel_time: 1,
-            interleave: 0,
+            // Op-0 frames are full literal overwrites that ignore prior
+            // state, but the pipeline still produces one frame per step;
+            // tag `interleave = 1` for a uniform single-step ANIM.
+            interleave: 1,
             pad0: 0,
             bits: 0,
         };
@@ -2989,5 +3033,157 @@ mod tests {
         bytes[0..4].copy_from_slice(b"FORM");
         bytes[8..12].copy_from_slice(b"ANIM");
         assert_eq!(probe(&bytes), 100);
+    }
+
+    /// Wrap a chunk body in `ckID + ckSize + body + odd-pad`.
+    fn frame_chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + body.len() + 1);
+        out.extend_from_slice(id);
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(body);
+        if body.len() & 1 == 1 {
+            out.push(0);
+        }
+        out
+    }
+
+    /// Assemble a `FORM ANIM` from a seed ILBM plus a list of delta
+    /// frames, each `(Anhd, op5-DLTA/BODY payload)`. The seed is encoded
+    /// with `encode_ilbm`; every delta frame is an inner `FORM ILBM`
+    /// carrying `ANHD` + `BODY`.
+    fn assemble_anim(seed: &IlbmImage, deltas: &[(Anhd, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FORM");
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"ANIM");
+        let leading = crate::ilbm::encode_ilbm(seed).unwrap();
+        out.extend_from_slice(&leading);
+        if leading.len() & 1 == 1 {
+            out.push(0);
+        }
+        for (anhd, body) in deltas {
+            let anhd_bytes = anhd.write(body.len() as u32);
+            let mut inner = Vec::new();
+            inner.extend_from_slice(b"ILBM");
+            inner.extend_from_slice(&frame_chunk(b"ANHD", &anhd_bytes));
+            inner.extend_from_slice(&frame_chunk(b"BODY", body));
+            out.extend_from_slice(&frame_chunk(b"FORM", &inner));
+        }
+        let form_size = (out.len() - 8) as u32;
+        out[4..8].copy_from_slice(&form_size.to_be_bytes());
+        out
+    }
+
+    /// An `interleave = 0` delta references the frame **two** back
+    /// (DeluxePaint double-buffering), not the immediately-previous
+    /// frame. Build seed = red, frame 1 = green (op-0 literal), frame 2 =
+    /// op-5 delta from the *seed* (red) tagged `interleave = 0`, so the
+    /// decoded frame 2 must be the seed-plus-delta result — proving the
+    /// decoder selected the 2-back buffer, not frame 1.
+    #[test]
+    fn interleave_zero_references_two_frames_back() {
+        let pal = solid_palette();
+        let seed = frame_solid([255, 0, 0, 0xFF], 8, 4, pal.clone()); // index 1
+        let green = frame_solid([0, 255, 0, 0xFF], 8, 4, pal.clone()); // index 2
+        let blue = frame_solid([0, 0, 255, 0xFF], 8, 4, pal.clone()); // index 3
+
+        let seed_planar = rgba_to_planar(&seed);
+        let blue_planar = rgba_to_planar(&blue);
+
+        // Frame 1: full op-0 literal of green.
+        let green_body = encode_full_body(&green).unwrap();
+        let anhd0 = Anhd {
+            operation: 0,
+            w: 8,
+            h: 4,
+            rel_time: 1,
+            interleave: 1,
+            ..Anhd::default()
+        };
+
+        // Frame 2: op-5 delta from the SEED (red) → blue, tagged
+        // interleave = 0 (two frames back ⇒ references the seed).
+        let blue_delta = encode_op5_body(&seed_planar, &blue_planar, &blue.bmhd).unwrap();
+        let anhd_blue = Anhd {
+            operation: 5,
+            w: 8,
+            h: 4,
+            rel_time: 1,
+            interleave: 0,
+            ..Anhd::default()
+        };
+
+        let bytes = assemble_anim(&seed, &[(anhd0, green_body), (anhd_blue, blue_delta)]);
+        let dec = parse_anim(&bytes).unwrap();
+        assert_eq!(dec.frames.len(), 3);
+        // Frame 0 = red, frame 1 = green, frame 2 must be blue because
+        // the delta was applied two frames back (to the red seed), not
+        // to the green frame 1.
+        assert_eq!(&dec.frames[0].rgba[0..3], &[255, 0, 0]);
+        assert_eq!(&dec.frames[1].rgba[0..3], &[0, 255, 0]);
+        assert_eq!(
+            &dec.frames[2].rgba[0..3],
+            &[0, 0, 255],
+            "interleave=0 delta resolved against the 2-back seed buffer"
+        );
+    }
+
+    /// An `interleave = 1` delta references the immediately-previous
+    /// frame. Same construction but the frame-2 delta is computed from
+    /// frame 1 (green) and tagged `interleave = 1`.
+    #[test]
+    fn interleave_one_references_previous_frame() {
+        let pal = solid_palette();
+        let seed = frame_solid([255, 0, 0, 0xFF], 8, 4, pal.clone());
+        let green = frame_solid([0, 255, 0, 0xFF], 8, 4, pal.clone());
+        let blue = frame_solid([0, 0, 255, 0xFF], 8, 4, pal.clone());
+
+        let green_planar = rgba_to_planar(&green);
+        let blue_planar = rgba_to_planar(&blue);
+
+        let green_body = encode_full_body(&green).unwrap();
+        let anhd0 = Anhd {
+            operation: 0,
+            w: 8,
+            h: 4,
+            rel_time: 1,
+            interleave: 1,
+            ..Anhd::default()
+        };
+
+        // delta green → blue, applied one frame back (to green).
+        let blue_delta = encode_op5_body(&green_planar, &blue_planar, &blue.bmhd).unwrap();
+        let anhd_blue = Anhd {
+            operation: 5,
+            w: 8,
+            h: 4,
+            rel_time: 1,
+            interleave: 1,
+            ..Anhd::default()
+        };
+
+        let bytes = assemble_anim(&seed, &[(anhd0, green_body), (anhd_blue, blue_delta)]);
+        let dec = parse_anim(&bytes).unwrap();
+        assert_eq!(dec.frames.len(), 3);
+        assert_eq!(&dec.frames[2].rgba[0..3], &[0, 0, 255]);
+    }
+
+    /// All existing multi-frame encoders now tag `interleave = 1` (they
+    /// compute each frame as a delta against the immediately-previous
+    /// one), so a full encode → decode round-trip is still pixel-exact.
+    #[test]
+    fn encoders_tag_interleave_one_and_roundtrip() {
+        let pal = solid_palette();
+        let frames = vec![
+            frame_solid([255, 0, 0, 0xFF], 8, 4, pal.clone()),
+            frame_solid([0, 255, 0, 0xFF], 8, 4, pal.clone()),
+            frame_solid([0, 0, 255, 0xFF], 8, 4, pal.clone()),
+        ];
+        let bytes = encode_anim_op5(&frames).unwrap();
+        let dec = parse_anim(&bytes).unwrap();
+        assert_eq!(dec.frames.len(), 3);
+        assert_eq!(&dec.frames[0].rgba[0..3], &[255, 0, 0]);
+        assert_eq!(&dec.frames[1].rgba[0..3], &[0, 255, 0]);
+        assert_eq!(&dec.frames[2].rgba[0..3], &[0, 0, 255]);
     }
 }

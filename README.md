@@ -374,6 +374,16 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
   mask scanline's participation in the §2.1 plane mask is undocumented.
   The encoder tags each delta with the all-planes `mask` and full-frame
   `w`/`h` so a round-trip always emits the unambiguous case.
+- The §2.1 `ANHD.interleave` field is honoured during reconstruction:
+  a delta modifies the frame `interleave` frames back — `0` defaults to
+  **two** frames back (the DeluxePaint double-buffering convention),
+  `n` means n frames back — rather than always the immediately-previous
+  frame. The decoder keeps a per-frame planar history and selects the
+  referenced buffer, clamping to the seed for the first delta(s) per the
+  §1.3 bootstrap (both double-buffers start as a copy of frame 0). The
+  in-tree multi-frame encoders compute each frame as a delta against the
+  immediately-previous frame, so they tag `interleave = 1`; a full
+  encode → decode round-trip stays pixel-exact.
 - Op-0 (full literal BODY) and op-5 (Byte Vertical Delta) round-trip
   through the public encoder. Op-5 emits the canonical
   pointer-table + per-plane column op-stream: each column's run-
