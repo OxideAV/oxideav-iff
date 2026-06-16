@@ -272,8 +272,9 @@ pub fn probe(buf: &[u8]) -> u8 {
 /// all-planes or §2.1 `mask` plane-subset),
 /// `ANHD.operation = 2` / `= 3` (Long / Short Delta mode),
 /// `ANHD.operation = 4` (Generalized short/long Delta mode),
-/// `ANHD.operation = 5` (Byte Vertical Delta) and `ANHD.operation = 7`
-/// (Short / Long Vertical Delta). Other operations
+/// `ANHD.operation = 5` (Byte Vertical Delta), `ANHD.operation = 7`
+/// (Short / Long Vertical Delta) and `ANHD.operation = 8`
+/// (Anim8 short / long Vertical Delta). Other operations
 /// return `Error::Unsupported`.
 ///
 /// Each delta frame's §2.1 `ANHD.interleave` field selects which earlier
@@ -660,8 +661,14 @@ fn apply_delta(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -
             let long_data = (anhd.bits & 1) != 0;
             apply_op7(planar, delta, bmhd, long_data)
         }
+        8 => {
+            // Op 8 (Anim8) honours bit 0 of ANHD.bits: 0 = short data
+            // (WORD, 2 B), 1 = long data (LONG, 4 B).
+            let long_data = (anhd.bits & 1) != 0;
+            apply_op8(planar, delta, bmhd, long_data)
+        }
         other => Err(Error::unsupported(format!(
-            "ANIM: ANHD operation {other} not implemented (only 0, 1, 2, 3, 4, 5 and 7 supported)"
+            "ANIM: ANHD operation {other} not implemented (only 0, 1, 2, 3, 4, 5, 7 and 8 supported)"
         ))),
     }
 }
@@ -1076,6 +1083,210 @@ pub fn apply_op7_for_test(
     long_data: bool,
 ) -> Result<()> {
     apply_op7(planar, delta, bmhd, long_data)
+}
+
+/// The per-column item widths for an op-8 plane of `row_bytes` bytes.
+///
+/// Op-8 splits each bitplane into vertical columns whose width is the
+/// data-item width (WORD = 2 B, LONG = 4 B), selected by `ANHD.bits`
+/// bit 0. The §3.2 odd-long edge case applies only when `long_data`:
+/// "if the data is not an even number of longs wide and is to be
+/// long-compressed, the last column of data is word-compressed
+/// instead." So a `row_bytes` that is an odd number of words wide
+/// (`row_bytes / 2` odd) gets `row_bytes / 4` LONG columns plus one
+/// trailing WORD column. Short data is always uniform 2-byte columns.
+///
+/// Returns the list of per-column item widths in left-to-right order
+/// (each entry is `2` or `4`). Returns `None` when `row_bytes` is not a
+/// whole number of words (odd byte count) — op-8 columns are always at
+/// least word-aligned.
+fn op8_column_widths(row_bytes: usize, long_data: bool) -> Option<Vec<usize>> {
+    if row_bytes % 2 != 0 {
+        return None;
+    }
+    if !long_data {
+        // Short data: every column is one WORD.
+        return Some(vec![2; row_bytes / 2]);
+    }
+    // Long data: as many full LONG columns as fit, plus a trailing WORD
+    // column when the width is an odd number of words (half a long over).
+    let full_longs = row_bytes / 4;
+    let mut widths = vec![4usize; full_longs];
+    if row_bytes % 4 != 0 {
+        // The trailing half-long (one WORD) column.
+        widths.push(2);
+    }
+    Some(widths)
+}
+
+/// Op 8 — Anim8 short / long Vertical Delta (Joe Porkka, 10-Jan-1992).
+///
+/// Op-8 is to op-7 (Hofer's short/long vertical delta) what op-5 is to
+/// op-7's *separate* opcode/data lists: op-8 keeps the **method-5
+/// 16-pointer layout** (8 opcode-list pointers used, slots 8..=15
+/// unused) but the opcodes and their data items are **interleaved
+/// inline** within each opcode list — there is no separate data list.
+/// The motivation per the staged spec
+/// (`docs/image/iff/anim-op8.md`): *"it is easier to convert existing
+/// Anim5 code to support Anim8 than Anim7."*
+///
+/// Each pointer is a byte offset from the start of the DLTA chunk data;
+/// a zero opcode-list pointer means the plane is unchanged. Items are
+/// WORD (2 B) when `long_data` is false and LONG (4 B) when true,
+/// selected by `ANHD.bits` bit 0. Each bitplane is split into vertical
+/// columns of the item width (§3.2 odd-long edge: a width that is an odd
+/// number of words wide gets a trailing WORD column even in long mode —
+/// see [`op8_column_widths`]).
+///
+/// Per column the stream is an **op-count** item (item-sized; `0` =
+/// column unchanged) followed by that many ops. The three op classes
+/// (each an item-sized opcode) are:
+///
+/// * **Skip** — hi bit clear, non-zero. The value is the number of rows
+///   to advance the dest cursor by; no data follows.
+/// * **Uniq** — hi bit set. `op & !sign_bit` data items follow inline,
+///   one copied per consecutive row.
+/// * **Same** — a `0` opcode, then a **count** item, then **one** data
+///   item; the value is written to `count` consecutive rows.
+///
+/// "Advance one row" adds `row_bytes` to the byte offset within the
+/// bitplane (NOT the item width), because the data is compressed
+/// vertically.
+fn apply_op8(planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd, long_data: bool) -> Result<()> {
+    let n_planes = bmhd.n_planes as usize;
+    let has_mask = bmhd.masking == Masking::HasMask;
+    let planes_per_row = n_planes + has_mask as usize;
+    let row_bytes = bmhd.row_bytes();
+    let height = bmhd.height as usize;
+    let sign_word = 0x8000u32;
+    let sign_long = 0x8000_0000u32;
+
+    let col_widths = op8_column_widths(row_bytes, long_data).ok_or_else(|| {
+        Error::invalid(format!(
+            "ANIM op 8: row_bytes {row_bytes} is not a whole number of words"
+        ))
+    })?;
+
+    // 16 big-endian u32 pointers — opcode lists in slots 0..=7, slots
+    // 8..=15 unused.
+    if delta.len() < 64 {
+        return Err(Error::invalid("ANIM op 8: pointer table truncated"));
+    }
+    let read_ptr = |slot: usize| -> usize {
+        u32::from_be_bytes([
+            delta[slot * 4],
+            delta[slot * 4 + 1],
+            delta[slot * 4 + 2],
+            delta[slot * 4 + 3],
+        ]) as usize
+    };
+
+    for p in 0..n_planes.min(8) {
+        let op_ptr = read_ptr(p);
+        if op_ptr == 0 {
+            continue; // plane unchanged
+        }
+        if op_ptr >= delta.len() {
+            return Err(Error::invalid("ANIM op 8: opcode pointer out of range"));
+        }
+        let mut cur = op_ptr;
+        let mut col_byte = 0usize;
+        for &item_bytes in &col_widths {
+            // Read this column's op-count (item-sized).
+            let opcount = read_item(delta, &mut cur, item_bytes)
+                .ok_or_else(|| Error::invalid("ANIM op 8: op-count truncated"))?
+                as usize;
+            let mut row: usize = 0;
+            for _ in 0..opcount {
+                let op = read_item(delta, &mut cur, item_bytes)
+                    .ok_or_else(|| Error::invalid("ANIM op 8: opcode list truncated mid-column"))?;
+                let sign = if item_bytes == 4 {
+                    sign_long
+                } else {
+                    sign_word
+                };
+                if op == 0 {
+                    // Same: count item, then one value item.
+                    let cnt = read_item(delta, &mut cur, item_bytes)
+                        .ok_or_else(|| Error::invalid("ANIM op 8: Same op missing count"))?
+                        as usize;
+                    let item_start = cur;
+                    if cur + item_bytes > delta.len() {
+                        return Err(Error::invalid("ANIM op 8: Same op value truncated"));
+                    }
+                    cur += item_bytes;
+                    for r in 0..cnt {
+                        let abs_row = row + r;
+                        if abs_row >= height {
+                            break;
+                        }
+                        let row_idx = abs_row * planes_per_row + p;
+                        if row_idx < planar.len() && col_byte + item_bytes <= planar[row_idx].len()
+                        {
+                            planar[row_idx][col_byte..col_byte + item_bytes]
+                                .copy_from_slice(&delta[item_start..item_start + item_bytes]);
+                        }
+                    }
+                    row += cnt;
+                } else if op & sign == 0 {
+                    // Skip: advance `op` rows, no data.
+                    row += op as usize;
+                } else {
+                    // Uniq: copy `op & !sign` data items literally.
+                    let cnt = (op & !sign) as usize;
+                    if cur + cnt * item_bytes > delta.len() {
+                        return Err(Error::invalid("ANIM op 8: Uniq op data items truncated"));
+                    }
+                    for r in 0..cnt {
+                        let abs_row = row + r;
+                        let item_start = cur + r * item_bytes;
+                        if abs_row < height {
+                            let row_idx = abs_row * planes_per_row + p;
+                            if row_idx < planar.len()
+                                && col_byte + item_bytes <= planar[row_idx].len()
+                            {
+                                planar[row_idx][col_byte..col_byte + item_bytes]
+                                    .copy_from_slice(&delta[item_start..item_start + item_bytes]);
+                            }
+                        }
+                    }
+                    cur += cnt * item_bytes;
+                    row += cnt;
+                }
+            }
+            col_byte += item_bytes;
+        }
+    }
+    Ok(())
+}
+
+/// Read one WORD (2 B) or LONG (4 B) big-endian item at `*cur` from
+/// `buf`, advancing `*cur` past it. Returns `None` if the item would
+/// run past the end of `buf`. The value is zero-extended into a `u32`
+/// so WORD and LONG callers share one helper.
+fn read_item(buf: &[u8], cur: &mut usize, item_bytes: usize) -> Option<u32> {
+    if *cur + item_bytes > buf.len() {
+        return None;
+    }
+    let v = if item_bytes == 4 {
+        u32::from_be_bytes([buf[*cur], buf[*cur + 1], buf[*cur + 2], buf[*cur + 3]])
+    } else {
+        u16::from_be_bytes([buf[*cur], buf[*cur + 1]]) as u32
+    };
+    *cur += item_bytes;
+    Some(v)
+}
+
+/// Test-only re-export of [`apply_op8`] so integration tests can drive
+/// the op-8 decoder without rebuilding a full ANIM container.
+#[doc(hidden)]
+pub fn apply_op8_for_test(
+    planar: &mut [Vec<u8>],
+    delta: &[u8],
+    bmhd: &Bmhd,
+    long_data: bool,
+) -> Result<()> {
+    apply_op8(planar, delta, bmhd, long_data)
 }
 
 /// The subset of `ANHD.bits` options op-4 (Generalized Delta) accepts.
@@ -2257,6 +2468,299 @@ pub fn encode_anim_op7(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
         };
         let anhd_bytes = anhd.write(dlta.len() as u32);
         // Inner FORM ILBM size = 4 ("ILBM") + 8+40 (ANHD) + 8 + dlta.
+        let inner_size = (4 + 8 + 40 + 8 + dlta.len()) as u32;
+        out.extend_from_slice(b"FORM");
+        out.extend_from_slice(&inner_size.to_be_bytes());
+        out.extend_from_slice(b"ILBM");
+        out.extend_from_slice(b"ANHD");
+        out.extend_from_slice(&40u32.to_be_bytes());
+        out.extend_from_slice(&anhd_bytes);
+        out.extend_from_slice(b"DLTA");
+        out.extend_from_slice(&(dlta.len() as u32).to_be_bytes());
+        out.extend_from_slice(&dlta);
+        if dlta.len() & 1 == 1 {
+            out.push(0);
+        }
+        prev_planar = cur_planar;
+    }
+
+    let form_size = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&form_size.to_be_bytes());
+    Ok(out)
+}
+
+/// Append one WORD (2 B) or LONG (4 B) big-endian item to `out`.
+/// The low `item_bytes` bytes of `v` are emitted; callers pass values
+/// that fit (op counts ≤ the item's signed range, etc.).
+fn push_item(out: &mut Vec<u8>, v: u32, item_bytes: usize) {
+    if item_bytes == 4 {
+        out.extend_from_slice(&v.to_be_bytes());
+    } else {
+        out.extend_from_slice(&(v as u16).to_be_bytes());
+    }
+}
+
+/// Encode a single op-8 (Anim8 short / long Vertical Delta) DLTA
+/// payload from a previous and current planar frame.
+///
+/// `prev_planar` and `cur_planar` are the row-major flat arrays of
+/// bitplane rows in IFF order (`planes_per_row = n_planes +
+/// mask_plane`), each row `row_bytes` long — the same shape
+/// [`apply_op8`] consumes. `long_data` selects the data-item width
+/// (`false` = short WORD/2-byte items → `ANHD.bits` bit 0 clear,
+/// `true` = long LONG/4-byte items → bit 0 set).
+///
+/// The output is the DLTA chunk body per `docs/image/iff/anim-op8.md`:
+/// a 64-byte pointer table (16 × u32 BE — 8 opcode-list pointers in
+/// slots 0..=7, slots 8..=15 zero) followed by per-plane opcode lists.
+/// Unlike op-7, op-8 interleaves data items **inline** within each
+/// opcode list (the method-5 layout) — there is no separate data list,
+/// so only the first eight pointer slots are used.
+///
+/// Each plane's opcode list walks its vertical columns left-to-right
+/// (§3.2: in long mode an odd-number-of-words-wide plane gets a
+/// trailing WORD column). Per column the encoder emits an op-count
+/// item, then the ops: it splits each column into runs of equal-vs-
+/// different items and picks Same (one value item) for repeats of ≥ 2
+/// equal items and Uniq (inline literal items) otherwise, with Skip
+/// items for unchanged rows — the same greedy strategy the op-7
+/// encoder uses, adapted to op-8's inline data and item-sized op
+/// counts.
+///
+/// Used by [`encode_anim_op8`] but exposed publicly so callers driving
+/// the lower-level container can build their own ANIM8 streams.
+pub fn encode_op8_body(
+    prev_planar: &[Vec<u8>],
+    cur_planar: &[Vec<u8>],
+    bmhd: &Bmhd,
+    long_data: bool,
+) -> Result<Vec<u8>> {
+    let n_planes = bmhd.n_planes as usize;
+    let has_mask = bmhd.masking == Masking::HasMask;
+    let planes_per_row = n_planes + has_mask as usize;
+    let row_bytes = bmhd.row_bytes();
+    let height = bmhd.height as usize;
+    let expected = height * planes_per_row;
+    if prev_planar.len() != expected || cur_planar.len() != expected {
+        return Err(Error::invalid(format!(
+            "ANIM op 8 encode: planar buffers have {} / {} rows, expected {expected}",
+            prev_planar.len(),
+            cur_planar.len()
+        )));
+    }
+    if n_planes > 8 {
+        // op-8 pointer table addresses 8 opcode-list slots; > 8 planes
+        // can't be expressed.
+        return Err(Error::unsupported(format!(
+            "ANIM op 8 encode: requires ≤ 8 colour planes (got {n_planes})"
+        )));
+    }
+    let col_widths = op8_column_widths(row_bytes, long_data).ok_or_else(|| {
+        Error::invalid(format!(
+            "ANIM op 8 encode: row_bytes {row_bytes} is not a whole number of words"
+        ))
+    })?;
+
+    // Per-plane opcode list (with inline data) + a dirty flag.
+    let mut plane_op: Vec<Vec<u8>> = vec![Vec::new(); 8];
+    let mut plane_dirty = [false; 8];
+
+    for p in 0..n_planes {
+        let mut op_list: Vec<u8> = Vec::new();
+        let mut any_change = false;
+        let mut col_byte = 0usize;
+        for &item_bytes in &col_widths {
+            // The signed range of a Skip/Uniq op item: the high bit is
+            // the Uniq flag, so Skip counts and Uniq counts cap at
+            // `sign_bit - 1`. Same counts are full-width (no flag bit).
+            let sign_bit: usize = if item_bytes == 4 { 0x8000_0000 } else { 0x8000 };
+            let max_flagged = sign_bit - 1; // 0x7FFF / 0x7FFFFFFF
+            let max_count: usize = if item_bytes == 4 { 0xFFFF_FFFF } else { 0xFFFF };
+
+            let item_at = |buf: &[Vec<u8>], r: usize| -> Vec<u8> {
+                let row = &buf[r * planes_per_row + p];
+                if col_byte + item_bytes <= row.len() {
+                    row[col_byte..col_byte + item_bytes].to_vec()
+                } else {
+                    vec![0u8; item_bytes]
+                }
+            };
+
+            // Serialise this column's ops into a temporary buffer and
+            // count the logical ops, then prefix with the op-count item.
+            let mut col_ops: Vec<u8> = Vec::new();
+            let mut col_op_count: usize = 0;
+            let mut row = 0usize;
+            while row < height {
+                let prev_item = item_at(prev_planar, row);
+                let cur_item = item_at(cur_planar, row);
+                if prev_item == cur_item {
+                    // Count contiguous unchanged rows.
+                    let mut skip = 0usize;
+                    while row + skip < height
+                        && item_at(prev_planar, row + skip) == item_at(cur_planar, row + skip)
+                    {
+                        skip += 1;
+                    }
+                    // Skip op value caps at `max_flagged` (hi bit clear).
+                    let mut remaining = skip;
+                    while remaining > 0 {
+                        let chunk = remaining.min(max_flagged);
+                        push_item(&mut col_ops, chunk as u32, item_bytes);
+                        col_op_count += 1;
+                        remaining -= chunk;
+                    }
+                    row += skip;
+                } else {
+                    // Find the contiguous changed run [row, end).
+                    let mut end = row + 1;
+                    while end < height && item_at(prev_planar, end) != item_at(cur_planar, end) {
+                        end += 1;
+                    }
+                    let mut i = row;
+                    while i < end {
+                        // Maximal repeat of the same item at `i`.
+                        let v = item_at(cur_planar, i);
+                        let mut rep_end = i + 1;
+                        while rep_end < end
+                            && rep_end - i < max_count
+                            && item_at(cur_planar, rep_end) == v
+                        {
+                            rep_end += 1;
+                        }
+                        let rep_len = rep_end - i;
+                        // Same op costs 3 items (0 + count + value);
+                        // Uniq of length L costs 1 + L items. Same wins
+                        // for runs ≥ 3 (matches op-5's repeat threshold —
+                        // op-8's per-item op count makes the break-even
+                        // one item higher than op-7's byte-stream count).
+                        if rep_len >= 3 {
+                            push_item(&mut col_ops, 0, item_bytes); // Same sentinel
+                            push_item(&mut col_ops, rep_len as u32, item_bytes); // count
+                            col_ops.extend_from_slice(&v); // one value item
+                            col_op_count += 1;
+                            i = rep_end;
+                        } else {
+                            // Uniq run: extend until we'd switch to a
+                            // Same op (3-run ahead) or hit the end of the
+                            // changed run, capped at `max_flagged` items.
+                            let lit_start = i;
+                            let mut lit_end = i + 1;
+                            while lit_end < end && lit_end - lit_start < max_flagged {
+                                // Peek for a 3-run of equal items ahead
+                                // that a Same op would capture more
+                                // cheaply; close the literal there.
+                                let a = item_at(cur_planar, lit_end);
+                                let run3 = lit_end + 2 < end
+                                    && item_at(cur_planar, lit_end + 1) == a
+                                    && item_at(cur_planar, lit_end + 2) == a;
+                                if run3 {
+                                    break;
+                                }
+                                lit_end += 1;
+                            }
+                            let lit_len = lit_end - lit_start;
+                            debug_assert!((1..=max_flagged).contains(&lit_len));
+                            push_item(&mut col_ops, (sign_bit | lit_len) as u32, item_bytes);
+                            col_op_count += 1;
+                            for r in lit_start..lit_end {
+                                col_ops.extend_from_slice(&item_at(cur_planar, r));
+                            }
+                            i = lit_end;
+                        }
+                    }
+                    any_change = true;
+                    row = end;
+                }
+            }
+            // op-count item caps at the item's unsigned range.
+            if col_op_count > max_count {
+                return Err(Error::unsupported(format!(
+                    "ANIM op 8 encode: column at byte {col_byte} of plane {p} produced {col_op_count} logical ops (max {max_count})"
+                )));
+            }
+            push_item(&mut op_list, col_op_count as u32, item_bytes);
+            op_list.extend_from_slice(&col_ops);
+            col_byte += item_bytes;
+        }
+        if any_change {
+            plane_op[p] = op_list;
+            plane_dirty[p] = true;
+        }
+    }
+
+    // Assemble: 64-byte pointer table (8 opcode-list pointers used,
+    // slots 8..=15 zero) + per-plane opcode lists. Pointers are absolute
+    // byte offsets from the DLTA start.
+    let mut out = vec![0u8; 64];
+    for (slot, list) in plane_op.iter_mut().enumerate().take(8) {
+        if !plane_dirty[slot] {
+            continue;
+        }
+        let offset = out.len() as u32;
+        out[slot * 4..slot * 4 + 4].copy_from_slice(&offset.to_be_bytes());
+        out.append(list);
+    }
+    Ok(out)
+}
+
+/// Encode a sequence of ILBM frames as a FORM/ANIM file using
+/// `operation = 8` (Anim8 Short / Long Vertical Delta) for every delta
+/// frame.
+///
+/// The seed frame is the full leading FORM ILBM (same as
+/// [`encode_anim_op0`] / [`encode_anim_op5`] / [`encode_anim_op7`]);
+/// subsequent frames carry an `ANHD` (op = 8) plus a `DLTA` chunk
+/// produced by [`encode_op8_body`] from the diff between the prior and
+/// current planar frames. `long_data` selects the short (WORD/2-byte
+/// items; `ANHD.bits` bit 0 cleared) vs long (LONG/4-byte items; bit 0
+/// set) variant.
+///
+/// Compatible with the in-tree [`parse_anim`] op-8 decoder; tested via
+/// `tests/anim_op8_encode.rs`.
+pub fn encode_anim_op8(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>> {
+    if frames.is_empty() {
+        return Err(Error::invalid(
+            "ANIM op 8 encode: at least one frame required",
+        ));
+    }
+    if frames[0].bmhd.n_planes > 8 {
+        return Err(Error::unsupported(format!(
+            "ANIM op 8 encode: requires ≤ 8 colour planes (got {})",
+            frames[0].bmhd.n_planes
+        )));
+    }
+    let leading = crate::ilbm::encode_ilbm(&frames[0])?;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"FORM");
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(b"ANIM");
+    out.extend_from_slice(&leading);
+    if leading.len() & 1 == 1 {
+        out.push(0);
+    }
+
+    let mut prev_planar = rgba_to_planar(&frames[0]);
+
+    for frame in &frames[1..] {
+        let cur_planar = rgba_to_planar(frame);
+        let dlta = encode_op8_body(&prev_planar, &cur_planar, &frame.bmhd, long_data)?;
+        let anhd = Anhd {
+            operation: 8,
+            mask: 0,
+            w: frame.bmhd.width,
+            h: frame.bmhd.height,
+            x: frame.bmhd.x_origin,
+            y: frame.bmhd.y_origin,
+            abs_time: 0,
+            rel_time: 1,
+            // Delta against the immediately-previous frame ⇒ one frame
+            // back (§2.1 `interleave`), not the `0` two-back default.
+            interleave: 1,
+            pad0: 0,
+            bits: if long_data { 1 } else { 0 },
+        };
+        let anhd_bytes = anhd.write(dlta.len() as u32);
         let inner_size = (4 + 8 + 40 + 8 + dlta.len()) as u32;
         out.extend_from_slice(b"FORM");
         out.extend_from_slice(&inner_size.to_be_bytes());

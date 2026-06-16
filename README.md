@@ -24,7 +24,8 @@ crate ships:
 - **FORM/PBM** — read+round-trip (DPaint II / Brilliance chunky sibling).
 - **FORM/ANIM** — op-0 literal + op-2/op-3 Long/Short Delta
   (encode+decode) + op-5 byte-vertical delta (encode+decode) +
-  op-7 Short/Long Vertical Delta (encode+decode). The op-7 encoder
+  op-7 Short/Long Vertical Delta (encode+decode) + op-8 Anim8
+  short/long vertical delta (encode+decode). The op-7 encoder
   picks Skip / Same / Uniq ops
   per column to minimise byte cost (Same for runs ≥ 2, Uniq
   otherwise, Skip for unchanged runs); both short (2-byte items)
@@ -341,7 +342,7 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
 | Op 4 — Generalized short/long Delta      |  Y   |   Y   |
 | Op 5 — Byte Vertical Delta (DPaint III)  |  Y   |   Y   |
 | Op 7 — Short / Long Vertical Delta       |  Y   |   Y   |
-| Op 8 — Short / Long Vertical Delta (32b) |  N   |   N   |
+| Op 8 — Anim8 short / long Vertical Delta  |  Y   |   Y   |
 
 - Public API: [`anim::parse_anim`], [`anim::encode_anim_op0`],
   [`anim::encode_anim_op1`], [`anim::encode_op1_body`],
@@ -350,6 +351,7 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
   [`anim::encode_anim_op4`], [`anim::encode_op4_body`],
   [`anim::encode_anim_op5`], [`anim::encode_op5_body`],
   [`anim::encode_anim_op7`], [`anim::encode_op7_body`],
+  [`anim::encode_anim_op8`], [`anim::encode_op8_body`],
   [`anim::AnimImage`], [`anim::Anhd`].
 - Container id: `"iff_anim"`, probes `FORM....ANIM` and matches
   `.anim` by extension. Multi-frame `rawvideo` / `Rgba` stream;
@@ -404,6 +406,25 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
   (`0x00` byte followed by a count byte — copy one data item `count`
   times to consecutive rows). Advancing one row adds `row_bytes` to
   the byte offset within the bitplane (not `data_size`).
+- Op-8 (Anim8 short / long Vertical Delta, Joe Porkka 1992) is decoded
+  and encoded. Op-8 keeps op-5's **16-longword pointer layout** (8
+  opcode-list pointers used, slots 8..15 unused) but — unlike op-7's
+  separate opcode/data lists — **interleaves the data items inline**
+  within each opcode list, so existing Anim5 code ports easily. Items
+  are WORD (2 B) or LONG (4 B) per `ANHD.bits` bit 0. Each bitplane
+  splits into vertical columns of the item width; the §3.2 odd-long
+  edge case is honoured — a plane that is an odd number of words wide
+  and long-compressed gets a trailing WORD column (e.g. a 336-pixel
+  plane → 10 LONG columns + 1 WORD column). Per column an op-count item
+  precedes the ops; the three classes are Skip (hi bit clear, non-zero
+  → advance N rows), Uniq (hi bit set → `op & ~sign` inline literal
+  items, one per row) and Same (`0` op + count item + one value item →
+  written to `count` rows). Advancing one row adds `row_bytes` to the
+  byte offset, not the item width. The encoder mirrors the op-7 greedy
+  strategy (Same for repeats ≥ 3, Uniq otherwise, Skip for unchanged
+  runs) adapted to op-8's inline data and item-sized op counts; a full
+  encode → decode round-trip stays pixel-exact in both WORD and LONG
+  modes, including the odd-long trailing-WORD-column shape.
 - Op-2 (Long Delta) / op-3 (Short Delta) follow the §2.2.1 group
   grammar: an 8-slot plane-pointer table (`0` = plane unchanged),
   then per plane a list of groups — a positive offset short advances
@@ -693,15 +714,18 @@ reader.
 
 ANIM coverage spans op-0 (literal), op-1 (XOR ILBM, full-frame),
 op-2/op-3 (Long/Short Delta), op-4 (Generalized short/long Delta),
-op-5 (Byte Vertical Delta), and op-7 (Short/Long Vertical Delta) —
-decode + encode for each. Op-1 now decodes both the all-planes and the
-§2.1 `mask` plane-subset XOR BODY for the full-frame rectangle.
-Remaining ANIM gaps: the op-1 genuine **sub-rectangle** variant (§2.1
-`w` / `h` / `x` / `y` narrower-than-bitmap "XOR mode only" fields)
-needs a staged wire description of the narrower row stride + the
-rectangle `x` byte/bit alignment; op-8 and the DEEP / TVPP / RGB8 /
-RGBN true-colour IFF chunks remain blocked on docs — none has a spec
-section staged in `docs/image/iff/`.
+op-5 (Byte Vertical Delta), op-7 (Short/Long Vertical Delta), and
+op-8 (Anim8 short/long Vertical Delta) — decode + encode for each.
+Op-1 now decodes both the all-planes and the §2.1 `mask` plane-subset
+XOR BODY for the full-frame rectangle. Remaining ANIM gaps: the op-1
+genuine **sub-rectangle** variant (§2.1 `w` / `h` / `x` / `y`
+narrower-than-bitmap "XOR mode only" fields) needs a staged wire
+description of the narrower row stride + the rectangle `x` byte/bit
+alignment. The DEEP / TVPP / RGB8 / RGBN true-colour IFF FORMs now
+have a staged spec at `docs/image/iff/iff-truecolor-chunks.md` and are
+the natural next IFF frontier (each is a distinct FORM type — DEEP's
+chunky DPEL-described raster incl. TVDC delta, RGB8/RGBN's LONG/WORD
+genlock RLE — rather than another ANIM op).
 
 AIFF-C coverage is saturated: Apple shipped 13 chunk classes (FVER,
 COMM, SSND, MARK, INST, COMT, AESD, APPL, MIDI, SAXL, NAME, AUTH,
@@ -730,9 +754,10 @@ highest-risk parser surface of the crate:
   keeps them honest.
 * `anim_decode` — feeds arbitrary bytes to `anim::parse_anim`, the
   FORM ANIM walker that loads a first FORM ILBM frame and then
-  applies subsequent ANHD + DLTA delta frames using one of three
-  vertical-delta operations (op-0 literal, op-5 byte-vertical-RLC,
-  op-7 short / long vertical delta). Each delta decoder has its
+  applies subsequent ANHD + DLTA delta frames using one of several
+  delta operations (op-0 literal, op-5 byte-vertical-RLC, op-7 short /
+  long vertical delta, op-8 Anim8 short / long vertical delta). Each
+  delta decoder has its
   own per-frame BODY/DLTA size arithmetic and its own
   failure-mode surface.
 * `pchg_parse` — feeds arbitrary bytes to `ilbm::Pchg::parse`, the

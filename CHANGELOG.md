@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(anim)* op-8 (Anim8 short / long Vertical Delta, Joe Porkka 1992)
+  decode + encode. Op-8 keeps op-5's 16-longword pointer layout (8
+  opcode-list pointers used) but interleaves data items inline within
+  each opcode list (unlike op-7's separate data lists), so existing
+  Anim5 code ports easily. Items are WORD (2 B) or LONG (4 B) per
+  `ANHD.bits` bit 0; the §3.2 odd-long edge case (a plane an odd number
+  of words wide, long-compressed, gets a trailing WORD column) is
+  honoured. New public API: `anim::encode_anim_op8` /
+  `anim::encode_op8_body` (plus `anim::apply_op8_for_test`). Source:
+  `docs/image/iff/anim-op8.md`.
 - *(anim)* op-1 XOR ILBM mode now decodes the §2.1 `mask` plane-subset
   BODY for the full-frame rectangle, not just the all-planes BODY.
   A sparse `mask` carries the scanline-interleaved rows of only the
