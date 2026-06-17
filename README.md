@@ -721,11 +721,24 @@ XOR BODY for the full-frame rectangle. Remaining ANIM gaps: the op-1
 genuine **sub-rectangle** variant (§2.1 `w` / `h` / `x` / `y`
 narrower-than-bitmap "XOR mode only" fields) needs a staged wire
 description of the narrower row stride + the rectangle `x` byte/bit
-alignment. The DEEP / TVPP / RGB8 / RGBN true-colour IFF FORMs now
-have a staged spec at `docs/image/iff/iff-truecolor-chunks.md` and are
-the natural next IFF frontier (each is a distinct FORM type — DEEP's
-chunky DPEL-described raster incl. TVDC delta, RGB8/RGBN's LONG/WORD
-genlock RLE — rather than another ANIM op).
+alignment. The DEEP / TVPP / RGB8 / RGBN true-colour IFF FORMs have a
+staged spec at `docs/image/iff/iff-truecolor-chunks.md`. The first of
+these to land is the **RGBN 12-bit genlock-RLE BODY** decoder
+([`ilbm::decode_rgbn_body`]): the §3.1 stream of 16-bit WORD units
+(red/green/blue nibbles, genlock bit, 3-bit run count) with the full
+count cascade (3-bit inline 1..7 → BYTE up to 255 → WORD for larger
+runs), widening each 4-bit gun to RGB888 by nibble replication and
+emitting packed RGBA top-to-bottom. A single run may spill across a
+scanline boundary (the body is a flat `width × height` pixel stream).
+The §3.3 genlock bit is interpreted via [`ilbm::GenlockPolicy`] —
+Turbo-Silver "zero colour" (genlocked → opaque black), Diamond/Light24
+"ignore" (always use the coded RGB, the default), or "brush" (genlocked
+→ alpha 0 transparency mask). A truncated stream, a run that
+overshoots the pixel budget, a missing BYTE/WORD escape, and a
+zero-length WORD-escape run are each rejected with `Error::invalid`.
+Remaining true-colour frontier: the RGB8 32-bit LONG body (§3.2), the
+RGBN/RGB8 FORM-type container walker + probe, and DEEP's chunky
+DPEL-described raster incl. TVDC delta (§1).
 
 AIFF-C coverage is saturated: Apple shipped 13 chunk classes (FVER,
 COMM, SSND, MARK, INST, COMT, AESD, APPL, MIDI, SAXL, NAME, AUTH,

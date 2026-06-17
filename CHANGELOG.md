@@ -24,6 +24,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* FORM RGBN 12-bit genlock-RLE BODY decoder
+  (`ilbm::decode_rgbn_body`). RGBN is Impulse's Turbo Silver / Imagine
+  true-colour FORM (no CLUT): a flat stream of 16-bit big-endian WORD
+  units carrying a 12-bit RGB value (red = MS nibble), a genlock bit,
+  and a 3-bit run count, with the full count cascade (3-bit inline
+  1..7 → trailing BYTE up to 255 → trailing WORD for larger runs).
+  Each 4-bit gun is widened to RGB888 by nibble replication; a run may
+  spill across scanline boundaries; output is packed RGBA top-to-bottom.
+  The genlock bit is interpreted via the new `ilbm::GenlockPolicy`
+  (Turbo-Silver zero-colour / Diamond-Light24 ignore-colour [default] /
+  brush transparency-mask). Truncated streams, runs overshooting the
+  pixel budget, missing BYTE/WORD escapes, and zero-length WORD-escape
+  runs are each rejected with `Error::invalid`. Source:
+  `docs/image/iff/iff-truecolor-chunks.md` §3, §3.1, §3.3.
 - *(anim)* op-8 (Anim8 short / long Vertical Delta, Joe Porkka 1992)
   decode + encode. Op-8 keeps op-5's 16-longword pointer layout (8
   opcode-list pointers used) but interleaves data items inline within

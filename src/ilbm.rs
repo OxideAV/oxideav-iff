@@ -3370,9 +3370,318 @@ fn skip_unknown<R: Seek + ?Sized>(r: &mut R, c: &ChunkHeader) -> Result<()> {
     skip_chunk_body(r, c)
 }
 
+// ───────────────────── FORM RGBN — Turbo Silver / Imagine 12-bit ─────────────────────
+//
+// RGBN is a distinct EA IFF 85 FORM type from Impulse's *Turbo Silver*
+// (later *Imagine*), almost identical to FORM ILBM: same `BMHD`, an
+// (unused) `CMAP`, and a `CAMG` viewport word. It differs from ILBM only
+// in the **BODY** encoding and two `BMHD` fields:
+//
+//   * `BMHD.compression` is **4** — a Turbo-Silver-specific RLE, *not*
+//     ILBM ByteRun1.
+//   * `BMHD.nPlanes` is the nominal **13** (12 colour bits + 1 genlock),
+//     even though the body is really chunky 12-bit RGB rather than 13
+//     bitplanes.
+//
+// The BODY is a stream of 16-bit big-endian WORD units, each carrying a
+// 12-bit RGB value (red = most-significant nibble, then green, then
+// blue), one genlock bit, and a run-length count:
+//
+//   bit:  15 .............. 4   3        2 1 0
+//         [ 12-bit RGB value ] [genlock] [3-bit count]
+//
+// Count cascade (the canonical RGBN sample's decode):
+//   * 3-bit inline count holds runs 1..7.
+//   * If the run > 7, the 3-bit field is 0 and a following **BYTE** holds
+//     the count (up to 255).
+//   * If the run > 255, that BYTE is 0 and a following **WORD** holds the
+//     larger count. Runs > 65536 are not supported.
+//
+// Pixels are filled left-to-right within a scanline, top to bottom; a
+// single run can spill across the right edge into the next scanline (the
+// body is a flat pixel stream of `width * height` entries). The 12-bit
+// RGB value is widened to RGB888 by bit replication (`x << 4 | x`).
+//
+// Source: docs/image/iff/iff-truecolor-chunks.md §3, §3.1, §3.3.
+
+/// How the RGBN/RGB8 **genlock** bit is interpreted when expanding a
+/// coded run into output pixels (§3.3 of the truecolor doc).
+///
+/// The [`Default`] is [`IgnoreUseColour`](GenlockPolicy::IgnoreUseColour):
+/// the least-surprising choice for a still-image decode, where every coded
+/// RGB value reaches the output and no pixel is silently blacked or made
+/// transparent. A caller wanting genlock / brush semantics opts in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GenlockPolicy {
+    /// *Turbo Silver* "picture" semantics: a set genlock bit writes the
+    /// **zero colour** (transparent-to-genlock black) into the pixel —
+    /// emitted here as opaque black `(0, 0, 0, 0xFF)`. The RGB value in
+    /// the coded unit is ignored for genlocked pixels.
+    TurboSilverZeroColour,
+    /// *Diamond / Light24* "load as picture" semantics: the genlock bit
+    /// is **ignored** and the coded RGB value is always used (opaque).
+    #[default]
+    IgnoreUseColour,
+    /// *Diamond / Light24* "load as brush" semantics: the genlock bit
+    /// **marks pixels that are not part of the brush** — i.e. a
+    /// transparency mask. Genlocked pixels get alpha `0`; the RGB value
+    /// is still widened and stored under the transparent alpha.
+    BrushTransparency,
+}
+
+/// Widen a 4-bit gun value (0..=15) to 8 bits by nibble replication, so
+/// `0xF → 0xFF` and `0x0 → 0x00` map the 12-bit RGB range onto the full
+/// 8-bit range.
+#[inline]
+fn widen4(x: u16) -> u8 {
+    let n = (x & 0x0F) as u8;
+    (n << 4) | n
+}
+
+/// Decode an RGBN (`compression == 4`) BODY of `width * height` 12-bit
+/// genlock-RLE pixels into packed RGBA8888, row-major, top-to-bottom.
+///
+/// `genlock` selects how the genlock bit maps to output colour / alpha
+/// (see [`GenlockPolicy`]). The function validates that the run stream
+/// fills *exactly* `width * height` pixels — a stream that runs out early
+/// or whose final run overshoots the pixel budget is rejected with
+/// [`Error::invalid`], so a truncated or malformed body never silently
+/// yields a partial frame or writes out of bounds.
+pub fn decode_rgbn_body(
+    width: u16,
+    height: u16,
+    body: &[u8],
+    genlock: GenlockPolicy,
+) -> Result<Vec<u8>> {
+    let total: usize = width as usize * height as usize;
+    let mut rgba = vec![0u8; total * 4];
+    let mut filled = 0usize;
+    let mut pos = 0usize;
+
+    while filled < total {
+        if pos + 2 > body.len() {
+            return Err(Error::invalid(format!(
+                "RGBN BODY: stream ended after {filled} of {total} pixels (need another WORD unit)"
+            )));
+        }
+        let w = u16::from_be_bytes([body[pos], body[pos + 1]]);
+        pos += 2;
+
+        let rgb12 = w >> 4;
+        let lock = w & 0x0008 != 0;
+        let mut count = (w & 0x0007) as usize;
+
+        // Count cascade: 3-bit 0 → BYTE; BYTE 0 → WORD.
+        if count == 0 {
+            if pos >= body.len() {
+                return Err(Error::invalid(
+                    "RGBN BODY: 3-bit count was 0 but no BYTE count follows",
+                ));
+            }
+            count = body[pos] as usize;
+            pos += 1;
+            if count == 0 {
+                if pos + 2 > body.len() {
+                    return Err(Error::invalid(
+                        "RGBN BODY: BYTE count was 0 but no WORD count follows",
+                    ));
+                }
+                count = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+                pos += 1; // advance one then …
+                pos += 1; // … the second WORD byte (keep arithmetic obvious)
+                if count == 0 {
+                    return Err(Error::invalid(
+                        "RGBN BODY: WORD escape count is 0 (a zero-length run is undefined)",
+                    ));
+                }
+            }
+        }
+
+        if filled + count > total {
+            return Err(Error::invalid(format!(
+                "RGBN BODY: run of {count} overshoots pixel budget ({filled} filled, {total} total)"
+            )));
+        }
+
+        // Resolve this run's RGBA quadruple once, then splat it.
+        let r = widen4(rgb12 >> 8);
+        let g = widen4(rgb12 >> 4);
+        let b = widen4(rgb12);
+        let (or, og, ob, oa) = match genlock {
+            GenlockPolicy::IgnoreUseColour => (r, g, b, 0xFF),
+            GenlockPolicy::TurboSilverZeroColour => {
+                if lock {
+                    (0, 0, 0, 0xFF)
+                } else {
+                    (r, g, b, 0xFF)
+                }
+            }
+            GenlockPolicy::BrushTransparency => {
+                if lock {
+                    (r, g, b, 0x00)
+                } else {
+                    (r, g, b, 0xFF)
+                }
+            }
+        };
+
+        for _ in 0..count {
+            let dst = filled * 4;
+            rgba[dst] = or;
+            rgba[dst + 1] = og;
+            rgba[dst + 2] = ob;
+            rgba[dst + 3] = oa;
+            filled += 1;
+        }
+    }
+
+    Ok(rgba)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ───────────────── FORM RGBN 12-bit genlock-RLE body ─────────────────
+
+    /// One coded WORD with a 3-bit inline count: red/green/blue nibbles,
+    /// genlock flag, and a 1..=7 run. Panics on out-of-range count so the
+    /// helper can't silently mis-encode a test fixture.
+    fn rgbn_word(r: u16, g: u16, b: u16, lock: bool, count: u16) -> [u8; 2] {
+        assert!((1..=7).contains(&count), "inline count must be 1..=7");
+        let rgb12 = (r & 0xF) << 8 | (g & 0xF) << 4 | (b & 0xF);
+        let w = rgb12 << 4 | (u16::from(lock) << 3) | count;
+        w.to_be_bytes()
+    }
+
+    #[test]
+    fn rgbn_inline_run_widens_12bit_to_rgb888() {
+        // 2x1 image: one red run of 1, one white run of 1.
+        let mut body = Vec::new();
+        body.extend_from_slice(&rgbn_word(0xF, 0x0, 0x0, false, 1)); // red
+        body.extend_from_slice(&rgbn_word(0xF, 0xF, 0xF, false, 1)); // white
+        let rgba = decode_rgbn_body(2, 1, &body, GenlockPolicy::default()).unwrap();
+        assert_eq!(rgba, vec![255, 0, 0, 255, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn rgbn_nibble_replication_maps_mid_value() {
+        // 0x8 → (0x8 << 4) | 0x8 = 0x88; verifies bit-replication widening.
+        let body = rgbn_word(0x8, 0x0, 0x0, false, 1);
+        let rgba = decode_rgbn_body(1, 1, &body, GenlockPolicy::default()).unwrap();
+        assert_eq!(&rgba[..3], &[0x88, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn rgbn_inline_run_fills_multiple_pixels() {
+        // A single run of 7 green pixels fills a 7x1 row.
+        let body = rgbn_word(0x0, 0xF, 0x0, false, 7);
+        let rgba = decode_rgbn_body(7, 1, &body, GenlockPolicy::default()).unwrap();
+        assert_eq!(rgba.len(), 7 * 4);
+        for px in rgba.chunks_exact(4) {
+            assert_eq!(px, [0, 255, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn rgbn_byte_count_cascade_handles_run_over_7() {
+        // Run of 200 (> 7): 3-bit field 0, then a BYTE count of 200.
+        let rgb12 = 0xF00u16; // pure red
+        let w = rgb12 << 4; // count nibble = 0, no genlock
+        let mut body = w.to_be_bytes().to_vec();
+        body.push(200);
+        let rgba = decode_rgbn_body(200, 1, &body, GenlockPolicy::default()).unwrap();
+        assert_eq!(rgba.len(), 200 * 4);
+        assert_eq!(&rgba[..4], &[255, 0, 0, 255]);
+        assert_eq!(&rgba[796..800], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn rgbn_word_count_cascade_handles_run_over_255() {
+        // Run of 300 (> 255): 3-bit field 0, BYTE 0, then WORD count 300.
+        let rgb12 = 0x0F0u16; // pure green
+        let w = rgb12 << 4;
+        let mut body = w.to_be_bytes().to_vec();
+        body.push(0); // BYTE escape
+        body.extend_from_slice(&300u16.to_be_bytes()); // WORD count
+        let rgba = decode_rgbn_body(300, 1, &body, GenlockPolicy::default()).unwrap();
+        assert_eq!(rgba.len(), 300 * 4);
+        assert_eq!(&rgba[1196..1200], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn rgbn_run_spills_across_scanlines() {
+        // A 2x2 image filled by a single run of 4 blue pixels: the run
+        // crosses the scanline boundary (the body is a flat pixel stream).
+        let body = rgbn_word(0x0, 0x0, 0xF, false, 4);
+        let rgba = decode_rgbn_body(2, 2, &body, GenlockPolicy::default()).unwrap();
+        assert_eq!(rgba.len(), 16);
+        for px in rgba.chunks_exact(4) {
+            assert_eq!(px, [0, 0, 255, 255]);
+        }
+    }
+
+    #[test]
+    fn rgbn_genlock_turbo_silver_writes_zero_colour() {
+        // A genlocked unit under Turbo-Silver semantics emits opaque
+        // black regardless of the coded RGB.
+        let body = rgbn_word(0xF, 0xF, 0xF, true, 1);
+        let rgba = decode_rgbn_body(1, 1, &body, GenlockPolicy::TurboSilverZeroColour).unwrap();
+        assert_eq!(rgba, vec![0, 0, 0, 255]);
+        // Same unit with IgnoreUseColour keeps the white colour.
+        let rgba2 = decode_rgbn_body(1, 1, &body, GenlockPolicy::IgnoreUseColour).unwrap();
+        assert_eq!(rgba2, vec![255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn rgbn_genlock_brush_marks_transparency() {
+        // Under brush semantics a genlocked pixel gets alpha 0 but keeps
+        // its widened RGB; a non-genlocked pixel stays opaque.
+        let mut body = Vec::new();
+        body.extend_from_slice(&rgbn_word(0xF, 0x0, 0x0, true, 1)); // masked-out red
+        body.extend_from_slice(&rgbn_word(0x0, 0xF, 0x0, false, 1)); // opaque green
+        let rgba = decode_rgbn_body(2, 1, &body, GenlockPolicy::BrushTransparency).unwrap();
+        assert_eq!(&rgba[0..4], &[255, 0, 0, 0]);
+        assert_eq!(&rgba[4..8], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn rgbn_truncated_stream_is_rejected() {
+        // Body claims to start a unit but provides only 1 of 2 WORD bytes.
+        let body = [0xFFu8];
+        let err = decode_rgbn_body(4, 1, &body, GenlockPolicy::default());
+        assert!(err.is_err());
+        // A run that fills fewer pixels than the frame needs is also an error.
+        let short = rgbn_word(0xF, 0x0, 0x0, false, 1); // 1 pixel for a 4-pixel frame
+        assert!(decode_rgbn_body(4, 1, &short, GenlockPolicy::default()).is_err());
+    }
+
+    #[test]
+    fn rgbn_overshoot_run_is_rejected() {
+        // A run of 7 into a 3-pixel frame overshoots the budget.
+        let body = rgbn_word(0xF, 0x0, 0x0, false, 7);
+        assert!(decode_rgbn_body(3, 1, &body, GenlockPolicy::default()).is_err());
+    }
+
+    #[test]
+    fn rgbn_missing_byte_escape_is_rejected() {
+        // 3-bit count 0 with no following BYTE.
+        let rgb12 = 0xF00u16;
+        let w = rgb12 << 4;
+        let body = w.to_be_bytes();
+        assert!(decode_rgbn_body(1, 1, &body, GenlockPolicy::default()).is_err());
+    }
+
+    #[test]
+    fn rgbn_zero_word_escape_count_is_rejected() {
+        // BYTE 0 then WORD 0 → undefined zero-length run.
+        let rgb12 = 0xF00u16;
+        let w = rgb12 << 4;
+        let mut body = w.to_be_bytes().to_vec();
+        body.push(0); // BYTE escape
+        body.extend_from_slice(&0u16.to_be_bytes()); // WORD 0
+        assert!(decode_rgbn_body(1, 1, &body, GenlockPolicy::default()).is_err());
+    }
 
     fn solid_palette() -> Vec<[u8; 3]> {
         vec![
