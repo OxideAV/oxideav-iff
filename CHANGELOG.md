@@ -24,6 +24,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* FORM DEEP chunky deep-raster support — the structural chunks
+  plus the two body codings whose wire format the staged spec fully
+  pins down. `ilbm::Dgbl` parses/writes the mandatory 8-byte DGBL global
+  header (display size, `DeepCompression` method, pixel aspect);
+  `ilbm::Dpel` parses the DPEL pixel-element layout (a ULONG `nElements`
+  followed by `(cType, cBitDepth)` pairs in MSB-first storage order) and
+  reports `total_bits` / `pixel_bytes` (the pixel padded up to a byte
+  boundary); `ilbm::Dloc` parses the optional DBOD-placement chunk.
+  `ilbm::decode_tvdc` decodes a TVDC component line (DGBL `Compression
+  == 5`, TecSoft's TVPaint addendum): the source is read one nibble at a
+  time (high then low), a running accumulator `v` starts at 0, a non-zero
+  `table[d]` 16-word delta advances `v` and emits it, and a zero
+  `table[d]` reads the next nibble as a short-run count that re-emits the
+  current `v`; the function returns the source-byte count
+  (`ceil(nibbles/2)`). `ilbm::assemble_deep_chunky` turns a decompressed
+  chunky body into packed RGBA8888 top-to-bottom, mapping RED/GREEN/BLUE
+  to the guns and ALPHA/OPACITY to alpha (any other component is parsed
+  for cursor advance only), with each component scaled from its
+  `cBitDepth` to 8 bits by left-shift + MSB replication. RUNLENGTH /
+  HUFFMAN / DYNAMICHUFF / JPEG bodies are not yet decoded (the canonical
+  DEEP text does not spell out their wire layout). Truncated TVDC
+  sources, run overshoot, undersized DPEL/DGBL/DLOC chunks, unknown
+  compression/cType codes, and short chunky bodies are each rejected with
+  `Error::invalid`. Source: `docs/image/iff/iff-truecolor-chunks.md` §1
+  (§1.1 DGBL, §1.2 DPEL, §1.3 DLOC, §1.4 DBOD, §1.5 TVDC).
 - *(ilbm)* FORM RGB8 24-bit genlock-RLE BODY decoder
   (`ilbm::decode_rgb8_body`). RGB8 is the 8-bit-per-gun sibling of RGBN:
   a flat stream of 32-bit big-endian LONG units carrying a 24-bit RGB

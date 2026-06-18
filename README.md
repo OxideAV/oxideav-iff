@@ -744,9 +744,32 @@ Turbo-Silver "zero colour" (genlocked → opaque black), Diamond/Light24
 run that overshoots the pixel budget are rejected with `Error::invalid`
 (plus RGBN's missing-BYTE/WORD-escape and zero-length-WORD-escape cases,
 and RGB8's zero-count case).
+**FORM DEEP** (Amiga Centre Scotland, 1991; TVPaint) chunky deep-raster
+support has landed for the structural chunks and the two body codings the
+staged spec fully pins down. [`ilbm::Dgbl`] parses/writes the mandatory
+DGBL global header (display size, [`ilbm::DeepCompression`] method, pixel
+aspect); [`ilbm::Dpel`] parses the DPEL pixel-element layout (a ULONG
+`nElements` then `(cType, cBitDepth)` pairs in MSB-first storage order)
+and reports `total_bits` / `pixel_bytes` (the pixel padded up to a byte
+boundary); [`ilbm::Dloc`] parses the optional DBOD-placement chunk.
+[`ilbm::decode_tvdc`] decodes a TVDC component line (DGBL `Compression ==
+5`, §1.5): the source is read one nibble at a time (high then low), a
+running accumulator starts at 0, a non-zero 16-word `table[d]` delta
+advances and emits it, and a zero `table[d]` reads the next nibble as a
+short-run count that re-emits the current value; it returns the source
+bytes used (`ceil(nibbles/2)`). [`ilbm::assemble_deep_chunky`] turns a
+decompressed chunky body into packed RGBA8888 top-to-bottom (RED/GREEN/
+BLUE → guns, ALPHA/OPACITY → alpha, each component scaled to 8 bits by
+left-shift + MSB replication). RUNLENGTH / HUFFMAN / DYNAMICHUFF / JPEG
+DEEP bodies are **not** yet decoded — the canonical DEEP text does not
+spell out their wire layout. Truncated TVDC sources, run overshoot,
+undersized DGBL/DPEL/DLOC chunks, unknown compression/cType codes, and
+short chunky bodies are each rejected with `Error::invalid`.
 Remaining true-colour frontier: the
-RGBN/RGB8 FORM-type container walker + probe, and DEEP's chunky
-DPEL-described raster incl. TVDC delta (§1).
+DEEP / RGBN / RGB8 FORM-type container walkers + probes (wiring these
+body decoders to a top-level `parse_*` entry point), DEEP's
+RUNLENGTH/HUFFMAN/DYNAMICHUFF/JPEG body codings, and the TVPP project-
+file FORM (§2, non-canonical RE — needs a real-file fixture).
 
 AIFF-C coverage is saturated: Apple shipped 13 chunk classes (FVER,
 COMM, SSND, MARK, INST, COMT, AESD, APPL, MIDI, SAXL, NAME, AUTH,

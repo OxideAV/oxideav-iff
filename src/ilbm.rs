@@ -3637,6 +3637,459 @@ pub fn decode_rgb8_body(
     Ok(rgba)
 }
 
+// ───────────────────────── FORM DEEP — chunky deep raster ─────────────────
+//
+// FORM DEEP (Amiga Centre Scotland, 1991; used by TVPaint) carries *chunky*
+// — not bitplaned — deep / true-colour pixels: each pixel's components sit in
+// consecutive bytes, described once by a DPEL chunk, with no CLUT. The chunk
+// vocabulary is:
+//
+//   FORM DEEP
+//      DGBL  global info (mandatory, first): display size, compression, aspect
+//      DPEL  pixel-element layout: per-component type + bit depth
+//      DLOC  optional DBOD placement (w/h/x/y)
+//      DBOD  the pixel data, compressed per DGBL.Compression
+//      DCHG  optional cel-anim frame timing
+//
+// This module implements the structural chunks (DGBL/DPEL/DLOC) plus the two
+// body codings whose wire format the staged spec fully pins down:
+// NOCOMPRESSION (raw chunky stream) and TVDC (Compression == 5, TecSoft's
+// 16-word delta + short-run RLE addendum). RUNLENGTH/HUFFMAN/DYNAMICHUFF/JPEG
+// are not yet decoded — the canonical DEEP text does not spell out their wire
+// layout (RUNLENGTH is explicitly flagged undocumented).
+//
+// Source: docs/image/iff/iff-truecolor-chunks.md §1 (§1.1 DGBL, §1.2 DPEL,
+// §1.3 DLOC, §1.4 DBOD, §1.5 TVDC). No third-party loader code was consulted.
+
+/// DEEP DBOD compression method, from the DGBL `Compression` field
+/// (§1.1 of the truecolor doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepCompression {
+    /// `0` — raw chunky stream, no compression.
+    None,
+    /// `1` — run-length (the canonical DEEP text does not spell out the
+    /// scheme; treat as undocumented and probe before relying on it).
+    RunLength,
+    /// `2` — Huffman.
+    Huffman,
+    /// `3` — dynamic Huffman.
+    DynamicHuffman,
+    /// `4` — JPEG.
+    Jpeg,
+    /// `5` — TVDC (TecSoft addendum): 16-word delta table + short-run RLE,
+    /// applied line-by-line per DPEL component. See [`decode_tvdc`].
+    Tvdc,
+}
+
+impl DeepCompression {
+    /// Map a DGBL `Compression` value to its enum, rejecting unknown codes.
+    pub fn from_u16(v: u16) -> Result<Self> {
+        Ok(match v {
+            0 => DeepCompression::None,
+            1 => DeepCompression::RunLength,
+            2 => DeepCompression::Huffman,
+            3 => DeepCompression::DynamicHuffman,
+            4 => DeepCompression::Jpeg,
+            5 => DeepCompression::Tvdc,
+            other => {
+                return Err(Error::invalid(format!(
+                    "DEEP DGBL: unknown Compression {other} (expected 0..=5)"
+                )))
+            }
+        })
+    }
+
+    /// The numeric DGBL `Compression` value for this method.
+    pub fn to_u16(self) -> u16 {
+        match self {
+            DeepCompression::None => 0,
+            DeepCompression::RunLength => 1,
+            DeepCompression::Huffman => 2,
+            DeepCompression::DynamicHuffman => 3,
+            DeepCompression::Jpeg => 4,
+            DeepCompression::Tvdc => 5,
+        }
+    }
+}
+
+/// DEEP global information — the `DGBL` chunk (§1.1). Always the first chunk
+/// in a FORM DEEP. Eight bytes on the wire: two UWORDs, one UWORD, two UBYTEs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dgbl {
+    /// Width of the source display, in pixels.
+    pub display_width: u16,
+    /// Height of the source display, in pixels.
+    pub display_height: u16,
+    /// DBOD compression method.
+    pub compression: DeepCompression,
+    /// Pixel aspect-ratio width term.
+    pub x_aspect: u8,
+    /// Pixel aspect-ratio height term.
+    pub y_aspect: u8,
+}
+
+impl Dgbl {
+    /// Parse a `DGBL` chunk body (8 bytes).
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 8 {
+            return Err(Error::invalid(format!(
+                "DEEP DGBL: chunk is {} bytes, need at least 8",
+                body.len()
+            )));
+        }
+        Ok(Dgbl {
+            display_width: u16::from_be_bytes([body[0], body[1]]),
+            display_height: u16::from_be_bytes([body[2], body[3]]),
+            compression: DeepCompression::from_u16(u16::from_be_bytes([body[4], body[5]]))?,
+            x_aspect: body[6],
+            y_aspect: body[7],
+        })
+    }
+
+    /// Serialise to the 8-byte `DGBL` wire form.
+    pub fn write(&self) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[0..2].copy_from_slice(&self.display_width.to_be_bytes());
+        out[2..4].copy_from_slice(&self.display_height.to_be_bytes());
+        out[4..6].copy_from_slice(&self.compression.to_u16().to_be_bytes());
+        out[6] = self.x_aspect;
+        out[7] = self.y_aspect;
+        out
+    }
+}
+
+/// DEEP pixel component type — the `cType` field of a DPEL element (§1.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepCType {
+    Red,
+    Green,
+    Blue,
+    Alpha,
+    Yellow,
+    Cyan,
+    Magenta,
+    Black,
+    Mask,
+    ZBuffer,
+    Opacity,
+    LinearKey,
+    BinaryKey,
+}
+
+impl DeepCType {
+    /// Map a DPEL `cType` value (§1.2 table) to its enum.
+    pub fn from_u16(v: u16) -> Result<Self> {
+        Ok(match v {
+            1 => DeepCType::Red,
+            2 => DeepCType::Green,
+            3 => DeepCType::Blue,
+            4 => DeepCType::Alpha,
+            5 => DeepCType::Yellow,
+            6 => DeepCType::Cyan,
+            7 => DeepCType::Magenta,
+            8 => DeepCType::Black,
+            9 => DeepCType::Mask,
+            10 => DeepCType::ZBuffer,
+            11 => DeepCType::Opacity,
+            12 => DeepCType::LinearKey,
+            13 => DeepCType::BinaryKey,
+            other => {
+                return Err(Error::invalid(format!(
+                    "DEEP DPEL: unknown cType {other} (expected 1..=13)"
+                )))
+            }
+        })
+    }
+
+    /// The numeric `cType` value.
+    pub fn to_u16(self) -> u16 {
+        match self {
+            DeepCType::Red => 1,
+            DeepCType::Green => 2,
+            DeepCType::Blue => 3,
+            DeepCType::Alpha => 4,
+            DeepCType::Yellow => 5,
+            DeepCType::Cyan => 6,
+            DeepCType::Magenta => 7,
+            DeepCType::Black => 8,
+            DeepCType::Mask => 9,
+            DeepCType::ZBuffer => 10,
+            DeepCType::Opacity => 11,
+            DeepCType::LinearKey => 12,
+            DeepCType::BinaryKey => 13,
+        }
+    }
+}
+
+/// One DPEL pixel-component descriptor: a `(cType, cBitDepth)` pair (§1.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DpelElement {
+    /// Component type.
+    pub c_type: DeepCType,
+    /// Number of bits this component occupies in the pixel.
+    pub c_bit_depth: u16,
+}
+
+/// DEEP pixel-element layout — the `DPEL` chunk (§1.2). Describes, in storage
+/// order (MSB-first), the components that make up one pixel. The whole pixel
+/// is padded up to a byte boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dpel {
+    /// The components, in MSB-first storage order.
+    pub elements: Vec<DpelElement>,
+}
+
+impl Dpel {
+    /// Parse a `DPEL` chunk body: a ULONG `nElements` followed by
+    /// `nElements` `(UWORD cType, UWORD cBitDepth)` pairs.
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 4 {
+            return Err(Error::invalid(
+                "DEEP DPEL: chunk too small for the nElements ULONG",
+            ));
+        }
+        let n = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
+        // Each element is 4 bytes (two UWORDs). Reject a count that the body
+        // can't possibly hold before allocating anything.
+        let need = 4usize
+            .checked_add(
+                n.checked_mul(4)
+                    .ok_or_else(|| Error::invalid("DEEP DPEL: nElements * 4 overflows"))?,
+            )
+            .ok_or_else(|| Error::invalid("DEEP DPEL: header + payload overflows"))?;
+        if body.len() < need {
+            return Err(Error::invalid(format!(
+                "DEEP DPEL: {n} elements need {need} bytes, chunk is {}",
+                body.len()
+            )));
+        }
+        let mut elements = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = 4 + i * 4;
+            let c_type = DeepCType::from_u16(u16::from_be_bytes([body[off], body[off + 1]]))?;
+            let c_bit_depth = u16::from_be_bytes([body[off + 2], body[off + 3]]);
+            elements.push(DpelElement {
+                c_type,
+                c_bit_depth,
+            });
+        }
+        Ok(Dpel { elements })
+    }
+
+    /// Total bits across every component (before byte padding).
+    pub fn total_bits(&self) -> u32 {
+        self.elements.iter().map(|e| u32::from(e.c_bit_depth)).sum()
+    }
+
+    /// Bytes occupied by one pixel: the summed component bits rounded up to a
+    /// byte boundary (§1.2 "the whole pixel is padded up to a byte boundary").
+    pub fn pixel_bytes(&self) -> usize {
+        (self.total_bits() as usize).div_ceil(8)
+    }
+}
+
+/// DEEP display location — the optional `DLOC` chunk (§1.3): the width/height
+/// of the *following* DBOD plus its placement. Eight bytes: two UWORDs then
+/// two WORDs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dloc {
+    /// Width of the following DBOD, in pixels.
+    pub w: u16,
+    /// Height of the following DBOD, in pixels.
+    pub h: u16,
+    /// X pixel position of this image.
+    pub x: i16,
+    /// Y pixel position of this image.
+    pub y: i16,
+}
+
+impl Dloc {
+    /// Parse a `DLOC` chunk body (8 bytes).
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 8 {
+            return Err(Error::invalid(format!(
+                "DEEP DLOC: chunk is {} bytes, need at least 8",
+                body.len()
+            )));
+        }
+        Ok(Dloc {
+            w: u16::from_be_bytes([body[0], body[1]]),
+            h: u16::from_be_bytes([body[2], body[3]]),
+            x: i16::from_be_bytes([body[4], body[5]]),
+            y: i16::from_be_bytes([body[6], body[7]]),
+        })
+    }
+}
+
+/// Decode a TVDC component line (DEEP `Compression == 5`, §1.5).
+///
+/// TVDC (TecSoft's addendum for TVPaint) is a modified delta compression that
+/// reads the source **one nibble at a time, high nibble first then low**, and
+/// maintains a running accumulator `v` that starts at `0` for each line:
+///
+/// - look up `table[d]` for nibble `d` (0..=15), a signed 16-word delta table
+///   supplied alongside the data;
+/// - if `table[d] != 0`: `v += table[d]`; emit `v` (low 8 bits) as the next
+///   output byte;
+/// - if `table[d] == 0`: the **next nibble** is a run count; the *current* `v`
+///   is emitted that many **more** times (short-run RLE).
+///
+/// The function emits exactly `size` output bytes and returns the number of
+/// **source bytes** consumed (`(nibble_pos + 1) / 2`, i.e. the nibble count
+/// rounded up to whole bytes), so the caller can advance to the next line.
+/// A source that runs out of nibbles before `size` bytes are produced is
+/// rejected with [`Error::invalid`].
+pub fn decode_tvdc(
+    source: &[u8],
+    table: &[i16; 16],
+    size: usize,
+    out: &mut Vec<u8>,
+) -> Result<usize> {
+    // Nibble cursor: nibble index 2*k is the high nibble of byte k, 2*k+1 the
+    // low nibble. `read_nibble` advances and bounds-checks.
+    let mut nib = 0usize;
+    let max_nibbles = source.len() * 2;
+    let read_nibble = |nib: &mut usize| -> Result<u8> {
+        if *nib >= max_nibbles {
+            return Err(Error::invalid(
+                "DEEP TVDC: source ran out of nibbles before the line was filled",
+            ));
+        }
+        let byte = source[*nib / 2];
+        let n = if *nib & 1 == 0 {
+            byte >> 4
+        } else {
+            byte & 0x0F
+        };
+        *nib += 1;
+        Ok(n)
+    };
+
+    let mut v: i32 = 0;
+    let mut produced = 0usize;
+    while produced < size {
+        let d = read_nibble(&mut nib)? as usize;
+        let delta = table[d];
+        if delta != 0 {
+            v = v.wrapping_add(i32::from(delta));
+            out.push((v & 0xFF) as u8);
+            produced += 1;
+        } else {
+            // Zero delta → next nibble is a run count: emit current v that
+            // many more times.
+            let run = read_nibble(&mut nib)? as usize;
+            if produced + run > size {
+                return Err(Error::invalid(format!(
+                    "DEEP TVDC: run of {run} overshoots the {size}-byte line ({produced} produced)"
+                )));
+            }
+            for _ in 0..run {
+                out.push((v & 0xFF) as u8);
+            }
+            produced += run;
+        }
+    }
+    // Source bytes used = nibble count rounded up to whole bytes.
+    Ok(nib.div_ceil(2))
+}
+
+/// Assemble a decompressed DEEP **chunky** body into packed RGBA8888,
+/// row-major, top-to-bottom (§1.2 + §1.4).
+///
+/// `body` is the per-pixel chunky stream after any DGBL decompression: each
+/// pixel occupies [`Dpel::pixel_bytes`] bytes, with the DPEL components packed
+/// MSB-first and the pixel padded up to a byte boundary. Each component is
+/// scaled from its `cBitDepth` up to 8 bits by left-shift + MSB replication.
+/// RED/GREEN/BLUE map to the RGB guns; ALPHA / OPACITY map to alpha; any other
+/// component is parsed (to keep the bit cursor correct) but does not reach the
+/// output. A pixel with no alpha-bearing component is fully opaque.
+pub fn assemble_deep_chunky(dpel: &Dpel, width: u16, height: u16, body: &[u8]) -> Result<Vec<u8>> {
+    let pixel_bytes = dpel.pixel_bytes();
+    if pixel_bytes == 0 {
+        return Err(Error::invalid(
+            "DEEP: DPEL describes a zero-bit pixel (no components)",
+        ));
+    }
+    let total: usize = width as usize * height as usize;
+    let need = total
+        .checked_mul(pixel_bytes)
+        .ok_or_else(|| Error::invalid("DEEP: width * height * pixel_bytes overflows"))?;
+    if body.len() < need {
+        return Err(Error::invalid(format!(
+            "DEEP: chunky body is {} bytes, need {need} ({width}x{height} @ {pixel_bytes} B/pixel)",
+            body.len()
+        )));
+    }
+
+    let mut rgba = vec![0u8; total * 4];
+    for p in 0..total {
+        let pixel = &body[p * pixel_bytes..p * pixel_bytes + pixel_bytes];
+        // Walk components MSB-first across the pixel's bits.
+        let mut bit_cursor = 0u32;
+        let (mut r, mut g, mut b) = (0u8, 0u8, 0u8);
+        // A pixel with no alpha-bearing component is fully opaque.
+        let mut a = 0xFFu8;
+        for el in &dpel.elements {
+            let depth = el.c_bit_depth;
+            let raw = read_bits_msb(pixel, bit_cursor, depth);
+            bit_cursor += u32::from(depth);
+            let scaled = scale_to_u8(raw, depth);
+            match el.c_type {
+                DeepCType::Red => r = scaled,
+                DeepCType::Green => g = scaled,
+                DeepCType::Blue => b = scaled,
+                DeepCType::Alpha | DeepCType::Opacity => a = scaled,
+                _ => {} // parsed for cursor advance; not mapped to output
+            }
+        }
+        let dst = p * 4;
+        rgba[dst] = r;
+        rgba[dst + 1] = g;
+        rgba[dst + 2] = b;
+        rgba[dst + 3] = a;
+    }
+    Ok(rgba)
+}
+
+/// Read `depth` bits (1..=16) MSB-first starting at bit offset `start` within
+/// a byte slice, returning them right-aligned in a u16. Bits beyond the slice
+/// read as 0 (the caller has already size-checked the pixel buffer).
+fn read_bits_msb(bytes: &[u8], start: u32, depth: u16) -> u16 {
+    let mut acc: u16 = 0;
+    for i in 0..depth {
+        let bit_index = start + u32::from(i);
+        let byte_index = (bit_index / 8) as usize;
+        let bit_in_byte = 7 - (bit_index % 8);
+        let bit = bytes
+            .get(byte_index)
+            .map(|&v| (v >> bit_in_byte) & 1)
+            .unwrap_or(0);
+        acc = (acc << 1) | u16::from(bit);
+    }
+    acc
+}
+
+/// Scale a `depth`-bit value up to a full 8-bit channel by left-shifting into
+/// the high bits and replicating the most-significant bits into the low bits,
+/// so the full input range maps onto the full `0..=255` output range.
+fn scale_to_u8(value: u16, depth: u16) -> u8 {
+    if depth == 0 {
+        return 0;
+    }
+    if depth >= 8 {
+        // Take the top 8 bits of a deeper component.
+        return (value >> (depth - 8)) as u8;
+    }
+    let mut out = (value << (8 - depth)) as u8;
+    // Replicate the high bits down to fill the low bits.
+    let mut filled = depth;
+    while filled < 8 {
+        out |= out >> filled;
+        filled *= 2;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4232,5 +4685,235 @@ mod tests {
             assert_eq!(img.rgba[x * 4 + 2], 0xFF, "B pixel {x}");
             assert_eq!(img.rgba[x * 4 + 3], expected_a, "alpha pixel {x}");
         }
+    }
+
+    // ───────────────────── FORM DEEP — chunky deep raster ─────────────────
+
+    #[test]
+    fn deep_dgbl_roundtrips() {
+        let d = Dgbl {
+            display_width: 320,
+            display_height: 200,
+            compression: DeepCompression::Tvdc,
+            x_aspect: 10,
+            y_aspect: 11,
+        };
+        let bytes = d.write();
+        assert_eq!(Dgbl::parse(&bytes).unwrap(), d);
+    }
+
+    #[test]
+    fn deep_dgbl_compression_codes() {
+        for (v, want) in [
+            (0u16, DeepCompression::None),
+            (1, DeepCompression::RunLength),
+            (2, DeepCompression::Huffman),
+            (3, DeepCompression::DynamicHuffman),
+            (4, DeepCompression::Jpeg),
+            (5, DeepCompression::Tvdc),
+        ] {
+            assert_eq!(DeepCompression::from_u16(v).unwrap(), want);
+            assert_eq!(want.to_u16(), v);
+        }
+        assert!(DeepCompression::from_u16(6).is_err());
+    }
+
+    #[test]
+    fn deep_dgbl_rejects_short_chunk() {
+        assert!(Dgbl::parse(&[0u8; 7]).is_err());
+    }
+
+    #[test]
+    fn deep_dpel_rgb888_layout() {
+        // nElements = 3, each RED/GREEN/BLUE @ 8 bits.
+        let mut body = Vec::new();
+        body.extend_from_slice(&3u32.to_be_bytes());
+        for c in [1u16, 2, 3] {
+            body.extend_from_slice(&c.to_be_bytes());
+            body.extend_from_slice(&8u16.to_be_bytes());
+        }
+        let dpel = Dpel::parse(&body).unwrap();
+        assert_eq!(dpel.elements.len(), 3);
+        assert_eq!(dpel.elements[0].c_type, DeepCType::Red);
+        assert_eq!(dpel.elements[1].c_type, DeepCType::Green);
+        assert_eq!(dpel.elements[2].c_type, DeepCType::Blue);
+        assert_eq!(dpel.total_bits(), 24);
+        assert_eq!(dpel.pixel_bytes(), 3);
+    }
+
+    #[test]
+    fn deep_dpel_rgba_8_8_8_4_pads_to_byte() {
+        // RGBA 8:8:8:4 → 28 bits → 4 bytes (alpha padded).
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u32.to_be_bytes());
+        for (c, d) in [(1u16, 8u16), (2, 8), (3, 8), (4, 4)] {
+            body.extend_from_slice(&c.to_be_bytes());
+            body.extend_from_slice(&d.to_be_bytes());
+        }
+        let dpel = Dpel::parse(&body).unwrap();
+        assert_eq!(dpel.total_bits(), 28);
+        assert_eq!(dpel.pixel_bytes(), 4);
+        assert_eq!(dpel.elements[3].c_type, DeepCType::Alpha);
+    }
+
+    #[test]
+    fn deep_dpel_rejects_undersized_payload() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&3u32.to_be_bytes()); // claims 3 elements
+        body.extend_from_slice(&1u16.to_be_bytes()); // only one partial element
+        assert!(Dpel::parse(&body).is_err());
+    }
+
+    #[test]
+    fn deep_dpel_unknown_ctype_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&99u16.to_be_bytes());
+        body.extend_from_slice(&8u16.to_be_bytes());
+        assert!(Dpel::parse(&body).is_err());
+    }
+
+    #[test]
+    fn deep_dloc_parses() {
+        let body = [0, 64, 0, 48, 0xFF, 0xF6, 0, 10]; // w=64,h=48,x=-10,y=10
+        let dloc = Dloc::parse(&body).unwrap();
+        assert_eq!(dloc.w, 64);
+        assert_eq!(dloc.h, 48);
+        assert_eq!(dloc.x, -10);
+        assert_eq!(dloc.y, 10);
+    }
+
+    #[test]
+    fn deep_assemble_chunky_rgb888() {
+        // 2x1 RGB888: pixel0 = (10,20,30), pixel1 = (200,100,50).
+        let mut dpel_body = Vec::new();
+        dpel_body.extend_from_slice(&3u32.to_be_bytes());
+        for c in [1u16, 2, 3] {
+            dpel_body.extend_from_slice(&c.to_be_bytes());
+            dpel_body.extend_from_slice(&8u16.to_be_bytes());
+        }
+        let dpel = Dpel::parse(&dpel_body).unwrap();
+        let body = [10u8, 20, 30, 200, 100, 50];
+        let rgba = assemble_deep_chunky(&dpel, 2, 1, &body).unwrap();
+        assert_eq!(rgba, vec![10, 20, 30, 0xFF, 200, 100, 50, 0xFF]);
+    }
+
+    #[test]
+    fn deep_assemble_chunky_rgba_with_alpha() {
+        // 1x1 RGBA 8:8:8:8: (1,2,3,4).
+        let mut dpel_body = Vec::new();
+        dpel_body.extend_from_slice(&4u32.to_be_bytes());
+        for c in [1u16, 2, 3, 4] {
+            dpel_body.extend_from_slice(&c.to_be_bytes());
+            dpel_body.extend_from_slice(&8u16.to_be_bytes());
+        }
+        let dpel = Dpel::parse(&dpel_body).unwrap();
+        let body = [1u8, 2, 3, 4];
+        let rgba = assemble_deep_chunky(&dpel, 1, 1, &body).unwrap();
+        assert_eq!(rgba, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn deep_assemble_chunky_4bit_guns_scale() {
+        // 1x1 RGB444 packed into 12 bits → 2 bytes (padded). (0xF,0x0,0x8).
+        let mut dpel_body = Vec::new();
+        dpel_body.extend_from_slice(&3u32.to_be_bytes());
+        for c in [1u16, 2, 3] {
+            dpel_body.extend_from_slice(&c.to_be_bytes());
+            dpel_body.extend_from_slice(&4u16.to_be_bytes());
+        }
+        let dpel = Dpel::parse(&dpel_body).unwrap();
+        assert_eq!(dpel.pixel_bytes(), 2);
+        // bits MSB-first: R=1111 G=0000 B=1000 pad=0000 → 0xF0 0x80
+        let body = [0xF0u8, 0x80];
+        let rgba = assemble_deep_chunky(&dpel, 1, 1, &body).unwrap();
+        // 0xF → 0xFF, 0x0 → 0x00, 0x8 → 0x88 (replicate high nibble).
+        assert_eq!(&rgba[0..4], &[0xFF, 0x00, 0x88, 0xFF]);
+    }
+
+    #[test]
+    fn deep_assemble_chunky_rejects_short_body() {
+        let mut dpel_body = Vec::new();
+        dpel_body.extend_from_slice(&3u32.to_be_bytes());
+        for c in [1u16, 2, 3] {
+            dpel_body.extend_from_slice(&c.to_be_bytes());
+            dpel_body.extend_from_slice(&8u16.to_be_bytes());
+        }
+        let dpel = Dpel::parse(&dpel_body).unwrap();
+        assert!(assemble_deep_chunky(&dpel, 2, 1, &[1, 2, 3]).is_err());
+    }
+
+    // ───────────────────── TVDC line decompression (§1.5) ─────────────────
+
+    #[test]
+    fn tvdc_pure_delta_line() {
+        // Table: nibble 1 → +1, nibble 2 → -1; nibble 0 reserved as the
+        // run sentinel (table[0] = 0).
+        let mut table = [0i16; 16];
+        table[1] = 1;
+        table[2] = -1;
+        // Source nibbles: 1 1 1 2  → v: 1,2,3,2  (high then low nibble).
+        // bytes: 0x11, 0x12
+        let source = [0x11u8, 0x12];
+        let mut out = Vec::new();
+        let used = decode_tvdc(&source, &table, 4, &mut out).unwrap();
+        assert_eq!(out, vec![1, 2, 3, 2]);
+        assert_eq!(used, 2); // 4 nibbles = 2 bytes
+    }
+
+    #[test]
+    fn tvdc_short_run_rle() {
+        // table[1] = +5; table[0] = 0 (sentinel). Nibbles: 1 (v=5, emit),
+        // then 0 (sentinel) 3 (run=3 → emit v three more times).
+        let mut table = [0i16; 16];
+        table[1] = 5;
+        // bytes: 0x10, 0x30
+        let source = [0x10u8, 0x30];
+        let mut out = Vec::new();
+        let used = decode_tvdc(&source, &table, 4, &mut out).unwrap();
+        assert_eq!(out, vec![5, 5, 5, 5]);
+        assert_eq!(used, 2);
+    }
+
+    #[test]
+    fn tvdc_odd_nibble_rounds_up_byte_count() {
+        // Three nibbles consumed (1 1 1) → used = ceil(3/2) = 2 bytes.
+        let mut table = [0i16; 16];
+        table[1] = 1;
+        let source = [0x11u8, 0x10];
+        let mut out = Vec::new();
+        let used = decode_tvdc(&source, &table, 3, &mut out).unwrap();
+        assert_eq!(out, vec![1, 2, 3]);
+        assert_eq!(used, 2);
+    }
+
+    #[test]
+    fn tvdc_rejects_truncated_source() {
+        let mut table = [0i16; 16];
+        table[1] = 1;
+        let source = [0x11u8]; // only 2 nibbles, need 4 outputs
+        let mut out = Vec::new();
+        assert!(decode_tvdc(&source, &table, 4, &mut out).is_err());
+    }
+
+    #[test]
+    fn tvdc_rejects_run_overshoot() {
+        let mut table = [0i16; 16];
+        table[1] = 5;
+        // 1 (emit) then 0 (sentinel) F (run=15) → overshoots a 2-byte line.
+        let source = [0x10u8, 0xF0];
+        let mut out = Vec::new();
+        assert!(decode_tvdc(&source, &table, 2, &mut out).is_err());
+    }
+
+    #[test]
+    fn tvdc_accumulator_wraps_to_byte() {
+        // Repeated +200 deltas: v=200, 400&0xFF=144, 600&0xFF=88.
+        let mut table = [0i16; 16];
+        table[1] = 200;
+        let source = [0x11u8, 0x10];
+        let mut out = Vec::new();
+        decode_tvdc(&source, &table, 3, &mut out).unwrap();
+        assert_eq!(out, vec![200, 144, 88]);
     }
 }
