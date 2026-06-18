@@ -722,21 +722,29 @@ genuine **sub-rectangle** variant (§2.1 `w` / `h` / `x` / `y`
 narrower-than-bitmap "XOR mode only" fields) needs a staged wire
 description of the narrower row stride + the rectangle `x` byte/bit
 alignment. The DEEP / TVPP / RGB8 / RGBN true-colour IFF FORMs have a
-staged spec at `docs/image/iff/iff-truecolor-chunks.md`. The first of
-these to land is the **RGBN 12-bit genlock-RLE BODY** decoder
-([`ilbm::decode_rgbn_body`]): the §3.1 stream of 16-bit WORD units
+staged spec at `docs/image/iff/iff-truecolor-chunks.md`. The
+**RGBN 12-bit genlock-RLE BODY** decoder
+([`ilbm::decode_rgbn_body`]) decodes the §3.1 stream of 16-bit WORD units
 (red/green/blue nibbles, genlock bit, 3-bit run count) with the full
 count cascade (3-bit inline 1..7 → BYTE up to 255 → WORD for larger
 runs), widening each 4-bit gun to RGB888 by nibble replication and
-emitting packed RGBA top-to-bottom. A single run may spill across a
+emitting packed RGBA top-to-bottom. The **RGB8 24-bit genlock-RLE BODY**
+decoder ([`ilbm::decode_rgb8_body`]) is its 8-bit-per-gun sibling: the
+§3.2 stream of 32-bit LONG units (24-bit RGB value with red the MS byte,
+genlock bit, single inline 7-bit run count `1..=127`). Per §3.2 RGB8 has
+**no** BYTE/WORD count cascade — Impulse never wrote more than the 7-bit
+count and Imagine/Light24 only read it — so a zero count is an undefined
+zero-length run and is rejected. Each 8-bit gun passes through unchanged.
+For both decoders a single run may spill across a
 scanline boundary (the body is a flat `width × height` pixel stream).
 The §3.3 genlock bit is interpreted via [`ilbm::GenlockPolicy`] —
 Turbo-Silver "zero colour" (genlocked → opaque black), Diamond/Light24
 "ignore" (always use the coded RGB, the default), or "brush" (genlocked
-→ alpha 0 transparency mask). A truncated stream, a run that
-overshoots the pixel budget, a missing BYTE/WORD escape, and a
-zero-length WORD-escape run are each rejected with `Error::invalid`.
-Remaining true-colour frontier: the RGB8 32-bit LONG body (§3.2), the
+→ alpha 0 transparency mask). For both bodies a truncated stream and a
+run that overshoots the pixel budget are rejected with `Error::invalid`
+(plus RGBN's missing-BYTE/WORD-escape and zero-length-WORD-escape cases,
+and RGB8's zero-count case).
+Remaining true-colour frontier: the
 RGBN/RGB8 FORM-type container walker + probe, and DEEP's chunky
 DPEL-described raster incl. TVDC delta (§1).
 

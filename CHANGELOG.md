@@ -24,6 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* FORM RGB8 24-bit genlock-RLE BODY decoder
+  (`ilbm::decode_rgb8_body`). RGB8 is the 8-bit-per-gun sibling of RGBN:
+  a flat stream of 32-bit big-endian LONG units carrying a 24-bit RGB
+  value (red = MS byte), a genlock bit, and a single inline 7-bit run
+  count (`1..=127`). Per §3.2 ¶ "Impulse never wrote more than a 7-bit
+  repeat count, and Imagine/Light24 only read the 7-bit count", RGB8
+  has **no** BYTE/WORD count cascade — a zero count is an undefined
+  zero-length run and is rejected. Each 8-bit gun passes through
+  unchanged; a run may spill across scanline boundaries; output is
+  packed RGBA top-to-bottom. The genlock bit is interpreted via the
+  shared `ilbm::GenlockPolicy` (Turbo-Silver zero-colour /
+  Diamond-Light24 ignore-colour [default] / brush transparency-mask).
+  Truncated streams, runs overshooting the pixel budget, and zero-count
+  units are each rejected with `Error::invalid`. Source:
+  `docs/image/iff/iff-truecolor-chunks.md` §3, §3.2, §3.3.
 - *(ilbm)* FORM RGBN 12-bit genlock-RLE BODY decoder
   (`ilbm::decode_rgbn_body`). RGBN is Impulse's Turbo Silver / Imagine
   true-colour FORM (no CLUT): a flat stream of 16-bit big-endian WORD

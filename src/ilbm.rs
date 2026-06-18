@@ -3538,6 +3538,105 @@ pub fn decode_rgbn_body(
     Ok(rgba)
 }
 
+/// Decode an RGB8 (`compression == 4`) BODY of `width * height` 24-bit
+/// genlock-RLE pixels into packed RGBA8888, row-major, top-to-bottom.
+///
+/// RGB8 is the 24-bit-per-pixel sibling of RGBN (§3.2 of the truecolor
+/// doc): every coded unit is a **32-bit big-endian LONG**, MSB→LSB:
+///
+/// ```text
+///  bit:  31 ................. 8   7      6 .... 0
+///        [   24-bit RGB value   ] [genlock] [7-bit count]
+/// ```
+///
+/// Red is the most-significant gun, then green, then blue (LSBs); each gun
+/// is already a full 8 bits so no widening is needed. Unlike RGBN's
+/// 3-bit-with-BYTE/WORD-cascade count, RGB8 carries a single inline **7-bit
+/// repeat count** (runs `1..=127`): per §3.2 ¶ "Impulse never wrote more
+/// than a 7-bit repeat count, and Imagine/Light24 only read the 7-bit
+/// count", so there is no escape cascade. A `count` of `0` is therefore an
+/// undefined zero-length run and is rejected.
+///
+/// `genlock` selects how the genlock bit maps to output colour / alpha
+/// (see [`GenlockPolicy`]) — identical semantics to [`decode_rgbn_body`].
+/// The function validates that the run stream fills *exactly*
+/// `width * height` pixels — a stream that runs out early or whose final
+/// run overshoots the pixel budget is rejected with [`Error::invalid`], so
+/// a truncated or malformed body never silently yields a partial frame or
+/// writes out of bounds. A single run may spill across the right edge into
+/// the next scanline (the body is a flat pixel stream).
+pub fn decode_rgb8_body(
+    width: u16,
+    height: u16,
+    body: &[u8],
+    genlock: GenlockPolicy,
+) -> Result<Vec<u8>> {
+    let total: usize = width as usize * height as usize;
+    let mut rgba = vec![0u8; total * 4];
+    let mut filled = 0usize;
+    let mut pos = 0usize;
+
+    while filled < total {
+        if pos + 4 > body.len() {
+            return Err(Error::invalid(format!(
+                "RGB8 BODY: stream ended after {filled} of {total} pixels (need another LONG unit)"
+            )));
+        }
+        let w = u32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+        pos += 4;
+
+        let rgb24 = w >> 8;
+        let lock = w & 0x0000_0080 != 0;
+        let count = (w & 0x0000_007F) as usize;
+
+        if count == 0 {
+            return Err(Error::invalid(
+                "RGB8 BODY: 7-bit count is 0 (a zero-length run is undefined; RGB8 has no count escape)",
+            ));
+        }
+
+        if filled + count > total {
+            return Err(Error::invalid(format!(
+                "RGB8 BODY: run of {count} overshoots pixel budget ({filled} filled, {total} total)"
+            )));
+        }
+
+        // Resolve this run's RGBA quadruple once, then splat it. Each gun is
+        // already a full byte (red = MSB, then green, then blue = LSB).
+        let r = (rgb24 >> 16) as u8;
+        let g = (rgb24 >> 8) as u8;
+        let b = rgb24 as u8;
+        let (or, og, ob, oa) = match genlock {
+            GenlockPolicy::IgnoreUseColour => (r, g, b, 0xFF),
+            GenlockPolicy::TurboSilverZeroColour => {
+                if lock {
+                    (0, 0, 0, 0xFF)
+                } else {
+                    (r, g, b, 0xFF)
+                }
+            }
+            GenlockPolicy::BrushTransparency => {
+                if lock {
+                    (r, g, b, 0x00)
+                } else {
+                    (r, g, b, 0xFF)
+                }
+            }
+        };
+
+        for _ in 0..count {
+            let dst = filled * 4;
+            rgba[dst] = or;
+            rgba[dst + 1] = og;
+            rgba[dst + 2] = ob;
+            rgba[dst + 3] = oa;
+            filled += 1;
+        }
+    }
+
+    Ok(rgba)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3681,6 +3780,107 @@ mod tests {
         body.push(0); // BYTE escape
         body.extend_from_slice(&0u16.to_be_bytes()); // WORD 0
         assert!(decode_rgbn_body(1, 1, &body, GenlockPolicy::default()).is_err());
+    }
+
+    /// Build one RGB8 LONG unit: 24-bit RGB (r:8 g:8 b:8) << 8, genlock bit
+    /// at 0x80, 7-bit run count in the low 7 bits.
+    fn rgb8_long(r: u8, g: u8, b: u8, lock: bool, count: u8) -> [u8; 4] {
+        let rgb = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+        let mut w = rgb << 8;
+        if lock {
+            w |= 0x0000_0080;
+        }
+        w |= u32::from(count) & 0x7F;
+        w.to_be_bytes()
+    }
+
+    #[test]
+    fn rgb8_inline_run_keeps_full_8bit_guns() {
+        // Red then white, one pixel each — guns pass through unchanged.
+        let mut body = Vec::new();
+        body.extend_from_slice(&rgb8_long(0xFF, 0x00, 0x00, false, 1));
+        body.extend_from_slice(&rgb8_long(0x12, 0x34, 0x56, false, 1));
+        let rgba = decode_rgb8_body(2, 1, &body, GenlockPolicy::default()).unwrap();
+        assert_eq!(&rgba[0..4], &[0xFF, 0x00, 0x00, 0xFF]);
+        assert_eq!(&rgba[4..8], &[0x12, 0x34, 0x56, 0xFF]);
+    }
+
+    #[test]
+    fn rgb8_inline_run_fills_multiple_pixels() {
+        // A 7-bit count of 5 fills five consecutive pixels.
+        let body = rgb8_long(0x00, 0x80, 0xFF, false, 5);
+        let rgba = decode_rgb8_body(5, 1, &body, GenlockPolicy::default()).unwrap();
+        for px in rgba.chunks_exact(4) {
+            assert_eq!(px, &[0x00, 0x80, 0xFF, 0xFF]);
+        }
+    }
+
+    #[test]
+    fn rgb8_max_inline_count_127() {
+        // The full 7-bit count (127) is the largest legal run.
+        let body = rgb8_long(0x11, 0x22, 0x33, false, 127);
+        let rgba = decode_rgb8_body(127, 1, &body, GenlockPolicy::default()).unwrap();
+        assert_eq!(rgba.len(), 127 * 4);
+        assert_eq!(&rgba[126 * 4..], &[0x11, 0x22, 0x33, 0xFF]);
+    }
+
+    #[test]
+    fn rgb8_run_spills_across_scanlines() {
+        // A 2x2 frame filled by a single run of 4 — the run crosses the
+        // first scanline boundary into the second row.
+        let body = rgb8_long(0xAB, 0xCD, 0xEF, false, 4);
+        let rgba = decode_rgb8_body(2, 2, &body, GenlockPolicy::default()).unwrap();
+        assert_eq!(rgba.len(), 4 * 4);
+        for px in rgba.chunks_exact(4) {
+            assert_eq!(px, &[0xAB, 0xCD, 0xEF, 0xFF]);
+        }
+    }
+
+    #[test]
+    fn rgb8_genlock_turbo_silver_writes_zero_colour() {
+        // A genlocked pixel becomes opaque black under Turbo-Silver policy;
+        // the coded RGB is ignored.
+        let body = rgb8_long(0xFF, 0xFF, 0xFF, true, 1);
+        let rgba = decode_rgb8_body(1, 1, &body, GenlockPolicy::TurboSilverZeroColour).unwrap();
+        assert_eq!(&rgba[0..4], &[0x00, 0x00, 0x00, 0xFF]);
+        // Same unit under the default policy keeps the coded white.
+        let rgba2 = decode_rgb8_body(1, 1, &body, GenlockPolicy::IgnoreUseColour).unwrap();
+        assert_eq!(&rgba2[0..4], &[0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn rgb8_genlock_brush_marks_transparency() {
+        // Brush policy: genlocked pixel gets alpha 0 but keeps its RGB.
+        let mut body = Vec::new();
+        body.extend_from_slice(&rgb8_long(0xFF, 0x00, 0x00, true, 1)); // masked-out
+        body.extend_from_slice(&rgb8_long(0x00, 0xFF, 0x00, false, 1)); // opaque
+        let rgba = decode_rgb8_body(2, 1, &body, GenlockPolicy::BrushTransparency).unwrap();
+        assert_eq!(&rgba[0..4], &[0xFF, 0x00, 0x00, 0x00]);
+        assert_eq!(&rgba[4..8], &[0x00, 0xFF, 0x00, 0xFF]);
+    }
+
+    #[test]
+    fn rgb8_truncated_stream_is_rejected() {
+        // A 3-byte body cannot even form one LONG unit.
+        let body = [0u8, 0, 0];
+        assert!(decode_rgb8_body(4, 1, &body, GenlockPolicy::default()).is_err());
+        // One unit (1 pixel) for a 4-pixel frame underruns.
+        let short = rgb8_long(0xFF, 0x00, 0x00, false, 1);
+        assert!(decode_rgb8_body(4, 1, &short, GenlockPolicy::default()).is_err());
+    }
+
+    #[test]
+    fn rgb8_overshoot_run_is_rejected() {
+        // A run of 7 into a 3-pixel frame overshoots the budget.
+        let body = rgb8_long(0xFF, 0x00, 0x00, false, 7);
+        assert!(decode_rgb8_body(3, 1, &body, GenlockPolicy::default()).is_err());
+    }
+
+    #[test]
+    fn rgb8_zero_count_is_rejected() {
+        // A 7-bit count of 0 has no escape cascade in RGB8 → undefined.
+        let body = rgb8_long(0xFF, 0x00, 0x00, false, 0);
+        assert!(decode_rgb8_body(1, 1, &body, GenlockPolicy::default()).is_err());
     }
 
     fn solid_palette() -> Vec<[u8; 3]> {
