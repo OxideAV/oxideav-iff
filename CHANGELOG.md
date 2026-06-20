@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* `FORM RGB8` / `FORM RGBN` genlock-RLE **encode**, completing the
+  true-colour round-trip. `ilbm::encode_rgb8_body` / `encode_rgbn_body`
+  coalesce a packed RGBA8888 image into the Turbo-Silver run-length BODY each
+  form carries: maximal runs of identical pixels in flat top-to-bottom order,
+  RGB8 emitting a 32-bit LONG with an inline 7-bit count (runs > 127 split into
+  successive units, §3.2) and RGBN a 16-bit WORD with the §3.1 count cascade
+  (1..=7 inline → BYTE for ≤ 255 → BYTE-0 + WORD for ≤ 65535). Alpha drives the
+  genlock bit under `GenlockPolicy::BrushTransparency` (`a == 0` → genlocked).
+  `ilbm::encode_rgb8` / `encode_rgbn` wrap the body in a complete `FORM` with a
+  `compression = 4` BMHD (nPlanes 25 / 13) and the required minimal `CAMG`, so
+  `parse_rgb8(encode_rgb8(x)) == x` for any 8-bit-true image and likewise for
+  RGBN once 12-bit nibble quantisation is accounted for. A mis-sized RGBA
+  buffer is rejected rather than silently truncating.
 - *(ilbm)* top-level `FORM DEEP` decode. `ilbm::parse_deep` walks a
   complete Amiga-Centre-Scotland chunky deep-raster file: it locates DGBL
   (mandatory §1.1 global header), DPEL (mandatory §1.2 pixel layout), the

@@ -3775,6 +3775,190 @@ pub fn parse_rgbn(bytes: &[u8], genlock: GenlockPolicy) -> Result<RgbTrueColor> 
     })
 }
 
+// ─────────────── FORM RGB8 / RGBN — genlock-RLE encode ───────────────
+//
+// The `decode_*_body` functions above widen a coded run stream into packed
+// RGBA8888; the `encode_*_body` functions below are their inverse — they coalesce
+// a packed RGBA8888 image (top-to-bottom, row-major, 4 B/pixel) into the
+// Turbo-Silver run-length BODY each form carries. A run is a maximal sequence of
+// identical RGBA quadruples in the flat pixel order (runs spill across scanline
+// boundaries exactly as the decoder reconstructs them). The `parse_*` round-trip
+// is what these are checked against: `decode_rgb8_body(encode_rgb8_body(x)) == x`
+// for any 8-bit-true image, and likewise for RGBN once the 12-bit quantisation is
+// accounted for (see `encode_rgbn_body`).
+//
+// Source: docs/image/iff/iff-truecolor-chunks.md §3.1 (RGBN WORD unit + 3-bit /
+// BYTE / WORD count cascade) and §3.2 (RGB8 LONG unit + inline 7-bit count).
+
+/// Walk a packed RGBA8888 buffer (`width * height * 4` bytes) as a sequence of
+/// `(rgba, run_length)` pairs, each run a maximal stretch of identical pixels in
+/// flat top-to-bottom order. Returns an error if `rgba` is not exactly
+/// `width * height * 4` bytes, so a mis-sized buffer can't silently truncate.
+fn coalesce_rgba_runs(width: u16, height: u16, rgba: &[u8]) -> Result<Vec<([u8; 4], usize)>> {
+    let total = width as usize * height as usize;
+    if rgba.len() != total * 4 {
+        return Err(Error::invalid(format!(
+            "RGB encode: buffer is {} bytes, need {} ({width}x{height} @ 4 B/pixel)",
+            rgba.len(),
+            total * 4
+        )));
+    }
+    let mut runs: Vec<([u8; 4], usize)> = Vec::new();
+    for px in rgba.chunks_exact(4) {
+        let quad = [px[0], px[1], px[2], px[3]];
+        match runs.last_mut() {
+            Some((prev, len)) if *prev == quad => *len += 1,
+            _ => runs.push((quad, 1)),
+        }
+    }
+    Ok(runs)
+}
+
+/// Narrow an 8-bit gun to 4 bits by taking the high nibble — the exact inverse of
+/// [`widen4`] for any value already produced by nibble replication (`0xNN → 0xN`).
+#[inline]
+fn narrow4(x: u8) -> u16 {
+    u16::from(x >> 4)
+}
+
+/// Encode a packed RGBA8888 image into an RGBN (12-bit, §3.1) genlock-RLE BODY.
+///
+/// Each gun is narrowed to 4 bits (high nibble); alpha selects the genlock bit
+/// under [`GenlockPolicy::BrushTransparency`] semantics — a pixel with `a == 0`
+/// is emitted genlocked (the mask bit set), everything else opaque and unlocked.
+/// This is the inverse of [`decode_rgbn_body`] with `BrushTransparency`: a
+/// round-trip of any image whose guns are 4-bit-replicated and whose alpha is
+/// `0` or `0xFF` reproduces the input exactly. Runs use the §3.1 count cascade:
+/// 1..=7 inline, 8..=255 via a trailing BYTE (3-bit field 0), 256..=65535 via a
+/// BYTE-0 escape then a WORD. Runs longer than 65535 are split into successive
+/// units (the spec forbids a single run > 65536).
+pub fn encode_rgbn_body(width: u16, height: u16, rgba: &[u8]) -> Result<Vec<u8>> {
+    let runs = coalesce_rgba_runs(width, height, rgba)?;
+    let mut out = Vec::new();
+    for (quad, len) in runs {
+        let rgb12 = (narrow4(quad[0]) << 8) | (narrow4(quad[1]) << 4) | narrow4(quad[2]);
+        let lock = quad[3] == 0;
+        let mut remaining = len;
+        while remaining > 0 {
+            // The spec caps a single coded run at 65535 (a WORD count); split
+            // anything longer across multiple units.
+            let this = remaining.min(0xFFFF);
+            let lock_bit = if lock { 0x0008u16 } else { 0 };
+            if this <= 7 {
+                let w = (rgb12 << 4) | lock_bit | this as u16;
+                out.extend_from_slice(&w.to_be_bytes());
+            } else if this <= 0xFF {
+                // 3-bit count 0 → BYTE count follows.
+                let w = (rgb12 << 4) | lock_bit;
+                out.extend_from_slice(&w.to_be_bytes());
+                out.push(this as u8);
+            } else {
+                // BYTE 0 → WORD count follows.
+                let w = (rgb12 << 4) | lock_bit;
+                out.extend_from_slice(&w.to_be_bytes());
+                out.push(0);
+                out.extend_from_slice(&(this as u16).to_be_bytes());
+            }
+            remaining -= this;
+        }
+    }
+    Ok(out)
+}
+
+/// Encode a packed RGBA8888 image into an RGB8 (24-bit, §3.2) genlock-RLE BODY.
+///
+/// Each gun is a full byte (no narrowing); alpha selects the genlock bit under
+/// [`GenlockPolicy::BrushTransparency`] semantics (`a == 0` → genlocked). RGB8
+/// carries only the inline **7-bit** count (runs 1..=127, no escape cascade per
+/// §3.2), so a run longer than 127 is split into successive 127-pixel units.
+/// This is the inverse of [`decode_rgb8_body`] with `BrushTransparency`: a
+/// round-trip of any image whose alpha is `0` or `0xFF` reproduces the input.
+pub fn encode_rgb8_body(width: u16, height: u16, rgba: &[u8]) -> Result<Vec<u8>> {
+    let runs = coalesce_rgba_runs(width, height, rgba)?;
+    let mut out = Vec::new();
+    for (quad, len) in runs {
+        let rgb24 = (u32::from(quad[0]) << 16) | (u32::from(quad[1]) << 8) | u32::from(quad[2]);
+        let lock_bit = if quad[3] == 0 { 0x0000_0080u32 } else { 0 };
+        let mut remaining = len;
+        while remaining > 0 {
+            let this = remaining.min(0x7F);
+            let w = (rgb24 << 8) | lock_bit | this as u32;
+            out.extend_from_slice(&w.to_be_bytes());
+            remaining -= this;
+        }
+    }
+    Ok(out)
+}
+
+/// Append a chunk (`id` + BE u32 size + body + even-byte pad) to `out`, the
+/// EA IFF 85 framing every FORM child uses.
+fn push_chunk(out: &mut Vec<u8>, id: &[u8; 4], body: &[u8]) {
+    out.extend_from_slice(id);
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(body);
+    if body.len() & 1 == 1 {
+        out.push(0); // pad to an even byte boundary
+    }
+}
+
+/// Wrap a finished list of chunk bytes in a `FORM <type> { … }` envelope.
+fn wrap_form(form_type: &[u8; 4], chunks: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + chunks.len());
+    out.extend_from_slice(b"FORM");
+    // FORM size counts the 4-byte form type plus every child chunk.
+    out.extend_from_slice(&((4 + chunks.len()) as u32).to_be_bytes());
+    out.extend_from_slice(form_type);
+    out.extend_from_slice(chunks);
+    out
+}
+
+/// Build the BMHD body a Turbo-Silver true-colour FORM needs: dimensions from
+/// `width`/`height`, `compression = 4` (the §3 invariant), and `nPlanes` set to
+/// the conventional `13` (RGBN) / `25` (RGB8). Other BMHD fields are zeroed.
+fn truecolor_bmhd(width: u16, height: u16, n_planes: u8) -> [u8; 20] {
+    let mut b = [0u8; 20];
+    b[0..2].copy_from_slice(&width.to_be_bytes());
+    b[2..4].copy_from_slice(&height.to_be_bytes());
+    // x/y origin (4..8) = 0.
+    b[8] = n_planes;
+    // masking (9) = 0 (none).
+    b[10] = 4; // Turbo-Silver RLE — the §3 invariant.
+               // pad (11), transparent colour (12..14) = 0.
+    b[14] = 1; // x aspect
+    b[15] = 1; // y aspect
+    b[16..18].copy_from_slice(&width.to_be_bytes()); // page width
+    b[18..20].copy_from_slice(&height.to_be_bytes()); // page height
+    b
+}
+
+/// Encode a packed RGBA8888 image as a complete `FORM RGB8` file (§3.2):
+/// `BMHD` (compression 4, nPlanes 25), the required `CAMG` viewport chunk, and
+/// the genlock-RLE `BODY` from [`encode_rgb8_body`]. Round-trips through
+/// [`parse_rgb8`] with [`GenlockPolicy::BrushTransparency`].
+pub fn encode_rgb8(width: u16, height: u16, rgba: &[u8]) -> Result<Vec<u8>> {
+    let body = encode_rgb8_body(width, height, rgba)?;
+    let mut chunks = Vec::new();
+    push_chunk(&mut chunks, b"BMHD", &truecolor_bmhd(width, height, 25));
+    // CAMG IS REQUIRED (§3); a zero viewport word is a valid minimal CAMG.
+    push_chunk(&mut chunks, b"CAMG", &0u32.to_be_bytes());
+    push_chunk(&mut chunks, b"BODY", &body);
+    Ok(wrap_form(b"RGB8", &chunks))
+}
+
+/// Encode a packed RGBA8888 image as a complete `FORM RGBN` file (§3.1):
+/// `BMHD` (compression 4, nPlanes 13), the required `CAMG` viewport chunk, and
+/// the genlock-RLE `BODY` from [`encode_rgbn_body`]. Round-trips through
+/// [`parse_rgbn`] with [`GenlockPolicy::BrushTransparency`] for any image whose
+/// guns are already 4-bit-replicated (`0xNN`).
+pub fn encode_rgbn(width: u16, height: u16, rgba: &[u8]) -> Result<Vec<u8>> {
+    let body = encode_rgbn_body(width, height, rgba)?;
+    let mut chunks = Vec::new();
+    push_chunk(&mut chunks, b"BMHD", &truecolor_bmhd(width, height, 13));
+    push_chunk(&mut chunks, b"CAMG", &0u32.to_be_bytes());
+    push_chunk(&mut chunks, b"BODY", &body);
+    Ok(wrap_form(b"RGBN", &chunks))
+}
+
 // ───────────────────────── FORM DEEP — chunky deep raster ─────────────────
 //
 // FORM DEEP (Amiga Centre Scotland, 1991; used by TVPaint) carries *chunky*
@@ -4753,6 +4937,99 @@ mod tests {
         for px in img.rgba.chunks_exact(4) {
             assert_eq!(px, &[0xFF, 0x00, 0xAA, 0xFF]);
         }
+    }
+
+    // ───────────────── RGB8 / RGBN genlock-RLE encode round-trip ─────────────
+
+    /// A small opaque RGB8 image survives encode → parse byte-for-byte.
+    #[test]
+    fn encode_rgb8_round_trips_through_parse() {
+        // 3x2 image: two distinct colours, the second forming a run of 4.
+        let mut rgba = Vec::new();
+        rgba.extend_from_slice(&[0x10, 0x20, 0x30, 0xFF]);
+        rgba.extend_from_slice(&[0x10, 0x20, 0x30, 0xFF]);
+        for _ in 0..4 {
+            rgba.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0xFF]);
+        }
+        let file = encode_rgb8(3, 2, &rgba).unwrap();
+        let img = parse_rgb8(&file, GenlockPolicy::BrushTransparency).unwrap();
+        assert!(img.is_rgb8);
+        assert_eq!((img.width, img.height), (3, 2));
+        assert_eq!(img.rgba, rgba);
+    }
+
+    /// RGB8 runs longer than the 7-bit inline count split into 127-pixel units
+    /// and still reassemble exactly.
+    #[test]
+    fn encode_rgb8_splits_runs_over_127() {
+        let rgba: Vec<u8> = std::iter::repeat([0x01, 0x02, 0x03, 0xFF])
+            .take(300)
+            .flatten()
+            .collect();
+        let file = encode_rgb8(300, 1, &rgba).unwrap();
+        // 300 = 127 + 127 + 46 → three coded LONG units in the BODY.
+        let img = parse_rgb8(&file, GenlockPolicy::BrushTransparency).unwrap();
+        assert_eq!(img.rgba, rgba);
+    }
+
+    /// The RGB8 genlock bit round-trips: an alpha-0 pixel comes back transparent
+    /// under brush semantics, keeping its colour.
+    #[test]
+    fn encode_rgb8_preserves_genlock_alpha() {
+        let mut rgba = Vec::new();
+        rgba.extend_from_slice(&[0x40, 0x50, 0x60, 0x00]); // genlocked (mask)
+        rgba.extend_from_slice(&[0x40, 0x50, 0x60, 0xFF]); // opaque, same colour
+        let file = encode_rgb8(2, 1, &rgba).unwrap();
+        let img = parse_rgb8(&file, GenlockPolicy::BrushTransparency).unwrap();
+        // Two runs (alpha differs) → distinct LONG units; both reconstruct.
+        assert_eq!(img.rgba, rgba);
+    }
+
+    /// RGBN narrows to 4-bit guns, so a round-trip is exact only for
+    /// nibble-replicated colours (`0xNN`). Such an image survives intact.
+    #[test]
+    fn encode_rgbn_round_trips_replicated_colours() {
+        let mut rgba = Vec::new();
+        rgba.extend_from_slice(&[0xFF, 0x00, 0xAA, 0xFF]);
+        rgba.extend_from_slice(&[0x33, 0x66, 0x99, 0xFF]);
+        rgba.extend_from_slice(&[0x33, 0x66, 0x99, 0xFF]);
+        let file = encode_rgbn(3, 1, &rgba).unwrap();
+        let img = parse_rgbn(&file, GenlockPolicy::BrushTransparency).unwrap();
+        assert!(!img.is_rgb8);
+        assert_eq!(img.rgba, rgba);
+    }
+
+    /// RGBN's count cascade survives a round-trip: a run of 200 (> 7, ≤ 255)
+    /// emits the 3-bit-0 + BYTE form and reassembles.
+    #[test]
+    fn encode_rgbn_byte_count_cascade_round_trips() {
+        let rgba: Vec<u8> = std::iter::repeat([0xFF, 0x00, 0x00, 0xFF])
+            .take(200)
+            .flatten()
+            .collect();
+        let file = encode_rgbn(200, 1, &rgba).unwrap();
+        let img = parse_rgbn(&file, GenlockPolicy::BrushTransparency).unwrap();
+        assert_eq!(img.rgba, rgba);
+    }
+
+    /// RGBN's WORD escape (run > 255) round-trips: a run of 400 emits the
+    /// 3-bit-0 + BYTE-0 + WORD form.
+    #[test]
+    fn encode_rgbn_word_count_cascade_round_trips() {
+        let rgba: Vec<u8> = std::iter::repeat([0x00, 0xFF, 0x00, 0xFF])
+            .take(400)
+            .flatten()
+            .collect();
+        let file = encode_rgbn(400, 1, &rgba).unwrap();
+        let img = parse_rgbn(&file, GenlockPolicy::BrushTransparency).unwrap();
+        assert_eq!(img.rgba, rgba);
+    }
+
+    /// A mis-sized RGBA buffer is rejected rather than silently truncating.
+    #[test]
+    fn encode_rgb_rejects_wrong_buffer_length() {
+        assert!(encode_rgb8(2, 2, &[0; 8]).is_err());
+        assert!(encode_rgbn(2, 2, &[0; 8]).is_err());
     }
 
     #[test]
