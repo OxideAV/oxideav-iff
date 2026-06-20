@@ -4208,6 +4208,19 @@ impl Dpel {
     pub fn pixel_bytes(&self) -> usize {
         (self.total_bits() as usize).div_ceil(8)
     }
+
+    /// Serialise to the `DPEL` wire form: a ULONG `nElements` followed by an
+    /// `(UWORD cType, UWORD cBitDepth)` pair per component, in storage order.
+    /// Inverse of [`Dpel::parse`].
+    pub fn write(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.elements.len() * 4);
+        out.extend_from_slice(&(self.elements.len() as u32).to_be_bytes());
+        for el in &self.elements {
+            out.extend_from_slice(&el.c_type.to_u16().to_be_bytes());
+            out.extend_from_slice(&el.c_bit_depth.to_be_bytes());
+        }
+        out
+    }
 }
 
 /// DEEP display location — the optional `DLOC` chunk (§1.3): the width/height
@@ -4240,6 +4253,16 @@ impl Dloc {
             x: i16::from_be_bytes([body[4], body[5]]),
             y: i16::from_be_bytes([body[6], body[7]]),
         })
+    }
+
+    /// Serialise to the 8-byte `DLOC` wire form (two UWORDs then two WORDs).
+    pub fn write(&self) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[0..2].copy_from_slice(&self.w.to_be_bytes());
+        out[2..4].copy_from_slice(&self.h.to_be_bytes());
+        out[4..6].copy_from_slice(&self.x.to_be_bytes());
+        out[6..8].copy_from_slice(&self.y.to_be_bytes());
+        out
     }
 }
 
@@ -4371,6 +4394,211 @@ pub fn assemble_deep_chunky(dpel: &Dpel, width: u16, height: u16, body: &[u8]) -
         rgba[dst + 3] = a;
     }
     Ok(rgba)
+}
+
+/// Pack a packed RGBA8888 image into a DEEP **chunky** body (§1.2 + §1.4) —
+/// the inverse of [`assemble_deep_chunky`].
+///
+/// Every DPEL component must be exactly **8 bits** wide so the byte-aligned
+/// RGBA channels map losslessly into the chunky stream (a sub-8-bit component
+/// would need the lossy MSB-replication scaling [`assemble_deep_chunky`]
+/// applies on the way out, which has no exact inverse). Each pixel is emitted
+/// MSB-first in DPEL storage order: RED/GREEN/BLUE take the matching gun,
+/// ALPHA/OPACITY take alpha, and any other component type is written as 0
+/// (it carries no information recoverable from RGBA). This is rejected with
+/// [`Error::invalid`] for a non-8-bit layout or a mis-sized buffer, so a
+/// caller can't silently lose precision or overrun.
+pub fn encode_deep_chunky(dpel: &Dpel, width: u16, height: u16, rgba: &[u8]) -> Result<Vec<u8>> {
+    for el in &dpel.elements {
+        if el.c_bit_depth != 8 {
+            return Err(Error::invalid(format!(
+                "DEEP encode: component bit depth {} is not 8 (lossless chunky packing \
+                 needs byte-aligned components)",
+                el.c_bit_depth
+            )));
+        }
+    }
+    let total = width as usize * height as usize;
+    if rgba.len() != total * 4 {
+        return Err(Error::invalid(format!(
+            "DEEP encode: buffer is {} bytes, need {} ({width}x{height} @ 4 B/pixel)",
+            rgba.len(),
+            total * 4
+        )));
+    }
+    let mut out = Vec::with_capacity(total * dpel.elements.len());
+    for px in rgba.chunks_exact(4) {
+        for el in &dpel.elements {
+            let byte = match el.c_type {
+                DeepCType::Red => px[0],
+                DeepCType::Green => px[1],
+                DeepCType::Blue => px[2],
+                DeepCType::Alpha | DeepCType::Opacity => px[3],
+                _ => 0,
+            };
+            out.push(byte);
+        }
+    }
+    Ok(out)
+}
+
+/// Encode a single component line to a TVDC stream (§1.5) — the inverse of
+/// [`decode_tvdc`]. `table` is the same per-stream 16-word signed delta
+/// dictionary the decoder uses; `table[0]` MUST be `0` because the decoder
+/// treats a zero `table[d]` as the run-length escape (nibble 0 reaching a
+/// non-zero delta would be unreachable on decode). The encoder walks the line
+/// with a running accumulator `v` (starting at 0): for each output byte it
+/// finds a nibble `d` with `table[d] == byte - v` and emits it; a maximal run
+/// of the byte that follows is then coded as the **escape** nibble (the index
+/// of a zero `table` entry) plus a 0..=15 run-count nibble.
+///
+/// Returns [`Error::invalid`] if a required delta isn't expressible by the
+/// supplied table (no `table[d]` equals the needed step) — the caller picks a
+/// table dense enough for the data (a full ±, identity-style table always
+/// works; see the round-trip tests).
+pub fn encode_tvdc(line: &[u8], table: &[i16; 16], out: &mut Vec<u8>) -> Result<()> {
+    // The decoder uses a zero table entry as the run escape; locate one.
+    let escape =
+        table.iter().position(|&t| t == 0).ok_or_else(|| {
+            Error::invalid("DEEP TVDC encode: table has no zero entry for run escape")
+        })? as u8;
+
+    let mut nibbles: Vec<u8> = Vec::new();
+    let mut v: i32 = 0;
+    let mut i = 0usize;
+    while i < line.len() {
+        let target = i32::from(line[i]);
+        let step = target.wrapping_sub(v);
+        // Find a non-zero table entry equal to the needed step.
+        let d = table
+            .iter()
+            .position(|&t| t != 0 && i32::from(t) == step)
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "DEEP TVDC encode: delta {step} (from {v} to {target}) is not in the table"
+                ))
+            })? as u8;
+        nibbles.push(d);
+        v = target;
+        i += 1;
+        // Coalesce a run of identical bytes (the current v) as escape + count.
+        let mut run = 0usize;
+        while i < line.len() && i32::from(line[i]) == v && run < 15 {
+            run += 1;
+            i += 1;
+        }
+        if run > 0 {
+            nibbles.push(escape);
+            nibbles.push(run as u8);
+        }
+    }
+
+    // Pack nibbles high-first into bytes (the decoder reads high nibble first).
+    let mut k = 0usize;
+    while k < nibbles.len() {
+        let hi = nibbles[k];
+        let lo = if k + 1 < nibbles.len() {
+            nibbles[k + 1]
+        } else {
+            0
+        };
+        out.push((hi << 4) | lo);
+        k += 2;
+    }
+    Ok(())
+}
+
+/// Encode a packed RGBA8888 image into a TVDC-compressed DEEP body (§1.5),
+/// inverse of [`assemble_deep_tvdc`]: per row, one TVDC line per DPEL
+/// component (a Red line, then Green, …). Every component must be 8 bits.
+fn encode_deep_tvdc_body(
+    dpel: &Dpel,
+    width: u16,
+    height: u16,
+    table: &[i16; 16],
+    rgba: &[u8],
+) -> Result<Vec<u8>> {
+    for el in &dpel.elements {
+        if el.c_bit_depth != 8 {
+            return Err(Error::invalid(
+                "DEEP TVDC encode: every component must be 8 bits",
+            ));
+        }
+    }
+    let w = width as usize;
+    let h = height as usize;
+    if rgba.len() != w * h * 4 {
+        return Err(Error::invalid(
+            "DEEP TVDC encode: RGBA buffer size mismatch",
+        ));
+    }
+    let mut out = Vec::new();
+    let mut line = vec![0u8; w];
+    for y in 0..h {
+        for el in &dpel.elements {
+            for (x, slot) in line.iter_mut().enumerate() {
+                let src = (y * w + x) * 4;
+                *slot = match el.c_type {
+                    DeepCType::Red => rgba[src],
+                    DeepCType::Green => rgba[src + 1],
+                    DeepCType::Blue => rgba[src + 2],
+                    DeepCType::Alpha | DeepCType::Opacity => rgba[src + 3],
+                    _ => 0,
+                };
+            }
+            encode_tvdc(&line, table, &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Encode a packed RGBA8888 image into a complete `FORM DEEP` file (§1).
+///
+/// Emits DGBL (the §1.1 global header, with the chosen [`DeepCompression`]),
+/// DPEL (the §1.2 pixel layout), and a single DBOD body. With
+/// [`DeepCompression::None`] the body is the raw chunky stream
+/// ([`encode_deep_chunky`]); with [`DeepCompression::Tvdc`] it is the
+/// per-component-line TVDC stream ([`encode_tvdc`]) and `tvdc_table` must be
+/// supplied (the 16-word delta dictionary, which the caller is responsible for
+/// transporting to the decoder — §1.5 stores it "with the file"). Any other
+/// compression method is rejected (no documented wire layout). Every DPEL
+/// component must be 8 bits. The output round-trips through
+/// [`parse_deep`] (NOCOMPRESSION) / [`assemble_deep_tvdc`] (TVDC).
+pub fn encode_deep(
+    dpel: &Dpel,
+    width: u16,
+    height: u16,
+    compression: DeepCompression,
+    tvdc_table: Option<&[i16; 16]>,
+    rgba: &[u8],
+) -> Result<Vec<u8>> {
+    let body = match compression {
+        DeepCompression::None => encode_deep_chunky(dpel, width, height, rgba)?,
+        DeepCompression::Tvdc => {
+            let table = tvdc_table.ok_or_else(|| {
+                Error::invalid("DEEP encode: TVDC compression needs a 16-word delta table")
+            })?;
+            encode_deep_tvdc_body(dpel, width, height, table, rgba)?
+        }
+        other => {
+            return Err(Error::invalid(format!(
+                "DEEP encode: Compression {} has no documented wire layout to emit",
+                other.to_u16()
+            )))
+        }
+    };
+    let dgbl = Dgbl {
+        display_width: width,
+        display_height: height,
+        compression,
+        x_aspect: 1,
+        y_aspect: 1,
+    };
+    let mut chunks = Vec::new();
+    push_chunk(&mut chunks, b"DGBL", &dgbl.write());
+    push_chunk(&mut chunks, b"DPEL", &dpel.write());
+    push_chunk(&mut chunks, b"DBOD", &body);
+    Ok(wrap_form(b"DEEP", &chunks))
 }
 
 /// Read `depth` bits (1..=16) MSB-first starting at bit offset `start` within
@@ -5789,5 +6017,99 @@ mod tests {
         let table = [0i16; 16];
         let dpel = Dpel::parse(&deep_dpel(&[(1, 4), (2, 4), (3, 4)])).unwrap();
         assert!(assemble_deep_tvdc(&dpel, 1, 1, &table, &[0, 0]).is_err());
+    }
+
+    // ───────────────── DEEP encode round-trip ─────────────────
+
+    /// A NOCOMPRESSION RGB888 image survives encode_deep → parse_deep.
+    #[test]
+    fn encode_deep_nocompression_round_trips() {
+        let dpel = Dpel::parse(&deep_dpel(&[(1, 8), (2, 8), (3, 8)])).unwrap();
+        let rgba = vec![
+            10, 20, 30, 0xFF, 200, 100, 50, 0xFF, 1, 2, 3, 0xFF, 4, 5, 6, 0xFF,
+        ];
+        let file = encode_deep(&dpel, 2, 2, DeepCompression::None, None, &rgba).unwrap();
+        let img = parse_deep(&file).unwrap();
+        assert_eq!((img.width, img.height), (2, 2));
+        assert_eq!(img.rgba, rgba);
+        assert_eq!(img.dgbl.compression, DeepCompression::None);
+    }
+
+    /// An RGBA8888 (4-component) NOCOMPRESSION image round-trips with alpha.
+    #[test]
+    fn encode_deep_nocompression_round_trips_rgba() {
+        let dpel = Dpel::parse(&deep_dpel(&[(1, 8), (2, 8), (3, 8), (4, 8)])).unwrap();
+        let rgba = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let file = encode_deep(&dpel, 2, 1, DeepCompression::None, None, &rgba).unwrap();
+        let img = parse_deep(&file).unwrap();
+        assert_eq!(img.rgba, rgba);
+    }
+
+    /// A TVDC body encoded by encode_deep round-trips through
+    /// assemble_deep_tvdc with the same delta table.
+    #[test]
+    fn encode_deep_tvdc_round_trips() {
+        // A table able to express every per-pixel delta in the test image:
+        // nibble 1 → +1, nibble 2 → -1, nibble 3 → +30, nibble 4 → +50.
+        // nibble 0 stays the run-escape sentinel.
+        let mut table = [0i16; 16];
+        table[1] = 1;
+        table[2] = -1;
+        table[3] = 30;
+        table[4] = 50;
+        let dpel = Dpel::parse(&deep_dpel(&[(1, 8), (2, 8), (3, 8)])).unwrap();
+        // 4x1 RGB. Per component the first byte's delta-from-0 and each
+        // subsequent step must be in the table.
+        // R: 1,2,1,2   (deltas +1,+1,-1,+1)
+        // G: 30,30,30,30 (delta +30 then runs of 0)
+        // B: 50,51,50,51 (deltas +50,+1,-1,+1)
+        let rgba = vec![
+            1, 30, 50, 0xFF, 2, 30, 51, 0xFF, 1, 30, 50, 0xFF, 2, 30, 51, 0xFF,
+        ];
+        let file = encode_deep(&dpel, 4, 1, DeepCompression::Tvdc, Some(&table), &rgba).unwrap();
+        // Re-parse the FORM structurally, then hand the DBOD to the TVDC
+        // assembler with the caller-held table (parse_deep rejects in-FORM TVDC
+        // by design — the table travels out of band, §1.5).
+        let body = extract_deep_dbod(&file);
+        let img = assemble_deep_tvdc(&dpel, 4, 1, &table, &body).unwrap();
+        assert_eq!(img, rgba);
+    }
+
+    /// encode_deep rejects TVDC without a table, and a sub-8-bit DPEL.
+    #[test]
+    fn encode_deep_validates_inputs() {
+        let dpel = Dpel::parse(&deep_dpel(&[(1, 8), (2, 8), (3, 8)])).unwrap();
+        assert!(encode_deep(&dpel, 1, 1, DeepCompression::Tvdc, None, &[0, 0, 0, 0xFF]).is_err());
+        let dpel4 = Dpel::parse(&deep_dpel(&[(1, 4), (2, 4), (3, 4)])).unwrap();
+        assert!(encode_deep(&dpel4, 1, 1, DeepCompression::None, None, &[0, 0, 0, 0xFF]).is_err());
+        // A JPEG/RUNLENGTH method has no documented wire layout to emit.
+        assert!(encode_deep(&dpel, 1, 1, DeepCompression::Jpeg, None, &[0, 0, 0, 0xFF]).is_err());
+    }
+
+    /// encode_tvdc errors cleanly when a needed delta isn't in the table.
+    #[test]
+    fn encode_tvdc_rejects_unreachable_delta() {
+        let mut table = [0i16; 16];
+        table[1] = 1; // only +1 available
+        let mut out = Vec::new();
+        // Line [5] needs a delta of +5 from v=0; not in the table.
+        assert!(encode_tvdc(&[5], &table, &mut out).is_err());
+    }
+
+    /// Pull the first DBOD payload out of a FORM DEEP for TVDC round-trip tests.
+    fn extract_deep_dbod(file: &[u8]) -> Vec<u8> {
+        let mut cur = 12usize; // skip FORM + size + "DEEP"
+        while cur + 8 <= file.len() {
+            let id = &file[cur..cur + 4];
+            let size =
+                u32::from_be_bytes([file[cur + 4], file[cur + 5], file[cur + 6], file[cur + 7]])
+                    as usize;
+            let start = cur + 8;
+            if id == b"DBOD" {
+                return file[start..start + size].to_vec();
+            }
+            cur = start + size + (size & 1);
+        }
+        panic!("no DBOD in FORM DEEP");
     }
 }

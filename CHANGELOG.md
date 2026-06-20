@@ -24,6 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* `FORM DEEP` **encode**, completing the chunky deep-raster
+  round-trip. `ilbm::encode_deep_chunky` packs a packed RGBA8888 image into the
+  raw chunky DBOD stream (inverse of `assemble_deep_chunky`); `ilbm::encode_tvdc`
+  encodes one component line to a TVDC nibble stream (inverse of `decode_tvdc`:
+  running accumulator, a non-zero `table[d]` per step, runs coded as the
+  zero-entry escape nibble + a 0..=15 count nibble); `ilbm::encode_deep` builds
+  a complete `FORM DEEP` (DGBL + DPEL + DBOD) for `DeepCompression::None`
+  (chunky) or `DeepCompression::Tvdc` (per-component lines, table supplied out
+  of band per §1.5). Every DPEL component must be 8 bits for a lossless
+  round-trip; sub-8-bit layouts, a missing TVDC table, an undocumented
+  compression method, a mis-sized RGBA buffer, or a delta the supplied table
+  can't express are each rejected with `Error::invalid`. `ilbm::Dpel::write` and
+  `ilbm::Dloc::write` serialise their chunks (inverses of `parse`). The
+  NOCOMPRESSION output round-trips through `parse_deep`; the TVDC output through
+  `assemble_deep_tvdc` with the matching delta table.
 - *(ilbm)* `FORM RGB8` / `FORM RGBN` genlock-RLE **encode**, completing the
   true-colour round-trip. `ilbm::encode_rgb8_body` / `encode_rgbn_body`
   coalesce a packed RGBA8888 image into the Turbo-Silver run-length BODY each
