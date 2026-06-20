@@ -773,11 +773,26 @@ DEEP bodies are **not** yet decoded — the canonical DEEP text does not
 spell out their wire layout. Truncated TVDC sources, run overshoot,
 undersized DGBL/DPEL/DLOC chunks, unknown compression/cType codes, and
 short chunky bodies are each rejected with `Error::invalid`.
-Remaining true-colour frontier: the
-DEEP / RGBN / RGB8 FORM-type container walkers + probes (wiring these
-body decoders to a top-level `parse_*` entry point), DEEP's
-RUNLENGTH/HUFFMAN/DYNAMICHUFF/JPEG body codings, and the TVPP project-
-file FORM (§2, non-canonical RE — needs a real-file fixture).
+[`ilbm::parse_deep`] now wires these pieces into a top-level `FORM DEEP`
+walker: it locates DGBL (mandatory §1.1 global header), DPEL (mandatory
+§1.2 pixel layout), the optional DLOC placement, and the first DBOD, takes
+the DBOD dimensions from the DLOC if present else the DGBL display size
+(§1.3), and assembles a packed top-to-bottom RGBA8888 [`ilbm::DeepImage`].
+NOCOMPRESSION bodies decode in full; TVDC and the other codings are
+rejected here (see the TVDC table gap below). For TVDC,
+[`ilbm::assemble_deep_tvdc`] decodes a per-component-line body (§1.5: one
+TVDC line per DPEL component per row — a Red line, then a Green line, …)
+when the caller supplies the 16-word delta table, mapping RED/GREEN/BLUE →
+guns and ALPHA/OPACITY → alpha; a sub-8-bit DPEL component is rejected
+(TVDC emits one byte per pixel and §1.5 pins no byte→sub-8-bit mapping).
+Remaining true-colour frontier: TVDC decode **from a FORM** is blocked —
+§1.5 says the 16-word delta table is "stored with the file/companion
+data" but the canonical DEEP text names no in-FORM chunk that carries it
+(documented gap; `assemble_deep_tvdc` is the caller-supplies-table escape
+hatch). Also pending: DEEP's RUNLENGTH/HUFFMAN/DYNAMICHUFF/JPEG body
+codings (wire layout undocumented), the TVPP project-file FORM (§2,
+non-canonical RE — needs a real-file fixture), and registry probes for
+the RGB8/RGBN/DEEP FORM types.
 
 AIFF-C coverage is saturated: Apple shipped 13 chunk classes (FVER,
 COMM, SSND, MARK, INST, COMT, AESD, APPL, MIDI, SAXL, NAME, AUTH,

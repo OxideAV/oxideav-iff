@@ -4228,6 +4228,214 @@ fn scale_to_u8(value: u16, depth: u16) -> u8 {
     out
 }
 
+// ─────────────────── FORM DEEP — top-level decode ───────────────────
+//
+// `assemble_deep_chunky` turns a *decompressed* chunky body into RGBA;
+// `decode_tvdc` decompresses one TVDC component line. `parse_deep` walks a
+// complete `FORM DEEP` file: DGBL (global header, mandatory first), DPEL
+// (pixel-element layout, mandatory), optional DLOC (per-DBOD dimensions),
+// and DBOD (the pixel data). It assembles the first DBOD into a packed
+// top-to-bottom RGBA8888 image.
+//
+// Coverage:
+//   * NOCOMPRESSION (DGBL.Compression == 0): the DBOD is a raw chunky
+//     stream → handed straight to assemble_deep_chunky.
+//   * TVDC (== 5): the per-component-line decoder (decode_tvdc) is wired
+//     via assemble_deep_tvdc, BUT the 16-word delta table TVDC needs is
+//     "supplied alongside the data / stored with the file" (§1.5) and the
+//     canonical DEEP text does not name a chunk that carries it inside the
+//     FORM. parse_deep therefore decodes TVDC only when the caller supplies
+//     the table (assemble_deep_tvdc); the chunk-walking parse_deep returns
+//     an Error for an in-FORM TVDC body, flagging the documented gap.
+//   * RUNLENGTH / HUFFMAN / DYNAMICHUFF / JPEG: wire layout undocumented in
+//     the staged spec → rejected.
+//
+// Source: docs/image/iff/iff-truecolor-chunks.md §1 (§1.1 DGBL, §1.2 DPEL,
+// §1.3 DLOC, §1.4 DBOD, §1.5 TVDC).
+
+/// A decoded `FORM DEEP` image.
+#[derive(Clone, Debug)]
+pub struct DeepImage {
+    /// Parsed DGBL global header.
+    pub dgbl: Dgbl,
+    /// Parsed DPEL pixel-element layout.
+    pub dpel: Dpel,
+    /// Optional DLOC placement of the decoded DBOD.
+    pub dloc: Option<Dloc>,
+    pub width: u16,
+    pub height: u16,
+    /// Packed RGBA, row-major, top-to-bottom, 4 bytes/pixel.
+    pub rgba: Vec<u8>,
+}
+
+/// Assemble a TVDC-compressed DEEP body (§1.5) into packed RGBA8888.
+///
+/// TVDC is applied **line by line, per DPEL component**: the body is, for
+/// each row, one TVDC-compressed line per component (a Red line, then a
+/// Green line, …). Each compressed line decodes to `width` output bytes —
+/// the 8-bit component values for that row. `table` is the per-stream
+/// 16-word signed delta dictionary TVPaint stores alongside the data.
+///
+/// Only components whose `cBitDepth == 8` are supported here: TVDC emits one
+/// output **byte** per pixel per line, so a non-8-bit DPEL component has no
+/// documented byte→sub-8-bit mapping (the staged §1.5 does not pin one).
+/// Such a layout is rejected with [`Error::invalid`].
+pub fn assemble_deep_tvdc(
+    dpel: &Dpel,
+    width: u16,
+    height: u16,
+    table: &[i16; 16],
+    body: &[u8],
+) -> Result<Vec<u8>> {
+    for el in &dpel.elements {
+        if el.c_bit_depth != 8 {
+            return Err(Error::invalid(format!(
+                "DEEP TVDC: component bit depth {} is not 8 (TVDC emits one byte per \
+                 component per pixel; sub-8-bit packing is undocumented in §1.5)",
+                el.c_bit_depth
+            )));
+        }
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let total = w * h;
+    let mut rgba = vec![0u8; total * 4];
+    // A pixel with no alpha-bearing component is fully opaque.
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = 0xFF;
+    }
+
+    let mut src = 0usize;
+    let mut line = Vec::with_capacity(w);
+    for y in 0..h {
+        for el in &dpel.elements {
+            line.clear();
+            let used = decode_tvdc(&body[src..], table, w, &mut line)?;
+            src += used;
+            let row_base = y * w;
+            for (x, &v) in line.iter().enumerate() {
+                let dst = (row_base + x) * 4;
+                match el.c_type {
+                    DeepCType::Red => rgba[dst] = v,
+                    DeepCType::Green => rgba[dst + 1] = v,
+                    DeepCType::Blue => rgba[dst + 2] = v,
+                    DeepCType::Alpha | DeepCType::Opacity => rgba[dst + 3] = v,
+                    _ => {} // parsed for stream advance; not mapped to output
+                }
+            }
+        }
+    }
+    Ok(rgba)
+}
+
+/// Walk a complete `FORM DEEP` file (§1) into a [`DeepImage`].
+///
+/// Locates DGBL (mandatory, the §1.1 global header), DPEL (mandatory, the
+/// §1.2 pixel layout), the optional DLOC placement, and the first DBOD body.
+/// Dimensions come from the DLOC preceding the DBOD if present, else from the
+/// DGBL display size (§1.3). The DBOD is assembled per DGBL.Compression:
+/// NOCOMPRESSION is decoded; every other method (RUNLENGTH / HUFFMAN /
+/// DYNAMICHUFF / JPEG / TVDC) is rejected here — see the module comment for
+/// the TVDC delta-table gap and use [`assemble_deep_tvdc`] when the caller
+/// has the table.
+pub fn parse_deep(bytes: &[u8]) -> Result<DeepImage> {
+    if bytes.len() < 12 || &bytes[0..4] != b"FORM" {
+        return Err(Error::invalid("DEEP: missing FORM signature"));
+    }
+    if &bytes[8..12] != b"DEEP" {
+        return Err(Error::invalid(format!(
+            "DEEP: outer form type is {:?} (expected DEEP)",
+            std::str::from_utf8(&bytes[8..12]).unwrap_or("????")
+        )));
+    }
+    let total = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let body_end = (8 + total).min(bytes.len());
+
+    let mut dgbl: Option<Dgbl> = None;
+    let mut dpel: Option<Dpel> = None;
+    // The DLOC that most recently preceded the captured DBOD.
+    let mut pending_dloc: Option<Dloc> = None;
+    let mut dbod_dloc: Option<Dloc> = None;
+    let mut dbod: Option<&[u8]> = None;
+
+    let mut cursor = 12usize;
+    while cursor + 8 <= body_end {
+        let id = [
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ];
+        let size = u32::from_be_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]) as usize;
+        let payload_start = cursor + 8;
+        let payload_end = payload_start + size;
+        if payload_end > body_end {
+            return Err(Error::invalid(format!(
+                "DEEP: chunk {:?} extends past FORM",
+                std::str::from_utf8(&id).unwrap_or("????")
+            )));
+        }
+        let payload = &bytes[payload_start..payload_end];
+        match &id {
+            b"DGBL" => dgbl = Some(Dgbl::parse(payload)?),
+            b"DPEL" => dpel = Some(Dpel::parse(payload)?),
+            b"DLOC" => pending_dloc = Some(Dloc::parse(payload)?),
+            // Capture only the first DBOD; subsequent ones (multi-image
+            // FORM DEEP) are ignored here.
+            b"DBOD" if dbod.is_none() => {
+                dbod = Some(payload);
+                dbod_dloc = pending_dloc.take();
+            }
+            _ => { /* DCHG (cel-anim timing), unknown chunks skipped */ }
+        }
+        let padded = size + (size & 1);
+        cursor = payload_start + padded;
+    }
+
+    let dgbl = dgbl.ok_or_else(|| Error::invalid("DEEP: missing DGBL chunk"))?;
+    let dpel = dpel.ok_or_else(|| Error::invalid("DEEP: missing DPEL chunk"))?;
+    let dbod = dbod.ok_or_else(|| Error::invalid("DEEP: missing DBOD chunk"))?;
+
+    // §1.3: DLOC gives the DBOD's dimensions; absent it, the DGBL display size.
+    let (width, height) = match dbod_dloc {
+        Some(dl) => (dl.w, dl.h),
+        None => (dgbl.display_width, dgbl.display_height),
+    };
+
+    let rgba = match dgbl.compression {
+        DeepCompression::None => assemble_deep_chunky(&dpel, width, height, dbod)?,
+        DeepCompression::Tvdc => {
+            return Err(Error::invalid(
+                "DEEP: TVDC body cannot be decoded from the FORM alone — the §1.5 16-word \
+                 delta table is stored with the file/companion data and the canonical DEEP \
+                 text names no chunk that carries it in-FORM. Use assemble_deep_tvdc with \
+                 the table supplied by the caller.",
+            ));
+        }
+        other => {
+            return Err(Error::invalid(format!(
+                "DEEP: DGBL Compression {} body coding is not decoded (wire layout \
+                 undocumented in the staged spec)",
+                other.to_u16()
+            )));
+        }
+    };
+
+    Ok(DeepImage {
+        dgbl,
+        dpel,
+        dloc: dbod_dloc,
+        width,
+        height,
+        rgba,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5165,5 +5373,144 @@ mod tests {
         let mut out = Vec::new();
         decode_tvdc(&source, &table, 3, &mut out).unwrap();
         assert_eq!(out, vec![200, 144, 88]);
+    }
+
+    // ───────────────────── FORM DEEP top-level decode ─────────────────────
+
+    /// A DPEL body for the given `(cType, cBitDepth)` components.
+    fn deep_dpel(elems: &[(u16, u16)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(elems.len() as u32).to_be_bytes());
+        for (ct, depth) in elems {
+            b.extend_from_slice(&ct.to_be_bytes());
+            b.extend_from_slice(&depth.to_be_bytes());
+        }
+        b
+    }
+
+    /// An 8-byte DGBL body.
+    fn deep_dgbl(dw: u16, dh: u16, compression: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 8];
+        b[0..2].copy_from_slice(&dw.to_be_bytes());
+        b[2..4].copy_from_slice(&dh.to_be_bytes());
+        b[4..6].copy_from_slice(&compression.to_be_bytes());
+        b[6] = 1; // x aspect
+        b[7] = 1; // y aspect
+        b
+    }
+
+    /// An 8-byte DLOC body.
+    fn deep_dloc(w: u16, h: u16, x: i16, y: i16) -> Vec<u8> {
+        let mut b = vec![0u8; 8];
+        b[0..2].copy_from_slice(&w.to_be_bytes());
+        b[2..4].copy_from_slice(&h.to_be_bytes());
+        b[4..6].copy_from_slice(&x.to_be_bytes());
+        b[6..8].copy_from_slice(&y.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn parse_deep_nocompression_rgb888() {
+        // 2x1 RGB888 chunky body, dimensions from DGBL display size.
+        let file = iff_form(
+            b"DEEP",
+            &[
+                (b"DGBL", deep_dgbl(2, 1, 0)),
+                (b"DPEL", deep_dpel(&[(1, 8), (2, 8), (3, 8)])),
+                (b"DBOD", vec![10, 20, 30, 200, 100, 50]),
+            ],
+        );
+        let img = parse_deep(&file).unwrap();
+        assert_eq!((img.width, img.height), (2, 1));
+        assert_eq!(img.rgba, vec![10, 20, 30, 0xFF, 200, 100, 50, 0xFF]);
+        assert_eq!(img.dgbl.compression, DeepCompression::None);
+    }
+
+    #[test]
+    fn parse_deep_dloc_overrides_dimensions() {
+        // DGBL says 8x8 but the DLOC narrows the DBOD to 2x1.
+        let file = iff_form(
+            b"DEEP",
+            &[
+                (b"DGBL", deep_dgbl(8, 8, 0)),
+                (b"DPEL", deep_dpel(&[(1, 8), (2, 8), (3, 8)])),
+                (b"DLOC", deep_dloc(2, 1, 0, 0)),
+                (b"DBOD", vec![1, 2, 3, 4, 5, 6]),
+            ],
+        );
+        let img = parse_deep(&file).unwrap();
+        assert_eq!((img.width, img.height), (2, 1));
+        assert!(img.dloc.is_some());
+        assert_eq!(&img.rgba[0..4], &[1, 2, 3, 0xFF]);
+    }
+
+    #[test]
+    fn parse_deep_missing_dgbl_rejected() {
+        let file = iff_form(
+            b"DEEP",
+            &[
+                (b"DPEL", deep_dpel(&[(1, 8), (2, 8), (3, 8)])),
+                (b"DBOD", vec![1, 2, 3]),
+            ],
+        );
+        assert!(parse_deep(&file).is_err());
+    }
+
+    #[test]
+    fn parse_deep_tvdc_in_form_is_a_documented_gap() {
+        // A TVDC DBOD cannot be decoded from the FORM alone (no in-FORM table).
+        let file = iff_form(
+            b"DEEP",
+            &[
+                (b"DGBL", deep_dgbl(2, 1, 5)), // compression = 5 = TVDC
+                (b"DPEL", deep_dpel(&[(1, 8), (2, 8), (3, 8)])),
+                (b"DBOD", vec![0, 0]),
+            ],
+        );
+        assert!(parse_deep(&file).is_err());
+    }
+
+    #[test]
+    fn parse_deep_jpeg_body_rejected() {
+        let file = iff_form(
+            b"DEEP",
+            &[
+                (b"DGBL", deep_dgbl(2, 1, 4)), // compression = 4 = JPEG
+                (b"DPEL", deep_dpel(&[(1, 8), (2, 8), (3, 8)])),
+                (b"DBOD", vec![0, 0]),
+            ],
+        );
+        assert!(parse_deep(&file).is_err());
+    }
+
+    #[test]
+    fn assemble_deep_tvdc_per_component_lines() {
+        // 3x1 RGB888, TVDC: one Red line, one Green line, one Blue line.
+        // Table: nibble 1 → +1, nibble 2 → -5; nibble 0 = run sentinel.
+        let mut table = [0i16; 16];
+        table[1] = 1;
+        table[2] = -5;
+        let dpel = Dpel::parse(&deep_dpel(&[(1, 8), (2, 8), (3, 8)])).unwrap();
+
+        // Red line: nibbles 1 1 1 → v = 1,2,3.   bytes 0x11 0x10
+        // Green line: nibbles 2 2 2 → v = -5,-10,-15 → &0xFF = 251,246,241
+        //             bytes 0x22 0x20
+        // Blue line: nibbles 1 0 2 → 1 emits v=1; 0 = run, next nibble 2 =>
+        //            emit current v (1) two more times → 1,1,1. bytes 0x10 0x20
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x11, 0x10]); // red
+        body.extend_from_slice(&[0x22, 0x20]); // green
+        body.extend_from_slice(&[0x10, 0x20]); // blue
+        let rgba = assemble_deep_tvdc(&dpel, 3, 1, &table, &body).unwrap();
+        assert_eq!(&rgba[0..4], &[1, 251, 1, 0xFF]);
+        assert_eq!(&rgba[4..8], &[2, 246, 1, 0xFF]);
+        assert_eq!(&rgba[8..12], &[3, 241, 1, 0xFF]);
+    }
+
+    #[test]
+    fn assemble_deep_tvdc_rejects_sub_8bit_component() {
+        let table = [0i16; 16];
+        let dpel = Dpel::parse(&deep_dpel(&[(1, 4), (2, 4), (3, 4)])).unwrap();
+        assert!(assemble_deep_tvdc(&dpel, 1, 1, &table, &[0, 0]).is_err());
     }
 }

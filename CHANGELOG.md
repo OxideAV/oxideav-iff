@@ -24,6 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* top-level `FORM DEEP` decode. `ilbm::parse_deep` walks a
+  complete Amiga-Centre-Scotland chunky deep-raster file: it locates DGBL
+  (mandatory §1.1 global header), DPEL (mandatory §1.2 pixel layout), the
+  optional DLOC placement and the first DBOD, takes the DBOD dimensions
+  from the DLOC when present else the DGBL display size (§1.3), and
+  assembles a packed top-to-bottom RGBA8888 `ilbm::DeepImage`.
+  NOCOMPRESSION bodies decode in full via `assemble_deep_chunky`. TVDC
+  per-component-line decode is wired through the new
+  `ilbm::assemble_deep_tvdc` (§1.5: one TVDC line per DPEL component per
+  row — Red line, then Green line, …; RED/GREEN/BLUE → guns, ALPHA/OPACITY
+  → alpha) **when the caller supplies the 16-word delta table**; a
+  sub-8-bit DPEL component is rejected because §1.5 pins no byte→sub-8-bit
+  mapping. `parse_deep` rejects an in-FORM TVDC body (the §1.5 delta table
+  is "stored with the file/companion data" and the canonical DEEP text
+  names no in-FORM chunk carrying it — a documented spec gap) and the
+  RUNLENGTH/HUFFMAN/DYNAMICHUFF/JPEG codings (wire layout undocumented).
 - *(ilbm)* top-level `FORM RGB8` / `FORM RGBN` decode. `ilbm::parse_rgb8`
   and `ilbm::parse_rgbn` walk a complete Turbo-Silver / Imagine
   true-colour file: they locate the mandatory `BMHD` (for dimensions),
