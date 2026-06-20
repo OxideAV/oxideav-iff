@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* top-level `FORM RGB8` / `FORM RGBN` decode. `ilbm::parse_rgb8`
+  and `ilbm::parse_rgbn` walk a complete Turbo-Silver / Imagine
+  true-colour file: they locate the mandatory `BMHD` (for dimensions),
+  enforce the truecolor-reference §3 invariants — `CAMG` IS REQUIRED and
+  `BMHD.compression == 4` (the Turbo-Silver RLE, not ByteRun1) — then hand
+  the `BODY` to the existing `decode_rgb8_body` / `decode_rgbn_body`
+  genlock-RLE decoders, returning a packed top-to-bottom RGBA8888
+  `ilbm::RgbTrueColor` image with a caller-chosen `GenlockPolicy`. A wrong
+  outer FORM type, a missing `CAMG`/`BMHD`/`BODY`, a non-4 compression
+  byte, or a chunk that overruns the FORM are each rejected with
+  `Error::invalid`. This wires the previously body-only RGB8/RGBN support
+  to a usable file-level entry point.
 - *(ilbm)* FORM DEEP chunky deep-raster support — the structural chunks
   plus the two body codings whose wire format the staged spec fully
   pins down. `ilbm::Dgbl` parses/writes the mandatory 8-byte DGBL global

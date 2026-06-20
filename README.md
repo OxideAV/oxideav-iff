@@ -743,7 +743,15 @@ Turbo-Silver "zero colour" (genlocked → opaque black), Diamond/Light24
 → alpha 0 transparency mask). For both bodies a truncated stream and a
 run that overshoots the pixel budget are rejected with `Error::invalid`
 (plus RGBN's missing-BYTE/WORD-escape and zero-length-WORD-escape cases,
-and RGB8's zero-count case).
+and RGB8's zero-count case). These body decoders are now wired to
+top-level FORM walkers: [`ilbm::parse_rgb8`] / [`ilbm::parse_rgbn`] walk a
+complete `FORM RGB8` / `FORM RGBN` file (locating `BMHD` for dimensions,
+enforcing the §3 invariants — `CAMG` IS REQUIRED and `BMHD.compression ==
+4` — then handing the `BODY` to the matching decoder), returning a packed
+top-to-bottom [`ilbm::RgbTrueColor`] image with a caller-chosen
+`GenlockPolicy`. A wrong outer FORM type, a missing `CAMG`, a
+non-4 compression byte, a missing `BMHD`/`BODY`, or a chunk that runs past
+the FORM are each rejected with `Error::invalid`.
 **FORM DEEP** (Amiga Centre Scotland, 1991; TVPaint) chunky deep-raster
 support has landed for the structural chunks and the two body codings the
 staged spec fully pins down. [`ilbm::Dgbl`] parses/writes the mandatory

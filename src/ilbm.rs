@@ -3637,6 +3637,144 @@ pub fn decode_rgb8_body(
     Ok(rgba)
 }
 
+// ─────────────────── FORM RGB8 / RGBN — top-level decode ───────────────────
+//
+// The `decode_rgb8_body` / `decode_rgbn_body` functions above decode a bare
+// Turbo-Silver run-length BODY once the dimensions are known. These two
+// `parse_*` wrappers walk a complete `FORM RGB8` / `FORM RGBN` file: they
+// locate the mandatory `BMHD` (for dimensions), enforce the two RGB-form
+// invariants the truecolor reference (§3) pins down — `CAMG` IS REQUIRED and
+// `BMHD.compression == 4` — and then hand the `BODY` to the matching body
+// decoder. The result is a packed top-to-bottom RGBA8888 image, the same
+// shape `parse_ilbm` produces, so a downstream image umbrella can treat every
+// IFF raster the same way.
+//
+// Source: docs/image/iff/iff-truecolor-chunks.md §3, §3.1, §3.2, §3.3.
+
+/// A decoded Turbo-Silver / Imagine true-colour image (`FORM RGB8` or
+/// `FORM RGBN`).
+#[derive(Clone, Debug)]
+pub struct RgbTrueColor {
+    /// `true` for `FORM RGB8` (24-bit), `false` for `FORM RGBN` (12-bit).
+    pub is_rgb8: bool,
+    pub width: u16,
+    pub height: u16,
+    /// Packed RGBA, row-major, top-to-bottom, 4 bytes/pixel.
+    pub rgba: Vec<u8>,
+}
+
+/// Locate `BMHD` (width/height/compression byte), whether a `CAMG` chunk was
+/// present, and the `BODY` payload inside a `FORM RGB8` / `FORM RGBN` file.
+///
+/// Returns `(width, height, compression_byte, have_camg, body)`.
+#[allow(clippy::type_complexity)]
+fn walk_rgb_form<'a>(
+    bytes: &'a [u8],
+    expect_form: &[u8; 4],
+) -> Result<(u16, u16, u8, bool, &'a [u8])> {
+    if bytes.len() < 12 || &bytes[0..4] != b"FORM" {
+        return Err(Error::invalid("RGB8/RGBN: missing FORM signature"));
+    }
+    if &bytes[8..12] != expect_form {
+        return Err(Error::invalid(format!(
+            "RGB8/RGBN: outer form type is {:?} (expected {:?})",
+            std::str::from_utf8(&bytes[8..12]).unwrap_or("????"),
+            std::str::from_utf8(expect_form).unwrap_or("????"),
+        )));
+    }
+    let total = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let body_end = (8 + total).min(bytes.len());
+
+    let mut dims: Option<(u16, u16, u8)> = None;
+    let mut have_camg = false;
+    let mut body: Option<&[u8]> = None;
+
+    let mut cursor = 12usize;
+    while cursor + 8 <= body_end {
+        let id = [
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ];
+        let size = u32::from_be_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]) as usize;
+        let payload_start = cursor + 8;
+        let payload_end = payload_start + size;
+        if payload_end > body_end {
+            return Err(Error::invalid(format!(
+                "RGB8/RGBN: chunk {:?} extends past FORM",
+                std::str::from_utf8(&id).unwrap_or("????")
+            )));
+        }
+        let payload = &bytes[payload_start..payload_end];
+        match &id {
+            b"BMHD" => {
+                if payload.len() < 20 {
+                    return Err(Error::invalid("RGB8/RGBN BMHD: need 20 bytes"));
+                }
+                dims = Some((
+                    u16::from_be_bytes([payload[0], payload[1]]),
+                    u16::from_be_bytes([payload[2], payload[3]]),
+                    payload[10],
+                ));
+            }
+            b"CAMG" => have_camg = true,
+            b"BODY" => body = Some(payload),
+            _ => { /* CMAP (unused on RGB8/RGBN), DPI, ... skipped */ }
+        }
+        let padded = size + (size & 1);
+        cursor = payload_start + padded;
+    }
+
+    let (w, h, compression) =
+        dims.ok_or_else(|| Error::invalid("RGB8/RGBN: missing BMHD chunk"))?;
+    // §3: "CAMG chunk IS REQUIRED."
+    if !have_camg {
+        return Err(Error::invalid(
+            "RGB8/RGBN: CAMG chunk is required for Turbo-Silver true-colour FORMs",
+        ));
+    }
+    // §3: BMHD.compression == 4 (Turbo-Silver-specific RLE, not ByteRun1).
+    if compression != 4 {
+        return Err(Error::invalid(format!(
+            "RGB8/RGBN: BMHD.compression is {compression} (expected 4 for Turbo-Silver RLE)"
+        )));
+    }
+    let body = body.ok_or_else(|| Error::invalid("RGB8/RGBN: missing BODY chunk"))?;
+    Ok((w, h, compression, have_camg, body))
+}
+
+/// Parse a complete `FORM RGB8` file (§3.2) into a packed-RGBA image,
+/// applying the given [`GenlockPolicy`] to the genlock bit.
+pub fn parse_rgb8(bytes: &[u8], genlock: GenlockPolicy) -> Result<RgbTrueColor> {
+    let (width, height, _comp, _camg, body) = walk_rgb_form(bytes, b"RGB8")?;
+    let rgba = decode_rgb8_body(width, height, body, genlock)?;
+    Ok(RgbTrueColor {
+        is_rgb8: true,
+        width,
+        height,
+        rgba,
+    })
+}
+
+/// Parse a complete `FORM RGBN` file (§3.1) into a packed-RGBA image,
+/// applying the given [`GenlockPolicy`] to the genlock bit.
+pub fn parse_rgbn(bytes: &[u8], genlock: GenlockPolicy) -> Result<RgbTrueColor> {
+    let (width, height, _comp, _camg, body) = walk_rgb_form(bytes, b"RGBN")?;
+    let rgba = decode_rgbn_body(width, height, body, genlock)?;
+    Ok(RgbTrueColor {
+        is_rgb8: false,
+        width,
+        height,
+        rgba,
+    })
+}
+
 // ───────────────────────── FORM DEEP — chunky deep raster ─────────────────
 //
 // FORM DEEP (Amiga Centre Scotland, 1991; used by TVPaint) carries *chunky*
@@ -4334,6 +4472,118 @@ mod tests {
         // A 7-bit count of 0 has no escape cascade in RGB8 → undefined.
         let body = rgb8_long(0xFF, 0x00, 0x00, false, 0);
         assert!(decode_rgb8_body(1, 1, &body, GenlockPolicy::default()).is_err());
+    }
+
+    // ───────────── FORM RGB8 / RGBN top-level decode (parse_rgb*) ─────────────
+
+    /// Build a minimal IFF FORM envelope around the given chunks.
+    fn iff_form(form_type: &[u8; 4], chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(form_type);
+        for (id, payload) in chunks {
+            body.extend_from_slice(*id);
+            body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            body.extend_from_slice(payload);
+            if payload.len() & 1 == 1 {
+                body.push(0);
+            }
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FORM");
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// A 20-byte BMHD with the given dimensions, plane count and compression.
+    fn rgb_bmhd(w: u16, h: u16, n_planes: u8, compression: u8) -> Vec<u8> {
+        let mut b = vec![0u8; 20];
+        b[0..2].copy_from_slice(&w.to_be_bytes());
+        b[2..4].copy_from_slice(&h.to_be_bytes());
+        b[8] = n_planes;
+        b[10] = compression;
+        b[14] = 1;
+        b[15] = 1;
+        b
+    }
+
+    #[test]
+    fn parse_rgb8_full_form() {
+        let mut bdy = Vec::new();
+        bdy.extend_from_slice(&rgb8_long(0x11, 0x22, 0x33, false, 4));
+        let file = iff_form(
+            b"RGB8",
+            &[
+                (b"BMHD", rgb_bmhd(4, 1, 25, 4)),
+                (b"CAMG", vec![0, 0, 0, 0]),
+                (b"BODY", bdy),
+            ],
+        );
+        let img = parse_rgb8(&file, GenlockPolicy::default()).unwrap();
+        assert!(img.is_rgb8);
+        assert_eq!((img.width, img.height), (4, 1));
+        for px in img.rgba.chunks_exact(4) {
+            assert_eq!(px, &[0x11, 0x22, 0x33, 0xFF]);
+        }
+    }
+
+    #[test]
+    fn parse_rgbn_full_form() {
+        let mut bdy = Vec::new();
+        bdy.extend_from_slice(&rgbn_word(0xF, 0x0, 0xA, false, 3));
+        let file = iff_form(
+            b"RGBN",
+            &[
+                (b"BMHD", rgb_bmhd(3, 1, 13, 4)),
+                (b"CAMG", vec![0, 0, 0, 0]),
+                (b"BODY", bdy),
+            ],
+        );
+        let img = parse_rgbn(&file, GenlockPolicy::default()).unwrap();
+        assert!(!img.is_rgb8);
+        assert_eq!((img.width, img.height), (3, 1));
+        for px in img.rgba.chunks_exact(4) {
+            assert_eq!(px, &[0xFF, 0x00, 0xAA, 0xFF]);
+        }
+    }
+
+    #[test]
+    fn parse_rgb8_requires_camg() {
+        let mut bdy = Vec::new();
+        bdy.extend_from_slice(&rgb8_long(0x11, 0x22, 0x33, false, 1));
+        let file = iff_form(b"RGB8", &[(b"BMHD", rgb_bmhd(1, 1, 25, 4)), (b"BODY", bdy)]);
+        assert!(parse_rgb8(&file, GenlockPolicy::default()).is_err());
+    }
+
+    #[test]
+    fn parse_rgb8_requires_compression_4() {
+        let mut bdy = Vec::new();
+        bdy.extend_from_slice(&rgb8_long(0x11, 0x22, 0x33, false, 1));
+        let file = iff_form(
+            b"RGB8",
+            &[
+                (b"BMHD", rgb_bmhd(1, 1, 25, 1)),
+                (b"CAMG", vec![0, 0, 0, 0]),
+                (b"BODY", bdy),
+            ],
+        );
+        assert!(parse_rgb8(&file, GenlockPolicy::default()).is_err());
+    }
+
+    #[test]
+    fn parse_rgb_wrong_form_type_rejected() {
+        let mut bdy = Vec::new();
+        bdy.extend_from_slice(&rgb8_long(0x11, 0x22, 0x33, false, 1));
+        let file = iff_form(
+            b"RGBN",
+            &[
+                (b"BMHD", rgb_bmhd(1, 1, 25, 4)),
+                (b"CAMG", vec![0, 0, 0, 0]),
+                (b"BODY", bdy),
+            ],
+        );
+        // Body parsed as RGBN would mis-decode; asking parse_rgb8 must reject.
+        assert!(parse_rgb8(&file, GenlockPolicy::default()).is_err());
     }
 
     fn solid_palette() -> Vec<[u8; 3]> {
