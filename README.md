@@ -751,7 +751,17 @@ enforcing the §3 invariants — `CAMG` IS REQUIRED and `BMHD.compression ==
 top-to-bottom [`ilbm::RgbTrueColor`] image with a caller-chosen
 `GenlockPolicy`. A wrong outer FORM type, a missing `CAMG`, a
 non-4 compression byte, a missing `BMHD`/`BODY`, or a chunk that runs past
-the FORM are each rejected with `Error::invalid`.
+the FORM are each rejected with `Error::invalid`. The **inverse** encoders
+complete the round-trip: [`ilbm::encode_rgb8`] / [`ilbm::encode_rgbn`]
+coalesce a packed RGBA8888 image into a complete `FORM` (a `compression =
+4` `BMHD`, the required minimal `CAMG`, and the genlock-RLE `BODY` from
+[`ilbm::encode_rgb8_body`] / [`ilbm::encode_rgbn_body`]). Maximal runs of
+identical pixels are coded as the §3.2 LONG with an inline 7-bit count
+(runs > 127 split) or the §3.1 WORD with the 1..=7 → BYTE → BYTE-0 + WORD
+count cascade; alpha drives the genlock bit under `BrushTransparency`.
+`parse_rgb8(encode_rgb8(x)) == x` for any 8-bit-true image, and likewise
+for RGBN once 12-bit nibble quantisation is accounted for; a mis-sized
+RGBA buffer is rejected.
 **FORM DEEP** (Amiga Centre Scotland, 1991; TVPaint) chunky deep-raster
 support has landed for the structural chunks and the two body codings the
 staged spec fully pins down. [`ilbm::Dgbl`] parses/writes the mandatory
@@ -785,6 +795,17 @@ TVDC line per DPEL component per row — a Red line, then a Green line, …)
 when the caller supplies the 16-word delta table, mapping RED/GREEN/BLUE →
 guns and ALPHA/OPACITY → alpha; a sub-8-bit DPEL component is rejected
 (TVDC emits one byte per pixel and §1.5 pins no byte→sub-8-bit mapping).
+DEEP **encode** completes the round-trip too: [`ilbm::encode_deep_chunky`]
+packs RGBA8888 into the raw chunky DBOD (inverse of `assemble_deep_chunky`),
+[`ilbm::encode_tvdc`] encodes one component line to a TVDC nibble stream
+(inverse of `decode_tvdc` — a non-zero `table[d]` per step, runs as the
+zero-entry escape + a 0..=15 count nibble), and [`ilbm::encode_deep`]
+builds a full `FORM DEEP` (DGBL + DPEL + DBOD) for `None` (chunky) or
+`Tvdc` (per-component lines, table supplied out of band). Every DPEL
+component must be 8 bits for a lossless round-trip; [`ilbm::Dpel::write`]
+and [`ilbm::Dloc::write`] serialise their chunks. NOCOMPRESSION output
+round-trips through `parse_deep`, TVDC output through `assemble_deep_tvdc`
+with the matching table.
 Remaining true-colour frontier: TVDC decode **from a FORM** is blocked —
 §1.5 says the 16-word delta table is "stored with the file/companion
 data" but the canonical DEEP text names no in-FORM chunk that carries it

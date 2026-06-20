@@ -12,7 +12,8 @@
 //!   §3 (RGB8 §3.2 / RGBN §3.1 Turbo-Silver genlock-RLE bodies, §3.3 genlock).
 
 use oxideav_iff::ilbm::{
-    assemble_deep_tvdc, parse_deep, parse_rgb8, parse_rgbn, DeepCompression, Dpel, GenlockPolicy,
+    assemble_deep_tvdc, encode_deep, encode_rgb8, encode_rgbn, parse_deep, parse_rgb8, parse_rgbn,
+    DeepCompression, Dpel, GenlockPolicy,
 };
 
 /// Wrap a list of `(id, payload)` chunks in an even-padded IFF FORM.
@@ -249,4 +250,99 @@ fn deep_tvdc_caller_supplied_table_decodes_two_rows() {
     assert_eq!(&rgba[4..8], &[2, 2, 2, 0xFF]);
     assert_eq!(&rgba[8..12], &[1, 1, 1, 0xFF]);
     assert_eq!(&rgba[12..16], &[2, 2, 2, 0xFF]);
+}
+
+// ───────────── encode → decode round-trip through the public API ─────────────
+
+/// A multi-row RGB8 image survives `encode_rgb8` → `parse_rgb8` byte-exact,
+/// including a run that spans a scanline boundary.
+#[test]
+fn rgb8_encode_decode_round_trip_multi_row() {
+    // 3x2: the first colour forms a run of 5 (spilling across the row break),
+    // the last pixel is distinct.
+    let mut rgba = Vec::new();
+    for _ in 0..5 {
+        rgba.extend_from_slice(&[0x12, 0x34, 0x56, 0xFF]);
+    }
+    rgba.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xFF]);
+    let file = encode_rgb8(3, 2, &rgba).unwrap();
+    let back = parse_rgb8(&file, GenlockPolicy::BrushTransparency).unwrap();
+    assert!(back.is_rgb8);
+    assert_eq!((back.width, back.height), (3, 2));
+    assert_eq!(back.rgba, rgba);
+}
+
+/// An RGB8 image whose first run exceeds the 7-bit inline count survives the
+/// public encode → decode round-trip (the encoder splits, the decoder rejoins).
+#[test]
+fn rgb8_encode_decode_round_trip_long_run() {
+    let rgba: Vec<u8> = std::iter::repeat([0x7F, 0x00, 0x7F, 0xFF])
+        .take(200)
+        .flatten()
+        .collect();
+    let file = encode_rgb8(200, 1, &rgba).unwrap();
+    let back = parse_rgb8(&file, GenlockPolicy::BrushTransparency).unwrap();
+    assert_eq!(back.rgba, rgba);
+}
+
+/// A nibble-replicated RGBN image survives `encode_rgbn` → `parse_rgbn`.
+#[test]
+fn rgbn_encode_decode_round_trip_replicated() {
+    let mut rgba = Vec::new();
+    rgba.extend_from_slice(&[0xFF, 0x00, 0x00, 0xFF]);
+    rgba.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+    rgba.extend_from_slice(&[0x44, 0x88, 0xCC, 0xFF]);
+    rgba.extend_from_slice(&[0x44, 0x88, 0xCC, 0xFF]);
+    let file = encode_rgbn(4, 1, &rgba).unwrap();
+    let back = parse_rgbn(&file, GenlockPolicy::BrushTransparency).unwrap();
+    assert!(!back.is_rgb8);
+    assert_eq!(back.rgba, rgba);
+}
+
+/// A NOCOMPRESSION DEEP image survives `encode_deep` → `parse_deep`, alpha
+/// included.
+#[test]
+fn deep_nocompression_encode_decode_round_trip() {
+    let dpel = Dpel::parse(&dpel(&[(1, 8), (2, 8), (3, 8), (4, 8)])).unwrap();
+    let rgba = vec![
+        10, 20, 30, 0x80, 40, 50, 60, 0xC0, // row 0
+        70, 80, 90, 0xFF, 11, 22, 33, 0x44, // row 1
+    ];
+    let file = encode_deep(&dpel, 2, 2, DeepCompression::None, None, &rgba).unwrap();
+    let back = parse_deep(&file).unwrap();
+    assert_eq!((back.width, back.height), (2, 2));
+    assert_eq!(back.rgba, rgba);
+}
+
+/// A TVDC DEEP image encoded by `encode_deep` round-trips through the
+/// caller-supplied-table `assemble_deep_tvdc` (the table travels out of band).
+#[test]
+fn deep_tvdc_encode_decode_round_trip() {
+    let mut table = [0i16; 16];
+    table[1] = 1; // +1
+    table[2] = -1; // -1
+    table[3] = 7; // +7 (seeds each component's first byte)
+    let dpel = Dpel::parse(&dpel(&[(1, 8), (2, 8), (3, 8)])).unwrap();
+    // R/G/B all start at 7 (delta +7 from 0) then oscillate 8,7,8 (+1,-1,+1).
+    let rgba = vec![7, 7, 7, 0xFF, 8, 8, 8, 0xFF, 7, 7, 7, 0xFF, 8, 8, 8, 0xFF];
+    let file = encode_deep(&dpel, 4, 1, DeepCompression::Tvdc, Some(&table), &rgba).unwrap();
+    // Pull the DBOD back out and decode with the same table.
+    let body = {
+        let mut cur = 12usize;
+        let mut found = Vec::new();
+        while cur + 8 <= file.len() {
+            let id = &file[cur..cur + 4];
+            let size =
+                u32::from_be_bytes([file[cur + 4], file[cur + 5], file[cur + 6], file[cur + 7]])
+                    as usize;
+            if id == b"DBOD" {
+                found = file[cur + 8..cur + 8 + size].to_vec();
+                break;
+            }
+            cur = cur + 8 + size + (size & 1);
+        }
+        found
+    };
+    let back = assemble_deep_tvdc(&dpel, 4, 1, &table, &body).unwrap();
+    assert_eq!(back, rgba);
 }
