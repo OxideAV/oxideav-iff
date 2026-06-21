@@ -72,6 +72,12 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_demuxer("iff_rgbn", open_rgbn);
     reg.register_extension("rgbn", "iff_rgbn");
     reg.register_probe("iff_rgbn", probe_rgbn);
+
+    // Amiga Centre Scotland / TVPaint chunky deep-raster FORM (decode-only).
+    // NOCOMPRESSION bodies decode; other DGBL.Compression codings error.
+    reg.register_demuxer("iff_deep", open_deep);
+    reg.register_extension("deep", "iff_deep");
+    reg.register_probe("iff_deep", probe_deep);
 }
 
 fn probe(p: &oxideav_core::ProbeData) -> u8 {
@@ -4996,6 +5002,66 @@ pub fn parse_deep(bytes: &[u8]) -> Result<DeepImage> {
         height,
         rgba,
     })
+}
+
+// ───────────────── FORM DEEP — container registry wiring ─────────────────
+//
+// `iff_deep` demuxer: a `FORM DEEP` chunky deep-raster file decodes through
+// the standard `ContainerRegistry::open_*` path, surfacing the first DBOD as
+// a single `rawvideo` / `Rgba` keyframe. Only the body codings `parse_deep`
+// decodes (NOCOMPRESSION today) succeed; TVDC and the other DGBL.Compression
+// methods return the same `Error::invalid` `parse_deep` raises (see its doc
+// for the §1.5 delta-table gap). Source: iff-truecolor-chunks.md §1.
+
+fn probe_deep(p: &oxideav_core::ProbeData) -> u8 {
+    if p.buf.len() >= 12 && &p.buf[0..4] == b"FORM" && &p.buf[8..12] == b"DEEP" {
+        100
+    } else {
+        0
+    }
+}
+
+/// Single-frame `FORM DEEP` demuxer.
+struct DeepDemuxer {
+    streams: Vec<StreamInfo>,
+    rgba: Option<Vec<u8>>,
+}
+
+impl Demuxer for DeepDemuxer {
+    fn format_name(&self) -> &str {
+        "iff_deep"
+    }
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+    fn next_packet(&mut self) -> Result<Packet> {
+        let rgba = self.rgba.take().ok_or(Error::Eof)?;
+        let stream = &self.streams[0];
+        let mut pkt = Packet::new(0, stream.time_base, rgba);
+        pkt.pts = Some(0);
+        pkt.dts = Some(0);
+        pkt.duration = Some(1);
+        pkt.flags.keyframe = true;
+        Ok(pkt)
+    }
+    fn metadata(&self) -> &[(String, String)] {
+        &[]
+    }
+    fn duration_micros(&self) -> Option<i64> {
+        None
+    }
+}
+
+fn open_deep(
+    mut input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    let full = read_true_color_form(&mut *input, "DEEP", b"DEEP")?;
+    let image = parse_deep(&full)?;
+    Ok(Box::new(DeepDemuxer {
+        streams: vec![true_color_stream(image.width, image.height)],
+        rgba: Some(image.rgba),
+    }))
 }
 
 #[cfg(test)]

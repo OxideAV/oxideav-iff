@@ -24,16 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(ilbm)* the Turbo-Silver true-colour FORMs are now wired into the
-  container registry: `ilbm::register` installs `iff_rgb8` / `iff_rgbn`
+- *(ilbm)* the IFF true-colour FORMs are now wired into the container
+  registry: `ilbm::register` installs `iff_rgb8` / `iff_rgbn` / `iff_deep`
   demuxers, each with a `FORM`-signature probe and a matching `.rgb8` /
-  `.rgbn` extension, so a Turbo-Silver RGB8 / RGBN file decodes through
-  the standard `ContainerRegistry::probe_input` / `open_demuxer` path
-  (single `rawvideo` / `Rgba` keyframe, EOF after one packet). The
+  `.rgbn` / `.deep` extension, so a Turbo-Silver RGB8 / RGBN or an
+  Amiga-Centre-Scotland DEEP file decodes through the standard
+  `ContainerRegistry::probe_input` / `open_demuxer` path (single
+  `rawvideo` / `Rgba` keyframe, EOF after one packet). The RGB8 / RGBN
   demuxers apply `GenlockPolicy::default` (§3.3 load-as-a-picture
-  "ignore genlock, use the coded RGB"); callers needing the
-  zero-colour / brush-transparency genlock semantics use `parse_rgb8` /
-  `parse_rgbn` directly.
+  "ignore genlock, use the coded RGB"); the DEEP demuxer decodes
+  NOCOMPRESSION bodies and surfaces the same `parse_deep` error for TVDC
+  and the other unsupported codings.
 - *(ilbm)* `FORM DEEP` **encode**, completing the chunky deep-raster
   round-trip. `ilbm::encode_deep_chunky` packs a packed RGBA8888 image into the
   raw chunky DBOD stream (inverse of `assemble_deep_chunky`); `ilbm::encode_tvdc`
