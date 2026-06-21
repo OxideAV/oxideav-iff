@@ -806,14 +806,26 @@ component must be 8 bits for a lossless round-trip; [`ilbm::Dpel::write`]
 and [`ilbm::Dloc::write`] serialise their chunks. NOCOMPRESSION output
 round-trips through `parse_deep`, TVDC output through `assemble_deep_tvdc`
 with the matching table.
+The RGB8 / RGBN true-colour FORMs are now **wired into the container
+registry**: [`ilbm::register`] installs the `iff_rgb8` / `iff_rgbn`
+demuxers (each with a `FORM`-signature probe and a matching `.rgb8` /
+`.rgbn` extension), so a Turbo-Silver RGB8 / RGBN file decodes through
+the standard `ContainerRegistry::probe_input` / `open_demuxer` path
+exactly like `iff_ilbm`. Each demuxer surfaces a single `rawvideo` /
+`Rgba` keyframe and is EOF after one packet, applying
+[`GenlockPolicy::default`] ("ignore — use the coded RGB", the §3.3
+load-as-a-picture default); callers needing the Turbo-Silver
+zero-colour or brush-transparency genlock semantics use
+[`ilbm::parse_rgb8`] / [`ilbm::parse_rgbn`] directly.
+
 Remaining true-colour frontier: TVDC decode **from a FORM** is blocked —
 §1.5 says the 16-word delta table is "stored with the file/companion
 data" but the canonical DEEP text names no in-FORM chunk that carries it
 (documented gap; `assemble_deep_tvdc` is the caller-supplies-table escape
 hatch). Also pending: DEEP's RUNLENGTH/HUFFMAN/DYNAMICHUFF/JPEG body
 codings (wire layout undocumented), the TVPP project-file FORM (§2,
-non-canonical RE — needs a real-file fixture), and registry probes for
-the RGB8/RGBN/DEEP FORM types.
+non-canonical RE — needs a real-file fixture), and a registry probe for
+the DEEP FORM type.
 
 AIFF-C coverage is saturated: Apple shipped 13 chunk classes (FVER,
 COMM, SSND, MARK, INST, COMT, AESD, APPL, MIDI, SAXL, NAME, AUTH,

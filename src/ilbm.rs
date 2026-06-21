@@ -62,6 +62,16 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_extension("ilbm", "iff_ilbm");
     reg.register_extension("lbm", "iff_ilbm");
     reg.register_probe("iff_ilbm", probe);
+
+    // Turbo-Silver / Imagine true-colour FORMs (decode-only). Both share the
+    // ILBM-like outer container but carry a Turbo-Silver genlock-RLE BODY
+    // (`BMHD.compression == 4`). See `iff-truecolor-chunks.md` §3.
+    reg.register_demuxer("iff_rgb8", open_rgb8);
+    reg.register_extension("rgb8", "iff_rgb8");
+    reg.register_probe("iff_rgb8", probe_rgb8);
+    reg.register_demuxer("iff_rgbn", open_rgbn);
+    reg.register_extension("rgbn", "iff_rgbn");
+    reg.register_probe("iff_rgbn", probe_rgbn);
 }
 
 fn probe(p: &oxideav_core::ProbeData) -> u8 {
@@ -3773,6 +3783,146 @@ pub fn parse_rgbn(bytes: &[u8], genlock: GenlockPolicy) -> Result<RgbTrueColor> 
         height,
         rgba,
     })
+}
+
+// ───────────── FORM RGB8 / RGBN — container registry wiring ─────────────
+//
+// Probe + demuxer entry points so a `FORM RGB8` / `FORM RGBN` Turbo-Silver
+// true-colour file decodes through the standard `ContainerRegistry::open_*`
+// path, mirroring the `iff_ilbm` demuxer. Both forms surface a single
+// `rawvideo` / `Rgba` keyframe. The genlock bit is interpreted under the
+// [`GenlockPolicy::default`] ("ignore — use the coded RGB") policy: a
+// container demuxer has no caller-supplied policy hook, and §3.3 makes
+// "load as a picture → ignore the genlock bit, use the RGB" the picture-load
+// default (the brush-transparency reading only applies when the file is
+// loaded as a paint brush). Callers needing the Turbo-Silver zero-colour or
+// brush-transparency semantics use [`parse_rgb8`] / [`parse_rgbn`] directly.
+//
+// Source: docs/image/iff/iff-truecolor-chunks.md §3, §3.3.
+
+fn probe_rgb8(p: &oxideav_core::ProbeData) -> u8 {
+    probe_rgb_form(p.buf, b"RGB8")
+}
+
+fn probe_rgbn(p: &oxideav_core::ProbeData) -> u8 {
+    probe_rgb_form(p.buf, b"RGBN")
+}
+
+fn probe_rgb_form(buf: &[u8], form_type: &[u8; 4]) -> u8 {
+    if buf.len() >= 12 && &buf[0..4] == b"FORM" && &buf[8..12] == form_type {
+        100
+    } else {
+        0
+    }
+}
+
+/// Single-frame true-colour demuxer shared by `iff_rgb8` / `iff_rgbn`.
+struct RgbTrueColorDemuxer {
+    format_name: &'static str,
+    streams: Vec<StreamInfo>,
+    rgba: Option<Vec<u8>>,
+}
+
+impl Demuxer for RgbTrueColorDemuxer {
+    fn format_name(&self) -> &str {
+        self.format_name
+    }
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+    fn next_packet(&mut self) -> Result<Packet> {
+        let rgba = self.rgba.take().ok_or(Error::Eof)?;
+        let stream = &self.streams[0];
+        let mut pkt = Packet::new(0, stream.time_base, rgba);
+        pkt.pts = Some(0);
+        pkt.dts = Some(0);
+        pkt.duration = Some(1);
+        pkt.flags.keyframe = true;
+        Ok(pkt)
+    }
+    fn metadata(&self) -> &[(String, String)] {
+        &[]
+    }
+    fn duration_micros(&self) -> Option<i64> {
+        None
+    }
+}
+
+/// Read the whole outer `FORM` from `input` into a contiguous buffer that
+/// `parse_rgb8` / `parse_rgbn` / `parse_deep` can walk verbatim.
+fn read_true_color_form(
+    input: &mut dyn ReadSeek,
+    label: &str,
+    expect: &[u8; 4],
+) -> Result<Vec<u8>> {
+    let hdr = read_chunk_header(&mut *input)?
+        .ok_or_else(|| Error::invalid(format!("{label}: empty file")))?;
+    if hdr.id != GROUP_FORM {
+        return Err(Error::invalid(format!(
+            "{label}: expected FORM chunk, got {}",
+            hdr.id_str()
+        )));
+    }
+    let form_type = read_form_type(&mut *input)?;
+    if &form_type != expect {
+        return Err(Error::invalid(format!(
+            "{label}: not a {} file (form type {:?})",
+            std::str::from_utf8(expect).unwrap_or("????"),
+            std::str::from_utf8(&form_type).unwrap_or("????"),
+        )));
+    }
+    let body_size = (hdr.size as u64)
+        .checked_sub(4)
+        .ok_or_else(|| Error::invalid(format!("{label}: FORM size shorter than form type")))?;
+    let mut form_body = vec![0u8; body_size as usize];
+    input.read_exact(&mut form_body)?;
+    let mut full = Vec::with_capacity(12 + form_body.len());
+    full.extend_from_slice(b"FORM");
+    full.extend_from_slice(&hdr.size.to_be_bytes());
+    full.extend_from_slice(&form_type);
+    full.extend_from_slice(&form_body);
+    Ok(full)
+}
+
+fn true_color_stream(width: u16, height: u16) -> StreamInfo {
+    let mut params = CodecParameters::video(CodecId::new("rawvideo"));
+    params.media_type = MediaType::Video;
+    params.width = Some(u32::from(width));
+    params.height = Some(u32::from(height));
+    params.pixel_format = Some(PixelFormat::Rgba);
+    StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 1),
+        duration: Some(1),
+        start_time: Some(0),
+        params,
+    }
+}
+
+fn open_rgb8(
+    mut input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    let full = read_true_color_form(&mut *input, "RGB8", b"RGB8")?;
+    let image = parse_rgb8(&full, GenlockPolicy::default())?;
+    Ok(Box::new(RgbTrueColorDemuxer {
+        format_name: "iff_rgb8",
+        streams: vec![true_color_stream(image.width, image.height)],
+        rgba: Some(image.rgba),
+    }))
+}
+
+fn open_rgbn(
+    mut input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    let full = read_true_color_form(&mut *input, "RGBN", b"RGBN")?;
+    let image = parse_rgbn(&full, GenlockPolicy::default())?;
+    Ok(Box::new(RgbTrueColorDemuxer {
+        format_name: "iff_rgbn",
+        streams: vec![true_color_stream(image.width, image.height)],
+        rgba: Some(image.rgba),
+    }))
 }
 
 // ─────────────── FORM RGB8 / RGBN — genlock-RLE encode ───────────────
