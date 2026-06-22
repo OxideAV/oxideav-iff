@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* `FORM DEEP` **RUNLENGTH** (`DGBL.Compression == 1`) body
+  decode + encode — the §1.5b best-effort coding. `ilbm::decode_deep_runlength_body`
+  unpacks the whole DBOD as a single ByteRun1 (PackBits) stream to
+  `width × height × pixel_bytes` bytes and assembles it as for
+  NOCOMPRESSION; `ilbm::encode_deep_runlength_body` is the inverse.
+  `parse_deep` / `encode_deep` now accept `DeepCompression::RunLength`,
+  and the `iff_deep` demuxer decodes RUNLENGTH bodies through the
+  standard registry path. §1.5b leaves the per-line-vs-whole-DBOD
+  framing to a fixture probe; this decoder reads whole-DBOD framing and
+  rejects a length mismatch (under-run or trailing source bytes) per
+  §1.5b ¶ "fall back … ask for a fixture". HUFFMAN / DYNAMICHUFF / JPEG
+  remain rejected (no documented wire layout).
 - *(ilbm)* the IFF true-colour FORMs are now wired into the container
   registry: `ilbm::register` installs `iff_rgb8` / `iff_rgbn` / `iff_deep`
   demuxers, each with a `FORM`-signature probe and a matching `.rgb8` /

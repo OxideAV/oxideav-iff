@@ -125,6 +125,30 @@ fn deep_demuxer_emits_chunky_rgb888() {
     assert!(matches!(dmx.next_packet(), Err(oxideav_core::Error::Eof)));
 }
 
+#[test]
+fn deep_demuxer_emits_runlength_rgb888() {
+    // DGBL.Compression == 1 (RUNLENGTH): the §1.5b best-effort ByteRun1
+    // coding decodes through the demuxer to the same RGBA the chunky body
+    // produces. Body = whole-DBOD ByteRun1 of the 2x2 chunky stream above.
+    let reg = registry();
+    let chunky: Vec<u8> = vec![
+        10, 11, 12, 20, 21, 22, // row 0
+        30, 31, 32, 40, 41, 42, // row 1
+    ];
+    // All 12 bytes differ from their neighbours, so a single literal run.
+    let mut body = vec![(chunky.len() as i8 - 1) as u8];
+    body.extend_from_slice(&chunky);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(deep_file(1, body)));
+    let mut dmx = reg
+        .open_demuxer("iff_deep", rs, &oxideav_core::NullCodecResolver)
+        .unwrap();
+    let pkt = dmx.next_packet().unwrap();
+    assert_eq!(pkt.data.len(), 2 * 2 * 4);
+    assert_eq!(&pkt.data[0..4], &[10, 11, 12, 0xFF]);
+    assert_eq!(&pkt.data[12..16], &[40, 41, 42, 0xFF]);
+    assert!(matches!(dmx.next_packet(), Err(oxideav_core::Error::Eof)));
+}
+
 // ─────────────────────────── error surface ─────────────────────────────
 
 #[test]

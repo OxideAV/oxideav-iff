@@ -4552,6 +4552,75 @@ pub fn assemble_deep_chunky(dpel: &Dpel, width: u16, height: u16, body: &[u8]) -
     Ok(rgba)
 }
 
+/// Decode a DEEP **RUNLENGTH** (`DGBL.Compression == 1`) DBOD body into packed
+/// RGBA8888 top-to-bottom (§1.5b).
+///
+/// The canonical DEEP text lists `RUNLENGTH = 1` as a compression code but
+/// publishes no byte-level layout for it; §1.5b records the universal Amiga IFF
+/// convention that `RUNLENGTH` is the **ByteRun1 (PackBits)** scheme — the same
+/// signed-int8 run encoding ILBM `BODY` chunks use — producing the raw
+/// uncompressed chunky pixel stream, which is then assembled exactly as for
+/// `NOCOMPRESSION`.
+///
+/// §1.5b leaves one detail to a fixture probe: whether the RLE is framed
+/// **one stream per scan line** or **one stream across the whole DBOD**. Absent
+/// a DEEP/RUNLENGTH fixture this decoder uses the whole-DBOD framing (the
+/// simpler reading, and the one that does not impose an undocumented per-line
+/// boundary) — it unpacks the entire body to exactly
+/// `width × height × pixel_bytes` bytes and rejects a stream that under- or
+/// over-runs that budget. A caller holding a real per-line-framed file should
+/// treat a length-mismatch rejection as the §1.5b ¶ "fall back … ask for a
+/// fixture" signal.
+pub fn decode_deep_runlength_body(
+    dpel: &Dpel,
+    width: u16,
+    height: u16,
+    body: &[u8],
+) -> Result<Vec<u8>> {
+    let pixel_bytes = dpel.pixel_bytes();
+    if pixel_bytes == 0 {
+        return Err(Error::invalid(
+            "DEEP: DPEL describes a zero-bit pixel (no components)",
+        ));
+    }
+    let total: usize = width as usize * height as usize;
+    let need = total
+        .checked_mul(pixel_bytes)
+        .ok_or_else(|| Error::invalid("DEEP: width * height * pixel_bytes overflows"))?;
+    let mut chunky = Vec::with_capacity(need);
+    let consumed = byterun1_decode_row(body, need, &mut chunky)?;
+    // A well-formed whole-DBOD RUNLENGTH stream unpacks to exactly `need`
+    // bytes and consumes the whole body (modulo a trailing pad byte the chunk
+    // walker already trimmed). Trailing source bytes mean either a mis-framed
+    // (per-line) stream or corruption — reject rather than silently truncate.
+    if consumed != body.len() {
+        return Err(Error::invalid(format!(
+            "DEEP RUNLENGTH: body has {} bytes but only {consumed} were consumed unpacking \
+             {need} chunky bytes (per-line framing or corruption — see §1.5b)",
+            body.len()
+        )));
+    }
+    assemble_deep_chunky(dpel, width, height, &chunky)
+}
+
+/// Encode a packed RGBA8888 image into a DEEP **RUNLENGTH** DBOD body (§1.5b) —
+/// the inverse of [`decode_deep_runlength_body`].
+///
+/// Packs the image into the raw chunky stream ([`encode_deep_chunky`], so every
+/// DPEL component must be 8 bits) then ByteRun1-encodes the whole stream as a
+/// single run, matching the whole-DBOD framing the decoder reads. Output
+/// round-trips through [`decode_deep_runlength_body`] and through [`parse_deep`]
+/// when wrapped in a `FORM DEEP`.
+pub fn encode_deep_runlength_body(
+    dpel: &Dpel,
+    width: u16,
+    height: u16,
+    rgba: &[u8],
+) -> Result<Vec<u8>> {
+    let chunky = encode_deep_chunky(dpel, width, height, rgba)?;
+    Ok(byterun1_encode_row(&chunky))
+}
+
 /// Pack a packed RGBA8888 image into a DEEP **chunky** body (§1.2 + §1.4) —
 /// the inverse of [`assemble_deep_chunky`].
 ///
@@ -4713,7 +4782,9 @@ fn encode_deep_tvdc_body(
 /// Emits DGBL (the §1.1 global header, with the chosen [`DeepCompression`]),
 /// DPEL (the §1.2 pixel layout), and a single DBOD body. With
 /// [`DeepCompression::None`] the body is the raw chunky stream
-/// ([`encode_deep_chunky`]); with [`DeepCompression::Tvdc`] it is the
+/// ([`encode_deep_chunky`]); with [`DeepCompression::RunLength`] it is the
+/// whole-DBOD ByteRun1 stream ([`encode_deep_runlength_body`], the §1.5b
+/// best-effort coding); with [`DeepCompression::Tvdc`] it is the
 /// per-component-line TVDC stream ([`encode_tvdc`]) and `tvdc_table` must be
 /// supplied (the 16-word delta dictionary, which the caller is responsible for
 /// transporting to the decoder — §1.5 stores it "with the file"). Any other
@@ -4730,6 +4801,7 @@ pub fn encode_deep(
 ) -> Result<Vec<u8>> {
     let body = match compression {
         DeepCompression::None => encode_deep_chunky(dpel, width, height, rgba)?,
+        DeepCompression::RunLength => encode_deep_runlength_body(dpel, width, height, rgba)?,
         DeepCompression::Tvdc => {
             let table = tvdc_table.ok_or_else(|| {
                 Error::invalid("DEEP encode: TVDC compression needs a 16-word delta table")
@@ -4808,6 +4880,11 @@ fn scale_to_u8(value: u16, depth: u16) -> u8 {
 // Coverage:
 //   * NOCOMPRESSION (DGBL.Compression == 0): the DBOD is a raw chunky
 //     stream → handed straight to assemble_deep_chunky.
+//   * RUNLENGTH (== 1): the §1.5b best-effort ByteRun1 (PackBits) coding —
+//     the whole DBOD is unpacked to width*height*pixel_bytes and assembled
+//     as for NOCOMPRESSION (decode_deep_runlength_body). §1.5b leaves the
+//     per-line-vs-whole-DBOD framing to a fixture probe; this decoder reads
+//     whole-DBOD framing and rejects a length mismatch.
 //   * TVDC (== 5): the per-component-line decoder (decode_tvdc) is wired
 //     via assemble_deep_tvdc, BUT the 16-word delta table TVDC needs is
 //     "supplied alongside the data / stored with the file" (§1.5) and the
@@ -4815,11 +4892,11 @@ fn scale_to_u8(value: u16, depth: u16) -> u8 {
 //     FORM. parse_deep therefore decodes TVDC only when the caller supplies
 //     the table (assemble_deep_tvdc); the chunk-walking parse_deep returns
 //     an Error for an in-FORM TVDC body, flagging the documented gap.
-//   * RUNLENGTH / HUFFMAN / DYNAMICHUFF / JPEG: wire layout undocumented in
-//     the staged spec → rejected.
+//   * HUFFMAN / DYNAMICHUFF / JPEG: wire layout undocumented in the staged
+//     spec → rejected.
 //
 // Source: docs/image/iff/iff-truecolor-chunks.md §1 (§1.1 DGBL, §1.2 DPEL,
-// §1.3 DLOC, §1.4 DBOD, §1.5 TVDC).
+// §1.3 DLOC, §1.4 DBOD, §1.5 TVDC, §1.5b RUNLENGTH best-effort).
 
 /// A decoded `FORM DEEP` image.
 #[derive(Clone, Debug)]
@@ -4977,6 +5054,7 @@ pub fn parse_deep(bytes: &[u8]) -> Result<DeepImage> {
 
     let rgba = match dgbl.compression {
         DeepCompression::None => assemble_deep_chunky(&dpel, width, height, dbod)?,
+        DeepCompression::RunLength => decode_deep_runlength_body(&dpel, width, height, dbod)?,
         DeepCompression::Tvdc => {
             return Err(Error::invalid(
                 "DEEP: TVDC body cannot be decoded from the FORM alone — the §1.5 16-word \
@@ -6298,8 +6376,97 @@ mod tests {
         assert!(encode_deep(&dpel, 1, 1, DeepCompression::Tvdc, None, &[0, 0, 0, 0xFF]).is_err());
         let dpel4 = Dpel::parse(&deep_dpel(&[(1, 4), (2, 4), (3, 4)])).unwrap();
         assert!(encode_deep(&dpel4, 1, 1, DeepCompression::None, None, &[0, 0, 0, 0xFF]).is_err());
-        // A JPEG/RUNLENGTH method has no documented wire layout to emit.
+        // A JPEG method has no documented wire layout to emit.
         assert!(encode_deep(&dpel, 1, 1, DeepCompression::Jpeg, None, &[0, 0, 0, 0xFF]).is_err());
+    }
+
+    // ───────────────── DEEP RUNLENGTH (§1.5b ByteRun1) ─────────────────
+
+    /// A whole-DBOD ByteRun1 RUNLENGTH body decodes through parse_deep — the
+    /// §1.5b best-effort coding. Body hand-built: a 4x1 RGB888 image with a
+    /// solid run plus a literal tail so both PackBits ops exercise.
+    #[test]
+    fn parse_deep_runlength_byterun1() {
+        // Chunky stream (4 px, RGB888): [7,7,7][7,7,7][7,7,7][9,8,1] = 12 bytes
+        //   = 7 (×9), then 9,8,1.
+        // ByteRun1: replicate 7 nine times → (1-n)=9 ⇒ n=-8 ⇒ 0xF8, then byte 7;
+        //   literal 9,8,1 → n=2 (3 bytes) ⇒ 0x02, 9,8,1.
+        let body = vec![0xF8, 7, 0x02, 9, 8, 1];
+        let file = iff_form(
+            b"DEEP",
+            &[
+                (b"DGBL", deep_dgbl(4, 1, 1)), // compression = 1 = RUNLENGTH
+                (b"DPEL", deep_dpel(&[(1, 8), (2, 8), (3, 8)])),
+                (b"DBOD", body),
+            ],
+        );
+        let img = parse_deep(&file).unwrap();
+        assert_eq!((img.width, img.height), (4, 1));
+        assert_eq!(img.dgbl.compression, DeepCompression::RunLength);
+        assert_eq!(&img.rgba[0..4], &[7, 7, 7, 0xFF]);
+        assert_eq!(&img.rgba[8..12], &[7, 7, 7, 0xFF]);
+        assert_eq!(&img.rgba[12..16], &[9, 8, 1, 0xFF]);
+    }
+
+    /// encode_deep(RunLength) → parse_deep is lossless for an 8-bit image.
+    #[test]
+    fn encode_deep_runlength_round_trips() {
+        let dpel = Dpel::parse(&deep_dpel(&[(1, 8), (2, 8), (3, 8)])).unwrap();
+        // A mix of a flat run and varied pixels so both ByteRun1 ops appear.
+        let rgba = vec![
+            5, 5, 5, 0xFF, 5, 5, 5, 0xFF, 5, 5, 5, 0xFF, 9, 1, 200, 0xFF, 30, 31, 32, 0xFF, 30, 31,
+            32, 0xFF,
+        ];
+        let file = encode_deep(&dpel, 3, 2, DeepCompression::RunLength, None, &rgba).unwrap();
+        let img = parse_deep(&file).unwrap();
+        assert_eq!((img.width, img.height), (3, 2));
+        assert_eq!(img.dgbl.compression, DeepCompression::RunLength);
+        assert_eq!(img.rgba, rgba);
+    }
+
+    /// RGBA (4-component) RUNLENGTH round-trips with the alpha channel intact.
+    #[test]
+    fn encode_deep_runlength_round_trips_rgba() {
+        let dpel = Dpel::parse(&deep_dpel(&[(1, 8), (2, 8), (3, 8), (4, 8)])).unwrap();
+        let rgba = vec![10, 20, 30, 40, 10, 20, 30, 40, 99, 1, 2, 3];
+        let file = encode_deep(&dpel, 3, 1, DeepCompression::RunLength, None, &rgba).unwrap();
+        let img = parse_deep(&file).unwrap();
+        assert_eq!(img.rgba, rgba);
+    }
+
+    /// A RUNLENGTH body that unpacks to fewer bytes than the geometry needs is
+    /// rejected (§1.5b length-mismatch ⇒ ask for a fixture).
+    #[test]
+    fn parse_deep_runlength_short_body_rejected() {
+        // Body unpacks to only 3 bytes but a 4x1 RGB888 image needs 12.
+        let body = vec![0x02, 1, 2, 3]; // literal of 3 bytes
+        let file = iff_form(
+            b"DEEP",
+            &[
+                (b"DGBL", deep_dgbl(4, 1, 1)),
+                (b"DPEL", deep_dpel(&[(1, 8), (2, 8), (3, 8)])),
+                (b"DBOD", body),
+            ],
+        );
+        assert!(parse_deep(&file).is_err());
+    }
+
+    /// A RUNLENGTH body with trailing source bytes (per-line framing / corruption)
+    /// is rejected rather than silently truncated.
+    #[test]
+    fn parse_deep_runlength_trailing_bytes_rejected() {
+        // Unpacks the full 3 bytes for a 1x1 RGB888 (literal of 3), then a stray
+        // extra op byte the whole-DBOD reader won't consume.
+        let body = vec![0x02, 1, 2, 3, 0x00];
+        let file = iff_form(
+            b"DEEP",
+            &[
+                (b"DGBL", deep_dgbl(1, 1, 1)),
+                (b"DPEL", deep_dpel(&[(1, 8), (2, 8), (3, 8)])),
+                (b"DBOD", body),
+            ],
+        );
+        assert!(parse_deep(&file).is_err());
     }
 
     /// encode_tvdc errors cleanly when a needed delta isn't in the table.

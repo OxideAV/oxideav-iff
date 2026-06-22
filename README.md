@@ -778,7 +778,15 @@ short-run count that re-emits the current value; it returns the source
 bytes used (`ceil(nibbles/2)`). [`ilbm::assemble_deep_chunky`] turns a
 decompressed chunky body into packed RGBA8888 top-to-bottom (RED/GREEN/
 BLUE → guns, ALPHA/OPACITY → alpha, each component scaled to 8 bits by
-left-shift + MSB replication). RUNLENGTH / HUFFMAN / DYNAMICHUFF / JPEG
+left-shift + MSB replication). The **RUNLENGTH** body coding
+(`DGBL.Compression == 1`) decodes + encodes via
+[`ilbm::decode_deep_runlength_body`] / [`ilbm::encode_deep_runlength_body`]
+— the §1.5b best-effort ByteRun1 (PackBits) scheme: the whole DBOD is
+unpacked as a single ByteRun1 stream to `width × height × pixel_bytes`
+and then assembled exactly as a NOCOMPRESSION body. §1.5b leaves the
+per-line-vs-whole-DBOD framing to a fixture probe; this decoder uses
+whole-DBOD framing and rejects a length mismatch (the §1.5b
+"fall back … ask for a fixture" signal). HUFFMAN / DYNAMICHUFF / JPEG
 DEEP bodies are **not** yet decoded — the canonical DEEP text does not
 spell out their wire layout. Truncated TVDC sources, run overshoot,
 undersized DGBL/DPEL/DLOC chunks, unknown compression/cType codes, and
@@ -788,8 +796,8 @@ walker: it locates DGBL (mandatory §1.1 global header), DPEL (mandatory
 §1.2 pixel layout), the optional DLOC placement, and the first DBOD, takes
 the DBOD dimensions from the DLOC if present else the DGBL display size
 (§1.3), and assembles a packed top-to-bottom RGBA8888 [`ilbm::DeepImage`].
-NOCOMPRESSION bodies decode in full; TVDC and the other codings are
-rejected here (see the TVDC table gap below). For TVDC,
+NOCOMPRESSION and RUNLENGTH (§1.5b ByteRun1) bodies decode in full; TVDC
+and the remaining codings are rejected here (see the TVDC table gap below). For TVDC,
 [`ilbm::assemble_deep_tvdc`] decodes a per-component-line body (§1.5: one
 TVDC line per DPEL component per row — a Red line, then a Green line, …)
 when the caller supplies the 16-word delta table, mapping RED/GREEN/BLUE →
@@ -818,16 +826,19 @@ and is EOF after one packet. The RGB8 / RGBN demuxers apply
 load-as-a-picture default); callers needing the Turbo-Silver
 zero-colour or brush-transparency genlock semantics use [`ilbm::parse_rgb8`]
 / [`ilbm::parse_rgbn`] directly. The DEEP demuxer decodes the
-NOCOMPRESSION body coding and surfaces the same `parse_deep` error for
-TVDC (no in-FORM delta table) and the other unsupported codings.
+NOCOMPRESSION and RUNLENGTH (§1.5b ByteRun1) body codings and surfaces the
+same `parse_deep` error for TVDC (no in-FORM delta table) and the other
+unsupported codings.
 
 Remaining true-colour frontier: TVDC decode **from a FORM** is blocked —
 §1.5 says the 16-word delta table is "stored with the file/companion
 data" but the canonical DEEP text names no in-FORM chunk that carries it
 (documented gap; `assemble_deep_tvdc` is the caller-supplies-table escape
-hatch). Also pending: DEEP's RUNLENGTH/HUFFMAN/DYNAMICHUFF/JPEG body
-codings (wire layout undocumented) and the TVPP project-file FORM (§2,
-non-canonical RE — needs a real-file fixture).
+hatch). Also pending: DEEP's HUFFMAN/DYNAMICHUFF/JPEG body codings (wire
+layout undocumented) and the TVPP project-file FORM (§2, non-canonical RE
+— needs a real-file fixture). RUNLENGTH is decoded best-effort per §1.5b
+(whole-DBOD ByteRun1; a real per-line-framed fixture would let us pin the
+remaining framing ambiguity).
 
 AIFF-C coverage is saturated: Apple shipped 13 chunk classes (FVER,
 COMM, SSND, MARK, INST, COMT, AESD, APPL, MIDI, SAXL, NAME, AUTH,
