@@ -820,8 +820,8 @@ registry**: [`ilbm::register`] installs the `iff_rgb8` / `iff_rgbn` /
 `.rgb8` / `.rgbn` / `.deep` extension), so a Turbo-Silver RGB8 / RGBN or
 an Amiga-Centre-Scotland DEEP file decodes through the standard
 `ContainerRegistry::probe_input` / `open_demuxer` path exactly like
-`iff_ilbm`. Each demuxer surfaces a single `rawvideo` / `Rgba` keyframe
-and is EOF after one packet. The RGB8 / RGBN demuxers apply
+`iff_ilbm`. The RGB8 / RGBN demuxers surface a single `rawvideo` / `Rgba`
+keyframe and are EOF after one packet, and apply
 [`GenlockPolicy::default`] ("ignore — use the coded RGB", the §3.3
 load-as-a-picture default); callers needing the Turbo-Silver
 zero-colour or brush-transparency genlock semantics use [`ilbm::parse_rgb8`]
@@ -829,6 +829,30 @@ zero-colour or brush-transparency genlock semantics use [`ilbm::parse_rgb8`]
 NOCOMPRESSION and RUNLENGTH (§1.5b ByteRun1) body codings and surfaces the
 same `parse_deep` error for TVDC (no in-FORM delta table) and the other
 unsupported codings.
+
+A FORM DEEP may carry **several DBOD frames** — successive cels of a cel
+animation (§1.4 "several images are stored in one FORM") — with an optional
+DCHG chunk (§1.6) giving the inter-frame timing as a millisecond `LONG`
+FrameRate. [`ilbm::parse_deep_frames`] walks the whole FORM into a
+[`ilbm::DeepMovie`] (DGBL + DPEL + optional [`ilbm::Dchg`] + a
+`Vec<`[`ilbm::DeepFrame`]`>`), decoding **every** DBOD and binding each
+frame's dimensions to the DLOC that immediately precedes it (§1.3 — a DLOC
+binds to the *next* DBOD) else the DGBL display size. `Dchg` parses/writes
+the FrameRate with the two §1.6 sentinels surfaced as
+`Dchg::AS_FAST_AS_POSSIBLE` (`0`) / `Dchg::NOT_AN_ANIMATION` (`-1`) plus
+`is_not_animation` / `delay_millis`; `DeepMovie::is_animation` /
+`frame_delay_millis` fold the frame count + DCHG sentinels into play/pace
+answers, and `DeepMovie::composite_frame` blits a frame's §1.3 DLOC
+sub-rectangle onto a fresh `DGBL.DisplayWidth × DisplayHeight` RGBA canvas at
+the DLOC `(x, y)` offset (clipping off-canvas pixels, zero-filling the rest)
+so a multi-cel DEEP of partial sprites reconstructs onto the display.
+[`ilbm::encode_deep_frames`] is the inverse for the round-trippable body
+codings (`None` / `RunLength`). The `iff_deep` demuxer now emits **one
+`rawvideo` / `Rgba` keyframe per DBOD**: with a DCHG millisecond delay it
+advertises a `1/1000`-second time base, per-frame PTS/duration, and a
+`duration_micros`; a still DEEP (one DBOD, or a `0`/`-1` DCHG sentinel) keeps
+the unit time base. A single-DBOD FORM yields a one-frame movie whose frame
+equals [`ilbm::parse_deep`]'s output.
 
 Remaining true-colour frontier: TVDC decode **from a FORM** is blocked —
 §1.5 says the 16-word delta table is "stored with the file/companion
