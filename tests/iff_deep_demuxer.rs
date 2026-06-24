@@ -149,6 +149,53 @@ fn deep_demuxer_emits_runlength_rgb888() {
     assert!(matches!(dmx.next_packet(), Err(oxideav_core::Error::Eof)));
 }
 
+#[test]
+fn deep_demuxer_plays_every_frame_of_a_cel_anim() {
+    // A FORM DEEP with two DBOD frames + a DCHG 50 ms FrameRate (§1.4 / §1.6):
+    // the demuxer must emit one keyframe packet per DBOD, with per-frame PTS
+    // advancing by the DCHG delay, and EOF only after the last frame.
+    let reg = registry();
+    let f0: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]; // 2x2 RGB888
+    let f1: Vec<u8> = vec![21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32];
+    let mut dchg = vec![0u8; 4];
+    dchg[0..4].copy_from_slice(&50i32.to_be_bytes());
+    let file = iff_form(
+        b"DEEP",
+        &[
+            (b"DGBL", dgbl(2, 2, 0)),
+            (b"DPEL", dpel(&[(1, 8), (2, 8), (3, 8)])),
+            (b"DCHG", dchg),
+            (b"DBOD", f0),
+            (b"DBOD", f1),
+        ],
+    );
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let mut dmx = reg
+        .open_demuxer("iff_deep", rs, &oxideav_core::NullCodecResolver)
+        .unwrap();
+
+    // Stream duration = 2 frames * 50 ms = 100_000 us.
+    assert_eq!(dmx.duration_micros(), Some(100_000));
+    assert_eq!(
+        dmx.streams()[0].time_base,
+        oxideav_core::TimeBase::new(1, 1000)
+    );
+
+    let p0 = dmx.next_packet().unwrap();
+    assert!(p0.flags.keyframe);
+    assert_eq!(p0.pts, Some(0));
+    assert_eq!(p0.duration, Some(50));
+    assert_eq!(&p0.data[0..4], &[1, 2, 3, 0xFF]);
+
+    let p1 = dmx.next_packet().unwrap();
+    assert!(p1.flags.keyframe);
+    assert_eq!(p1.pts, Some(50));
+    assert_eq!(&p1.data[0..4], &[21, 22, 23, 0xFF]);
+
+    assert!(matches!(dmx.next_packet(), Err(oxideav_core::Error::Eof)));
+}
+
 // ─────────────────────────── error surface ─────────────────────────────
 
 #[test]

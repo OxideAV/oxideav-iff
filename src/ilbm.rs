@@ -4422,6 +4422,66 @@ impl Dloc {
     }
 }
 
+/// DEEP change buffer — the optional `DCHG` chunk (§1.6). A single signed LONG
+/// `FrameRate` carrying the inter-frame delay in milliseconds when several
+/// images are stored in one FORM (cel animation). Two sentinel values are
+/// defined by §1.6:
+///
+/// - `FrameRate == 0` → change frames *as fast as possible*;
+/// - `FrameRate == -1` → the stored images are **not** an animation; the value
+///   marks frame boundaries only.
+///
+/// Any other value is a literal millisecond delay between successive frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dchg {
+    /// Milliseconds between frame changes (signed; see the sentinels above).
+    pub frame_rate: i32,
+}
+
+impl Dchg {
+    /// §1.6 sentinel: change frames as fast as possible.
+    pub const AS_FAST_AS_POSSIBLE: i32 = 0;
+    /// §1.6 sentinel: the stored images are not an animation.
+    pub const NOT_AN_ANIMATION: i32 = -1;
+
+    /// Parse a `DCHG` chunk body (4 bytes: one big-endian signed LONG).
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 4 {
+            return Err(Error::invalid(format!(
+                "DEEP DCHG: chunk is {} bytes, need at least 4",
+                body.len()
+            )));
+        }
+        Ok(Dchg {
+            frame_rate: i32::from_be_bytes([body[0], body[1], body[2], body[3]]),
+        })
+    }
+
+    /// Serialise to the 4-byte `DCHG` wire form (one big-endian signed LONG).
+    pub fn write(&self) -> [u8; 4] {
+        self.frame_rate.to_be_bytes()
+    }
+
+    /// True when `FrameRate == -1`: the stored images are not an animation
+    /// (§1.6), only delimited frame boundaries.
+    pub fn is_not_animation(&self) -> bool {
+        self.frame_rate == Self::NOT_AN_ANIMATION
+    }
+
+    /// The inter-frame delay in milliseconds, or `None` for the two §1.6
+    /// sentinels (`0` = as-fast-as-possible, `-1` = not-an-animation), which do
+    /// not denote a literal delay.
+    pub fn delay_millis(&self) -> Option<u32> {
+        match self.frame_rate {
+            Self::AS_FAST_AS_POSSIBLE | Self::NOT_AN_ANIMATION => None,
+            other if other > 0 => Some(other as u32),
+            // A negative value other than -1 is undefined; treat it as "no
+            // literal delay" rather than inventing one.
+            _ => None,
+        }
+    }
+}
+
 /// Decode a TVDC component line (DEEP `Compression == 5`, §1.5).
 ///
 /// TVDC (TecSoft's addendum for TVPaint) is a modified delta compression that
@@ -5052,25 +5112,7 @@ pub fn parse_deep(bytes: &[u8]) -> Result<DeepImage> {
         None => (dgbl.display_width, dgbl.display_height),
     };
 
-    let rgba = match dgbl.compression {
-        DeepCompression::None => assemble_deep_chunky(&dpel, width, height, dbod)?,
-        DeepCompression::RunLength => decode_deep_runlength_body(&dpel, width, height, dbod)?,
-        DeepCompression::Tvdc => {
-            return Err(Error::invalid(
-                "DEEP: TVDC body cannot be decoded from the FORM alone — the §1.5 16-word \
-                 delta table is stored with the file/companion data and the canonical DEEP \
-                 text names no chunk that carries it in-FORM. Use assemble_deep_tvdc with \
-                 the table supplied by the caller.",
-            ));
-        }
-        other => {
-            return Err(Error::invalid(format!(
-                "DEEP: DGBL Compression {} body coding is not decoded (wire layout \
-                 undocumented in the staged spec)",
-                other.to_u16()
-            )));
-        }
-    };
+    let rgba = decode_deep_dbod(dgbl.compression, &dpel, width, height, dbod)?;
 
     Ok(DeepImage {
         dgbl,
@@ -5080,6 +5122,246 @@ pub fn parse_deep(bytes: &[u8]) -> Result<DeepImage> {
         height,
         rgba,
     })
+}
+
+/// Decode a single DEEP `DBOD` body into packed RGBA8888 per the DGBL
+/// compression method. The shared back-end of [`parse_deep`] and
+/// [`parse_deep_frames`].
+///
+/// NOCOMPRESSION (§1.4) and RUNLENGTH (§1.5b best-effort ByteRun1) decode in
+/// full. TVDC (§1.5) is rejected from a FORM because the 16-word delta table is
+/// stored with the file/companion data and the canonical DEEP text names no
+/// in-FORM chunk that carries it (a documented spec gap; use
+/// [`assemble_deep_tvdc`] with the caller-supplied table). HUFFMAN /
+/// DYNAMICHUFF / JPEG are rejected — no documented wire layout.
+fn decode_deep_dbod(
+    compression: DeepCompression,
+    dpel: &Dpel,
+    width: u16,
+    height: u16,
+    dbod: &[u8],
+) -> Result<Vec<u8>> {
+    match compression {
+        DeepCompression::None => assemble_deep_chunky(dpel, width, height, dbod),
+        DeepCompression::RunLength => decode_deep_runlength_body(dpel, width, height, dbod),
+        DeepCompression::Tvdc => Err(Error::invalid(
+            "DEEP: TVDC body cannot be decoded from the FORM alone — the §1.5 16-word \
+             delta table is stored with the file/companion data and the canonical DEEP \
+             text names no chunk that carries it in-FORM. Use assemble_deep_tvdc with \
+             the table supplied by the caller.",
+        )),
+        other => Err(Error::invalid(format!(
+            "DEEP: DGBL Compression {} body coding is not decoded (wire layout \
+             undocumented in the staged spec)",
+            other.to_u16()
+        ))),
+    }
+}
+
+// ───────────────── FORM DEEP — multi-image / cel-anim decode ─────────────────
+//
+// A FORM DEEP may carry several DBOD chunks — successive frames of a cel
+// animation (§1.4 "several images are stored in one FORM"). Each DBOD may be
+// preceded by its own DLOC giving that frame's dimensions (§1.3); absent one,
+// the DGBL display size applies. An optional DCHG chunk (§1.6) gives the
+// inter-frame timing as a millisecond FrameRate (with the `0` =
+// as-fast-as-possible and `-1` = not-an-animation sentinels). `parse_deep`
+// decodes only the first DBOD; `parse_deep_frames` decodes every DBOD into a
+// list of frames so a viewer / demuxer can play the animation.
+//
+// Source: docs/image/iff/iff-truecolor-chunks.md §1.4 (DBOD), §1.3 (DLOC),
+// §1.6 (DCHG).
+
+/// One decoded frame of a multi-image `FORM DEEP` (§1.4).
+#[derive(Clone, Debug)]
+pub struct DeepFrame {
+    /// The DLOC that preceded this frame's DBOD, if any (§1.3).
+    pub dloc: Option<Dloc>,
+    /// Frame width in pixels (DLOC if present, else DGBL display width).
+    pub width: u16,
+    /// Frame height in pixels (DLOC if present, else DGBL display height).
+    pub height: u16,
+    /// Packed RGBA, row-major, top-to-bottom, 4 bytes/pixel.
+    pub rgba: Vec<u8>,
+}
+
+/// A decoded multi-image `FORM DEEP` — the global header, the pixel layout, the
+/// optional cel-anim timing, and every decoded DBOD frame (§1.4 / §1.6).
+#[derive(Clone, Debug)]
+pub struct DeepMovie {
+    /// Parsed DGBL global header (§1.1).
+    pub dgbl: Dgbl,
+    /// Parsed DPEL pixel-element layout (§1.2).
+    pub dpel: Dpel,
+    /// Parsed DCHG cel-anim frame timing, if the FORM carried one (§1.6).
+    pub dchg: Option<Dchg>,
+    /// Every decoded DBOD frame, in document order (§1.4).
+    pub frames: Vec<DeepFrame>,
+}
+
+impl DeepMovie {
+    /// True when the FORM is a genuine animation: more than one frame and the
+    /// DCHG (if any) is not the §1.6 `-1` not-an-animation sentinel.
+    pub fn is_animation(&self) -> bool {
+        self.frames.len() > 1 && !matches!(self.dchg, Some(d) if d.is_not_animation())
+    }
+
+    /// The per-frame delay in milliseconds from the DCHG (§1.6), or `None` when
+    /// there is no DCHG or it carries a sentinel value (`0` / `-1`).
+    pub fn frame_delay_millis(&self) -> Option<u32> {
+        self.dchg.and_then(|d| d.delay_millis())
+    }
+}
+
+/// Walk a complete `FORM DEEP` file into a [`DeepMovie`], decoding **every**
+/// DBOD frame (§1.4) rather than just the first.
+///
+/// Locates the mandatory DGBL (§1.1) and DPEL (§1.2), the optional DCHG
+/// cel-anim timing (§1.6), and every DBOD body. Each DBOD's dimensions come
+/// from the DLOC that immediately precedes it (§1.3) — a DLOC binds to the
+/// *next* DBOD and is consumed by it — else from the DGBL display size. Every
+/// DBOD is decoded per the DGBL compression method (NOCOMPRESSION and the
+/// §1.5b RUNLENGTH best-effort coding today; TVDC / HUFFMAN / DYNAMICHUFF /
+/// JPEG rejected, see [`decode_deep_dbod`]). A FORM with a single DBOD yields a
+/// one-frame movie whose frame equals [`parse_deep`]'s output.
+pub fn parse_deep_frames(bytes: &[u8]) -> Result<DeepMovie> {
+    if bytes.len() < 12 || &bytes[0..4] != b"FORM" {
+        return Err(Error::invalid("DEEP: missing FORM signature"));
+    }
+    if &bytes[8..12] != b"DEEP" {
+        return Err(Error::invalid(format!(
+            "DEEP: outer form type is {:?} (expected DEEP)",
+            std::str::from_utf8(&bytes[8..12]).unwrap_or("????")
+        )));
+    }
+    let total = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let body_end = (8 + total).min(bytes.len());
+
+    let mut dgbl: Option<Dgbl> = None;
+    let mut dpel: Option<Dpel> = None;
+    let mut dchg: Option<Dchg> = None;
+    // The DLOC that most recently preceded an as-yet-unclaimed DBOD; consumed
+    // by the next DBOD seen.
+    let mut pending_dloc: Option<Dloc> = None;
+    // Each frame's (dloc, raw DBOD body slice), captured during the walk.
+    let mut raw_frames: Vec<(Option<Dloc>, &[u8])> = Vec::new();
+
+    let mut cursor = 12usize;
+    while cursor + 8 <= body_end {
+        let id = [
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ];
+        let size = u32::from_be_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]) as usize;
+        let payload_start = cursor + 8;
+        let payload_end = payload_start + size;
+        if payload_end > body_end {
+            return Err(Error::invalid(format!(
+                "DEEP: chunk {:?} extends past FORM",
+                std::str::from_utf8(&id).unwrap_or("????")
+            )));
+        }
+        let payload = &bytes[payload_start..payload_end];
+        match &id {
+            b"DGBL" => dgbl = Some(Dgbl::parse(payload)?),
+            b"DPEL" => dpel = Some(Dpel::parse(payload)?),
+            b"DLOC" => pending_dloc = Some(Dloc::parse(payload)?),
+            b"DCHG" => dchg = Some(Dchg::parse(payload)?),
+            b"DBOD" => raw_frames.push((pending_dloc.take(), payload)),
+            _ => { /* unknown chunks skipped */ }
+        }
+        let padded = size + (size & 1);
+        cursor = payload_start + padded;
+    }
+
+    let dgbl = dgbl.ok_or_else(|| Error::invalid("DEEP: missing DGBL chunk"))?;
+    let dpel = dpel.ok_or_else(|| Error::invalid("DEEP: missing DPEL chunk"))?;
+    if raw_frames.is_empty() {
+        return Err(Error::invalid("DEEP: missing DBOD chunk"));
+    }
+
+    let mut frames = Vec::with_capacity(raw_frames.len());
+    for (dloc, body) in raw_frames {
+        // §1.3: DLOC gives the DBOD's dimensions; absent it, the DGBL size.
+        let (width, height) = match dloc {
+            Some(dl) => (dl.w, dl.h),
+            None => (dgbl.display_width, dgbl.display_height),
+        };
+        let rgba = decode_deep_dbod(dgbl.compression, &dpel, width, height, body)?;
+        frames.push(DeepFrame {
+            dloc,
+            width,
+            height,
+            rgba,
+        });
+    }
+
+    Ok(DeepMovie {
+        dgbl,
+        dpel,
+        dchg,
+        frames,
+    })
+}
+
+/// Build a multi-image `FORM DEEP` (§1.4 / §1.6) from a list of equally-sized
+/// RGBA8888 frames, the inverse of [`parse_deep_frames`] for the body codings
+/// that round-trip ([`DeepCompression::None`] / [`DeepCompression::RunLength`]).
+///
+/// Emits DGBL (§1.1) + DPEL (§1.2) + an optional DCHG (§1.6 timing) followed by
+/// one DBOD per frame. Every frame must be `width × height × 4` bytes (the
+/// frames share one geometry; per-frame DLOC sub-rectangles are a read-side
+/// concern and not emitted here). Every DPEL component must be 8 bits, as for
+/// [`encode_deep`]. A TVDC / HUFFMAN / DYNAMICHUFF / JPEG method is rejected
+/// (no emit-side wire layout). The output round-trips through
+/// [`parse_deep_frames`]; the first frame also round-trips through
+/// [`parse_deep`].
+pub fn encode_deep_frames(
+    dpel: &Dpel,
+    width: u16,
+    height: u16,
+    compression: DeepCompression,
+    dchg: Option<Dchg>,
+    frames: &[&[u8]],
+) -> Result<Vec<u8>> {
+    if frames.is_empty() {
+        return Err(Error::invalid("DEEP encode: need at least one frame"));
+    }
+    let mut chunks = Vec::new();
+    let dgbl = Dgbl {
+        display_width: width,
+        display_height: height,
+        compression,
+        x_aspect: 1,
+        y_aspect: 1,
+    };
+    push_chunk(&mut chunks, b"DGBL", &dgbl.write());
+    push_chunk(&mut chunks, b"DPEL", &dpel.write());
+    if let Some(d) = dchg {
+        push_chunk(&mut chunks, b"DCHG", &d.write());
+    }
+    for rgba in frames {
+        let body = match compression {
+            DeepCompression::None => encode_deep_chunky(dpel, width, height, rgba)?,
+            DeepCompression::RunLength => encode_deep_runlength_body(dpel, width, height, rgba)?,
+            other => {
+                return Err(Error::invalid(format!(
+                    "DEEP encode: Compression {} cannot be emitted in a multi-frame FORM \
+                     (no round-trip wire layout)",
+                    other.to_u16()
+                )))
+            }
+        };
+        push_chunk(&mut chunks, b"DBOD", &body);
+    }
+    Ok(wrap_form(b"DEEP", &chunks))
 }
 
 // ───────────────── FORM DEEP — container registry wiring ─────────────────
@@ -5099,10 +5381,20 @@ fn probe_deep(p: &oxideav_core::ProbeData) -> u8 {
     }
 }
 
-/// Single-frame `FORM DEEP` demuxer.
+/// `FORM DEEP` demuxer. Emits one `rawvideo` / `Rgba` keyframe per DBOD frame
+/// (§1.4): a still DEEP is a one-packet stream, a cel-anim DEEP plays every
+/// frame in document order with per-frame PTS derived from the DCHG timing
+/// (§1.6).
 struct DeepDemuxer {
     streams: Vec<StreamInfo>,
-    rgba: Option<Vec<u8>>,
+    /// Decoded RGBA frames in document order, drained front-to-back.
+    frames: std::collections::VecDeque<Vec<u8>>,
+    /// Next frame's presentation timestamp, in `time_base` units.
+    next_pts: i64,
+    /// Per-frame duration in `time_base` units (1 if no DCHG delay applies).
+    frame_duration: i64,
+    /// Total stream duration in microseconds, if a DCHG delay is known.
+    duration_us: Option<i64>,
 }
 
 impl Demuxer for DeepDemuxer {
@@ -5113,20 +5405,21 @@ impl Demuxer for DeepDemuxer {
         &self.streams
     }
     fn next_packet(&mut self) -> Result<Packet> {
-        let rgba = self.rgba.take().ok_or(Error::Eof)?;
+        let rgba = self.frames.pop_front().ok_or(Error::Eof)?;
         let stream = &self.streams[0];
         let mut pkt = Packet::new(0, stream.time_base, rgba);
-        pkt.pts = Some(0);
-        pkt.dts = Some(0);
-        pkt.duration = Some(1);
+        pkt.pts = Some(self.next_pts);
+        pkt.dts = Some(self.next_pts);
+        pkt.duration = Some(self.frame_duration);
         pkt.flags.keyframe = true;
+        self.next_pts += self.frame_duration;
         Ok(pkt)
     }
     fn metadata(&self) -> &[(String, String)] {
         &[]
     }
     fn duration_micros(&self) -> Option<i64> {
-        None
+        self.duration_us
     }
 }
 
@@ -5135,10 +5428,36 @@ fn open_deep(
     _codecs: &dyn CodecResolver,
 ) -> Result<Box<dyn Demuxer>> {
     let full = read_true_color_form(&mut *input, "DEEP", b"DEEP")?;
-    let image = parse_deep(&full)?;
+    let movie = parse_deep_frames(&full)?;
+    let width = movie.frames[0].width;
+    let height = movie.frames[0].height;
+    let frame_count = movie.frames.len() as i64;
+
+    // §1.6 DCHG FrameRate is a millisecond delay; build a 1/1000-s time base so
+    // each frame's duration is exactly the DCHG value. With no usable delay
+    // (still image, or a `0`/`-1` sentinel) fall back to the unit time base.
+    let (time_base, frame_duration, duration_us) = match movie.frame_delay_millis() {
+        Some(ms) => {
+            let dur = i64::from(ms);
+            let total_us = dur.saturating_mul(frame_count).saturating_mul(1_000);
+            (TimeBase::new(1, 1000), dur, Some(total_us))
+        }
+        None => (TimeBase::new(1, 1), 1, None),
+    };
+
+    let mut stream = true_color_stream(width, height);
+    stream.time_base = time_base;
+    stream.duration = Some(frame_duration.saturating_mul(frame_count));
+
+    let frames: std::collections::VecDeque<Vec<u8>> =
+        movie.frames.into_iter().map(|f| f.rgba).collect();
+
     Ok(Box::new(DeepDemuxer {
-        streams: vec![true_color_stream(image.width, image.height)],
-        rgba: Some(image.rgba),
+        streams: vec![stream],
+        frames,
+        next_pts: 0,
+        frame_duration,
+        duration_us,
     }))
 }
 

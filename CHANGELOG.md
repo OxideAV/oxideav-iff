@@ -24,6 +24,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* **multi-image / cel-anim `FORM DEEP`** decode + encode (§1.4 DBOD,
+  §1.3 DLOC, §1.6 DCHG). A FORM DEEP may carry several DBOD frames — successive
+  cels of an animation; previously `parse_deep` decoded only the first.
+  `ilbm::parse_deep_frames` now walks the whole FORM into a `ilbm::DeepMovie`
+  (DGBL + DPEL + optional DCHG + a `Vec<ilbm::DeepFrame>`), decoding **every**
+  DBOD and binding each frame's dimensions to the DLOC that immediately
+  precedes it (§1.3, consumed by the next DBOD) else the DGBL display size. The
+  new `ilbm::Dchg` chunk (§1.6 `LONG FrameRate`) parses/writes the inter-frame
+  timing with the two documented sentinels surfaced as
+  `Dchg::AS_FAST_AS_POSSIBLE` (`0`) / `Dchg::NOT_AN_ANIMATION` (`-1`) plus
+  `is_not_animation` / `delay_millis` accessors; `DeepMovie::is_animation` /
+  `frame_delay_millis` fold the frame count and the DCHG sentinels into the
+  "should this play?" / "at what pace?" answers. `ilbm::encode_deep_frames` is
+  the inverse for the round-trippable body codings (`None` / `RunLength`),
+  emitting DGBL + DPEL + optional DCHG + one DBOD per frame. The `iff_deep`
+  demuxer now emits **one `rawvideo` / `Rgba` keyframe per DBOD** instead of a
+  single still: with a DCHG millisecond delay it advertises a `1/1000`-second
+  time base, per-frame PTS/duration, and a `duration_micros`; a still DEEP (one
+  DBOD, or a `0`/`-1` DCHG sentinel) keeps the unit time base. A single-DBOD
+  FORM yields a one-frame movie whose frame equals `parse_deep`'s output, so
+  existing single-image callers are unaffected. Source:
+  `docs/image/iff/iff-truecolor-chunks.md` §1.4 / §1.3 / §1.6.
 - *(ilbm)* `FORM DEEP` **RUNLENGTH** (`DGBL.Compression == 1`) body
   decode + encode — the §1.5b best-effort coding. `ilbm::decode_deep_runlength_body`
   unpacks the whole DBOD as a single ByteRun1 (PackBits) stream to
