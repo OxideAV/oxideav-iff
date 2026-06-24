@@ -5418,11 +5418,13 @@ pub fn encode_deep_frames(
 // ───────────────── FORM DEEP — container registry wiring ─────────────────
 //
 // `iff_deep` demuxer: a `FORM DEEP` chunky deep-raster file decodes through
-// the standard `ContainerRegistry::open_*` path, surfacing the first DBOD as
-// a single `rawvideo` / `Rgba` keyframe. Only the body codings `parse_deep`
-// decodes (NOCOMPRESSION today) succeed; TVDC and the other DGBL.Compression
-// methods return the same `Error::invalid` `parse_deep` raises (see its doc
-// for the §1.5 delta-table gap). Source: iff-truecolor-chunks.md §1.
+// the standard `ContainerRegistry::open_*` path, surfacing **one** `rawvideo` /
+// `Rgba` keyframe per DBOD frame (§1.4) — a still DEEP is one packet, a cel-anim
+// DEEP plays every DBOD with per-frame PTS from the DCHG timing (§1.6). Only the
+// body codings `parse_deep_frames` decodes (NOCOMPRESSION + §1.5b RUNLENGTH)
+// succeed; TVDC and the other DGBL.Compression methods return the same
+// `Error::invalid` `parse_deep_frames` raises (see its doc for the §1.5
+// delta-table gap). Source: iff-truecolor-chunks.md §1.
 
 fn probe_deep(p: &oxideav_core::ProbeData) -> u8 {
     if p.buf.len() >= 12 && &p.buf[0..4] == b"FORM" && &p.buf[8..12] == b"DEEP" {
