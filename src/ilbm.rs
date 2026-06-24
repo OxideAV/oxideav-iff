@@ -5211,6 +5211,57 @@ impl DeepMovie {
     pub fn frame_delay_millis(&self) -> Option<u32> {
         self.dchg.and_then(|d| d.delay_millis())
     }
+
+    /// The display-canvas size (`DGBL.DisplayWidth × DisplayHeight`, §1.1) onto
+    /// which a frame's DLOC sub-rectangle is placed by [`composite_frame`].
+    pub fn display_size(&self) -> (u16, u16) {
+        (self.dgbl.display_width, self.dgbl.display_height)
+    }
+
+    /// Composite frame `index` onto a fresh DGBL-display-sized RGBA canvas at
+    /// the §1.3 DLOC `(x, y)` pixel position.
+    ///
+    /// §1.3 says the DLOC `x` / `y` give "the pixel position of this image" on
+    /// the display the DGBL describes — so a multi-cel DEEP whose DBODs are
+    /// partial sprites narrower than the display is reconstructed by blitting
+    /// each frame's sub-rectangle into the right spot. The canvas is
+    /// `display_width × display_height` (§1.1), zero-initialised (transparent
+    /// black: RGBA `00 00 00 00`); pixels of the frame that fall outside the
+    /// canvas (negative offset, or running past an edge) are clipped. A frame
+    /// with no DLOC is treated as placed at the origin and is expected to cover
+    /// the whole display.
+    ///
+    /// Returns `None` if `index` is out of range. The returned buffer is
+    /// `display_width × display_height × 4` bytes, row-major top-to-bottom.
+    pub fn composite_frame(&self, index: usize) -> Option<Vec<u8>> {
+        let frame = self.frames.get(index)?;
+        let cw = self.dgbl.display_width as i32;
+        let ch = self.dgbl.display_height as i32;
+        let mut canvas = vec![0u8; (cw as usize) * (ch as usize) * 4];
+
+        let (ox, oy) = match frame.dloc {
+            Some(dl) => (i32::from(dl.x), i32::from(dl.y)),
+            None => (0, 0),
+        };
+        let fw = frame.width as i32;
+        let fh = frame.height as i32;
+        for fy in 0..fh {
+            let dy = oy + fy;
+            if dy < 0 || dy >= ch {
+                continue;
+            }
+            for fx in 0..fw {
+                let dx = ox + fx;
+                if dx < 0 || dx >= cw {
+                    continue;
+                }
+                let src = ((fy * fw + fx) * 4) as usize;
+                let dst = ((dy * cw + dx) * 4) as usize;
+                canvas[dst..dst + 4].copy_from_slice(&frame.rgba[src..src + 4]);
+            }
+        }
+        Some(canvas)
+    }
 }
 
 /// Walk a complete `FORM DEEP` file into a [`DeepMovie`], decoding **every**

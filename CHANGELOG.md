@@ -44,7 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time base, per-frame PTS/duration, and a `duration_micros`; a still DEEP (one
   DBOD, or a `0`/`-1` DCHG sentinel) keeps the unit time base. A single-DBOD
   FORM yields a one-frame movie whose frame equals `parse_deep`'s output, so
-  existing single-image callers are unaffected. Source:
+  existing single-image callers are unaffected. `DeepMovie::composite_frame`
+  blits a frame's §1.3 DLOC sub-rectangle onto a fresh
+  `DGBL.DisplayWidth × DisplayHeight` RGBA canvas at the DLOC `(x, y)` pixel
+  position (the §1.3 "pixel position of this image" placement), clipping pixels
+  that fall outside the canvas (negative offset or running past an edge) and
+  zero-filling (transparent black) the untouched area — reconstructing a
+  multi-cel DEEP whose DBODs are partial sprites narrower than the display;
+  `DeepMovie::display_size` surfaces the canvas geometry. Source:
   `docs/image/iff/iff-truecolor-chunks.md` §1.4 / §1.3 / §1.6.
 - *(ilbm)* `FORM DEEP` **RUNLENGTH** (`DGBL.Compression == 1`) body
   decode + encode — the §1.5b best-effort coding. `ilbm::decode_deep_runlength_body`

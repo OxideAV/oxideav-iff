@@ -259,3 +259,177 @@ fn tvdc_multiframe_encode_rejected() {
     let f0 = solid(1, 1, [1, 2, 3, 255]);
     assert!(encode_deep_frames(&dpel, 1, 1, DeepCompression::Tvdc, None, &[&f0]).is_err());
 }
+
+/// Hand-build a FORM DEEP with a given display size and a list of
+/// `(Option<Dloc>, chunky_body)` frames for the composite tests.
+fn deep_with_frames(
+    dgbl_w: u16,
+    dgbl_h: u16,
+    dpel: &Dpel,
+    frames: &[(Option<Dloc>, Vec<u8>)],
+) -> Vec<u8> {
+    fn push_chunk(out: &mut Vec<u8>, id: &[u8; 4], body: &[u8]) {
+        out.extend_from_slice(id);
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(body);
+        if body.len() & 1 == 1 {
+            out.push(0);
+        }
+    }
+    let mut dgbl_body = Vec::new();
+    dgbl_body.extend_from_slice(&dgbl_w.to_be_bytes());
+    dgbl_body.extend_from_slice(&dgbl_h.to_be_bytes());
+    dgbl_body.extend_from_slice(&0u16.to_be_bytes()); // NOCOMPRESSION
+    dgbl_body.push(1);
+    dgbl_body.push(1);
+
+    let mut chunks = Vec::new();
+    push_chunk(&mut chunks, b"DGBL", &dgbl_body);
+    push_chunk(&mut chunks, b"DPEL", &dpel.write());
+    for (dloc, body) in frames {
+        if let Some(dl) = dloc {
+            push_chunk(&mut chunks, b"DLOC", &dl.write());
+        }
+        push_chunk(&mut chunks, b"DBOD", body);
+    }
+
+    let mut form = Vec::new();
+    form.extend_from_slice(b"FORM");
+    form.extend_from_slice(&((4 + chunks.len()) as u32).to_be_bytes());
+    form.extend_from_slice(b"DEEP");
+    form.extend_from_slice(&chunks);
+    form
+}
+
+#[test]
+fn composite_places_sub_rectangle_at_dloc_offset() {
+    // 4x4 display; a single 2x2 red sprite placed at (1,1). Everything else
+    // stays transparent black.
+    let dpel = rgb888_dpel();
+    // 2x2 chunky RGB888 = 4 pixels * 3 bytes.
+    let sprite: Vec<u8> = vec![
+        255, 0, 0, 255, 0, 0, // row 0: two red pixels
+        255, 0, 0, 255, 0, 0, // row 1
+    ];
+    let bytes = deep_with_frames(
+        4,
+        4,
+        &dpel,
+        &[(
+            Some(Dloc {
+                w: 2,
+                h: 2,
+                x: 1,
+                y: 1,
+            }),
+            sprite,
+        )],
+    );
+    let movie = parse_deep_frames(&bytes).unwrap();
+    assert_eq!(movie.display_size(), (4, 4));
+
+    let canvas = movie.composite_frame(0).unwrap();
+    assert_eq!(canvas.len(), 4 * 4 * 4);
+
+    // Helper: pixel at (x,y) on the 4-wide canvas.
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let o = (y * 4 + x) * 4;
+        [canvas[o], canvas[o + 1], canvas[o + 2], canvas[o + 3]]
+    };
+    // (0,0) untouched → transparent black.
+    assert_eq!(px(0, 0), [0, 0, 0, 0]);
+    // The red 2x2 block lands at (1,1)..(2,2).
+    assert_eq!(px(1, 1), [255, 0, 0, 255]);
+    assert_eq!(px(2, 1), [255, 0, 0, 255]);
+    assert_eq!(px(1, 2), [255, 0, 0, 255]);
+    assert_eq!(px(2, 2), [255, 0, 0, 255]);
+    // (3,3) outside the sprite → still transparent.
+    assert_eq!(px(3, 3), [0, 0, 0, 0]);
+}
+
+#[test]
+fn composite_clips_frame_that_overruns_canvas() {
+    // A 3x3 sprite placed at (2,2) on a 4x4 canvas: only the top-left 2x2
+    // corner of the sprite is on-canvas; the rest is clipped, no panic.
+    let dpel = rgb888_dpel();
+    let mut sprite = Vec::new();
+    for _ in 0..9 {
+        sprite.extend_from_slice(&[9, 8, 7]); // 3x3 chunky RGB888
+    }
+    let bytes = deep_with_frames(
+        4,
+        4,
+        &dpel,
+        &[(
+            Some(Dloc {
+                w: 3,
+                h: 3,
+                x: 2,
+                y: 2,
+            }),
+            sprite,
+        )],
+    );
+    let movie = parse_deep_frames(&bytes).unwrap();
+    let canvas = movie.composite_frame(0).unwrap();
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let o = (y * 4 + x) * 4;
+        [canvas[o], canvas[o + 1], canvas[o + 2], canvas[o + 3]]
+    };
+    assert_eq!(px(2, 2), [9, 8, 7, 255]);
+    assert_eq!(px(3, 3), [9, 8, 7, 255]);
+    // (1,1) is left of the sprite → transparent.
+    assert_eq!(px(1, 1), [0, 0, 0, 0]);
+}
+
+#[test]
+fn composite_negative_offset_clips_top_left() {
+    // A 2x2 sprite at (-1,-1): only its bottom-right pixel is visible at (0,0).
+    let dpel = rgb888_dpel();
+    let sprite: Vec<u8> = vec![
+        1, 1, 1, 2, 2, 2, // row 0
+        3, 3, 3, 4, 4, 4, // row 1
+    ];
+    let bytes = deep_with_frames(
+        2,
+        2,
+        &dpel,
+        &[(
+            Some(Dloc {
+                w: 2,
+                h: 2,
+                x: -1,
+                y: -1,
+            }),
+            sprite,
+        )],
+    );
+    let movie = parse_deep_frames(&bytes).unwrap();
+    let canvas = movie.composite_frame(0).unwrap();
+    // Sprite pixel (1,1) = (4,4,4) lands on canvas (0,0).
+    assert_eq!(&canvas[0..4], &[4, 4, 4, 255]);
+    // (1,0) and (0,1) get sprite (1,1)'s row/col neighbours? No: sprite (1,0)
+    // would map to canvas (0,-1) off-canvas. Canvas (1,0) untouched.
+    assert_eq!(&canvas[4..8], &[0, 0, 0, 0]);
+}
+
+#[test]
+fn composite_out_of_range_index_is_none() {
+    let dpel = rgb888_dpel();
+    let f0 = solid(2, 2, [1, 2, 3, 255]);
+    let bytes = encode_deep_frames(&dpel, 2, 2, DeepCompression::None, None, &[&f0]).unwrap();
+    let movie = parse_deep_frames(&bytes).unwrap();
+    assert!(movie.composite_frame(0).is_some());
+    assert!(movie.composite_frame(1).is_none());
+}
+
+#[test]
+fn composite_no_dloc_frame_covers_display_at_origin() {
+    // A full-display frame with no DLOC composites 1:1 onto the canvas.
+    let dpel = rgb888_dpel();
+    let f0 = solid(2, 2, [7, 7, 7, 255]);
+    let bytes = encode_deep_frames(&dpel, 2, 2, DeepCompression::None, None, &[&f0]).unwrap();
+    let movie = parse_deep_frames(&bytes).unwrap();
+    let canvas = movie.composite_frame(0).unwrap();
+    assert_eq!(canvas, f0);
+}
