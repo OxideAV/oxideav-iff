@@ -49,7 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   looping player still advances), `start_micros` / `duration_micros`
   helpers, plus `total_jiffies` / `total_micros` and `frame_at_jiffies` /
   `frame_at_micros` scrubbers that map a wall-clock offset to the frame
-  on screen (clamping past-the-end to the final frame). The
+  on screen (clamping past-the-end to the final frame), plus
+  `frame_at_jiffies_looping` / `frame_at_micros_looping` that wrap the
+  offset modulo the total length for endless playback. The
   `iff_anim` demuxer now emits packet `pts` / `dts` / `duration` from
   this timeline instead of a flat one-tick-per-frame, and
   `duration_micros()` reports the real animation length. A new

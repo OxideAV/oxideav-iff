@@ -238,3 +238,33 @@ fn single_frame_playback_has_unit_duration() {
     assert_eq!(pb.frame_at_jiffies(0), Some(0));
     assert_eq!(pb.frame_at_jiffies(100), Some(0));
 }
+
+#[test]
+fn looping_lookup_wraps_modulo_total() {
+    let frames = three_frames();
+    let timing = vec![
+        FrameTiming::default(),
+        FrameTiming {
+            rel_time: 10,
+            abs_time: 0,
+        },
+        FrameTiming {
+            rel_time: 25,
+            abs_time: 0,
+        },
+    ];
+    let bytes = encode_anim_op0_timed(&frames, &timing).unwrap();
+    let pb = parse_anim(&bytes).unwrap().playback();
+    // Total = 60 jiffies. A single playthrough clamps past-the-end to the
+    // last frame; the looping lookup instead wraps back to the start.
+    assert_eq!(pb.total_jiffies(), 60);
+    assert_eq!(pb.frame_at_jiffies(60), Some(2)); // clamped (single)
+    assert_eq!(pb.frame_at_jiffies_looping(60), Some(0)); // wrapped (loop)
+    assert_eq!(pb.frame_at_jiffies_looping(70), Some(1)); // 70 % 60 = 10 -> f1
+    assert_eq!(pb.frame_at_jiffies_looping(95), Some(2)); // 95 % 60 = 35 -> f2
+    assert_eq!(pb.frame_at_jiffies_looping(120), Some(0)); // 120 % 60 = 0 -> f0
+                                                           // Micros loop mirror: 60 jiffies = 1 s; t = 1.0 s wraps to frame 0.
+    assert_eq!(pb.frame_at_micros_looping(1_000_000), Some(0));
+    // 1.2 s = 72 jiffies; 72 % 60 = 12 jiffies into the loop -> frame 1.
+    assert_eq!(pb.frame_at_micros_looping(1_200_000), Some(1));
+}

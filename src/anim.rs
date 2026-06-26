@@ -396,6 +396,28 @@ impl AnimPlayback {
         // jiffies = micros * 60 / 1_000_000, floored.
         self.frame_at_jiffies(micros * 60 / 1_000_000)
     }
+
+    /// The frame index on screen at `jiffies` from the start of a
+    /// **looping** playthrough: the offset is taken modulo the total
+    /// animation length so the timeline wraps endlessly. Returns `None`
+    /// for an empty timeline (and falls back to [`Self::frame_at_jiffies`]
+    /// when the total length is zero, which can't happen for a non-empty
+    /// timeline since the last frame's duration is floored to 1).
+    pub fn frame_at_jiffies_looping(&self, jiffies: u64) -> Option<usize> {
+        if self.frames.is_empty() {
+            return None;
+        }
+        let total = self.total_jiffies();
+        if total == 0 {
+            return self.frame_at_jiffies(jiffies);
+        }
+        self.frame_at_jiffies(jiffies % total)
+    }
+
+    /// Looping counterpart of [`Self::frame_at_micros`].
+    pub fn frame_at_micros_looping(&self, micros: u64) -> Option<usize> {
+        self.frame_at_jiffies_looping(micros * 60 / 1_000_000)
+    }
 }
 
 impl AnimImage {
