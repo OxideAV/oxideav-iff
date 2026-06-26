@@ -788,7 +788,16 @@ short-run count that re-emits the current value; it returns the source
 bytes used (`ceil(nibbles/2)`). [`ilbm::assemble_deep_chunky`] turns a
 decompressed chunky body into packed RGBA8888 top-to-bottom (RED/GREEN/
 BLUE → guns, ALPHA/OPACITY → alpha, each component scaled to 8 bits by
-left-shift + MSB replication). The **RUNLENGTH** body coding
+left-shift + MSB replication). For the components an RGBA collapse drops
+(ZBUFFER, MASK, LINEARKEY / BINARYKEY, BLACK, …),
+[`ilbm::extract_deep_channel`] pulls any one named component out of an
+uncompressed chunky body into a row-major `Vec<u8>` plane (same 8-bit
+scaling), returning `Ok(None)` when the layout lacks it — so a caller can
+reach a Z-buffer or mask channel without us inventing rendering semantics
+for it. The `Dpel` accessors `has_component` / `bit_depth_of` /
+`bit_offset_of` / `has_alpha` describe the layout (`has_alpha` is true
+only for the well-defined ALPHA / OPACITY components, not the key
+channels). The **RUNLENGTH** body coding
 (`DGBL.Compression == 1`) decodes + encodes via
 [`ilbm::decode_deep_runlength_body`] / [`ilbm::encode_deep_runlength_body`]
 — the §1.5b best-effort ByteRun1 (PackBits) scheme: the whole DBOD is

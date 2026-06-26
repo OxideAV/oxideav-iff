@@ -4359,6 +4359,46 @@ impl Dpel {
         self.elements.iter().map(|e| u32::from(e.c_bit_depth)).sum()
     }
 
+    /// `true` when a component of type `c_type` is present in this pixel
+    /// layout (§1.2).
+    pub fn has_component(&self, c_type: DeepCType) -> bool {
+        self.elements.iter().any(|e| e.c_type == c_type)
+    }
+
+    /// Bit depth of the first component of type `c_type`, or `None` if the
+    /// layout has no such component.
+    pub fn bit_depth_of(&self, c_type: DeepCType) -> Option<u16> {
+        self.elements
+            .iter()
+            .find(|e| e.c_type == c_type)
+            .map(|e| e.c_bit_depth)
+    }
+
+    /// Starting bit offset (MSB-first, within the pixel) of the first
+    /// component of type `c_type`, or `None` if absent. Components are laid
+    /// out in storage order, most-significant-bit first (§1.2).
+    pub fn bit_offset_of(&self, c_type: DeepCType) -> Option<u32> {
+        let mut cursor = 0u32;
+        for e in &self.elements {
+            if e.c_type == c_type {
+                return Some(cursor);
+            }
+            cursor += u32::from(e.c_bit_depth);
+        }
+        None
+    }
+
+    /// `true` when this layout carries a transparency-bearing component —
+    /// ALPHA or OPACITY, the two component types the canonical DEEP text
+    /// gives an unambiguous "how opaque is this pixel" reading. MASK /
+    /// LINEARKEY / BINARYKEY are *key* channels whose byte-level rendering
+    /// semantics the staged DEEP reference does not pin down, so they are
+    /// deliberately excluded here (use [`Dpel::has_component`] +
+    /// [`extract_deep_channel`] to read them raw).
+    pub fn has_alpha(&self) -> bool {
+        self.has_component(DeepCType::Alpha) || self.has_component(DeepCType::Opacity)
+    }
+
     /// Bytes occupied by one pixel: the summed component bits rounded up to a
     /// byte boundary (§1.2 "the whole pixel is padded up to a byte boundary").
     pub fn pixel_bytes(&self) -> usize {
@@ -4610,6 +4650,60 @@ pub fn assemble_deep_chunky(dpel: &Dpel, width: u16, height: u16, body: &[u8]) -
         rgba[dst + 3] = a;
     }
     Ok(rgba)
+}
+
+/// Extract a **single named component** from an *uncompressed* (chunky,
+/// `NOCOMPRESSION`-layout) DEEP DBOD body into a row-major, top-to-bottom
+/// `Vec<u8>` plane of `width × height` samples (§1.2 / §1.4).
+///
+/// Each pixel's components sit consecutively, MSB-first, padded up to a
+/// byte boundary; this reads the requested component out of every pixel
+/// and scales it to 8 bits (`scale_to_u8`, the same bit replication
+/// [`assemble_deep_chunky`] applies to the RGB guns). This is the way to
+/// reach channels that an RGBA collapse drops — `ZBUFFER`, `MASK`,
+/// `LINEARKEY` / `BINARYKEY`, `BLACK`, etc. — without inventing a
+/// rendering meaning for them: the caller gets the raw scaled samples and
+/// decides what to do with them.
+///
+/// Returns `Ok(None)` when the layout has no component of type `c_type`.
+/// `body` must already be uncompressed (decode RLE / TVDC first); it is
+/// indexed exactly as [`assemble_deep_chunky`] indexes it.
+pub fn extract_deep_channel(
+    dpel: &Dpel,
+    width: u16,
+    height: u16,
+    body: &[u8],
+    c_type: DeepCType,
+) -> Result<Option<Vec<u8>>> {
+    let Some(bit_off) = dpel.bit_offset_of(c_type) else {
+        return Ok(None);
+    };
+    let depth = dpel
+        .bit_depth_of(c_type)
+        .expect("bit_offset_of returned Some so the component exists");
+    let pixel_bytes = dpel.pixel_bytes();
+    if pixel_bytes == 0 {
+        return Err(Error::invalid(
+            "DEEP: DPEL describes a zero-bit pixel (no components)",
+        ));
+    }
+    let total: usize = width as usize * height as usize;
+    let need = total
+        .checked_mul(pixel_bytes)
+        .ok_or_else(|| Error::invalid("DEEP: width * height * pixel_bytes overflows"))?;
+    if body.len() < need {
+        return Err(Error::invalid(format!(
+            "DEEP: chunky body is {} bytes, need {need} ({width}x{height} @ {pixel_bytes} B/pixel)",
+            body.len()
+        )));
+    }
+    let mut out = vec![0u8; total];
+    for (p, slot) in out.iter_mut().enumerate() {
+        let pixel = &body[p * pixel_bytes..p * pixel_bytes + pixel_bytes];
+        let raw = read_bits_msb(pixel, bit_off, depth);
+        *slot = scale_to_u8(raw, depth);
+    }
+    Ok(Some(out))
 }
 
 /// Decode a DEEP **RUNLENGTH** (`DGBL.Compression == 1`) DBOD body into packed

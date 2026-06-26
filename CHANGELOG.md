@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* **DEEP per-component channel extraction + `Dpel` layout
+  queries** (§1.2). `ilbm::extract_deep_channel(dpel, w, h, chunky_body,
+  c_type)` pulls any one named component out of an *uncompressed* chunky
+  DBOD body into a row-major `Vec<u8>` plane (scaled to 8 bits, the same
+  bit replication `assemble_deep_chunky` applies to the RGB guns),
+  returning `Ok(None)` when the layout lacks that component. This reaches
+  channels an RGBA collapse drops — `ZBUFFER`, `MASK`, `LINEARKEY` /
+  `BINARYKEY`, `BLACK`, etc. — without inventing a rendering meaning for
+  them. New `Dpel` accessors describe the layout: `has_component`,
+  `bit_depth_of`, `bit_offset_of` (MSB-first storage offset), and
+  `has_alpha` (true only for the well-defined ALPHA / OPACITY transparency
+  components, deliberately *not* the key channels).
 - *(anim)* **per-frame timing + an `AnimPlayback` cumulative-timeline
   driver** (§2.1 ANHD `abstime` / `reltime`). `parse_anim` now lifts each
   frame's `reltime` (jiffy = 1/60 s delay after the previous frame) and
