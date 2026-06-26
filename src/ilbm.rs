@@ -78,6 +78,13 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_demuxer("iff_deep", open_deep);
     reg.register_extension("deep", "iff_deep");
     reg.register_probe("iff_deep", probe_deep);
+
+    // TVPaint project FORM (best-effort, non-canonical; §2). Reuses the DEEP
+    // raster vocabulary; each DBOD layer is surfaced as one keyframe and the
+    // TVPP-specific MIXR/BGP1/BGP2 chunks are decoded raw (not via the demuxer).
+    reg.register_demuxer("iff_tvpp", open_tvpp);
+    reg.register_extension("tvpp", "iff_tvpp");
+    reg.register_probe("iff_tvpp", probe_tvpp);
 }
 
 fn probe(p: &oxideav_core::ProbeData) -> u8 {
@@ -5456,6 +5463,163 @@ pub fn parse_deep_frames(bytes: &[u8]) -> Result<DeepMovie> {
     })
 }
 
+// ───────────────── FORM TVPP — TVPaint project files (best-effort) ─────────────────
+//
+// TVPP is the on-disk FORM for TVPaint project files (§2 of the truecolor
+// doc). It has **no published canonical specification**; the staged notes are
+// community reverse-engineering and explicitly flagged non-canonical. What is
+// documented: TVPP is "largely the same container as FORM DEEP, with
+// extensions" — it reuses the DEEP chunk vocabulary (DGBL / DPEL / DLOC / DBOD
+// / DCHG, plus TVDC body coding) for its raster layers, and adds three
+// TVPP-specific chunks (MIXR, BGP1, BGP2) whose semantics are only partly
+// understood. Multiple DBOD chunks correspond to multiple *layers*.
+//
+// `parse_tvpp` therefore decodes the DEEP-vocabulary part (the well-specified
+// half) exactly as `parse_deep_frames` does — every DBOD becomes a decoded
+// layer — and surfaces the MIXR / BGP1 / BGP2 chunks as **raw, uninterpreted
+// byte payloads**. It deliberately does NOT assign meaning to those chunks
+// (the staged reference does not pin their byte layout), so a caller gets the
+// decoded raster plus the raw extra chunks to interpret as it sees fit.
+
+/// A TVPP-specific extension chunk surfaced raw by [`parse_tvpp`].
+///
+/// The community RE notes (`iff-truecolor-chunks.md` §2) suggest `MIXR`
+/// carries layer-mix / compositing info and `BGP1` / `BGP2` hold RGB colours
+/// (a background pair), but the byte layout is not pinned down, so the payload
+/// is preserved verbatim rather than parsed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TvppExtraChunk {
+    /// The 4-byte chunk id (`MIXR`, `BGP1`, or `BGP2`).
+    pub id: [u8; 4],
+    /// The raw chunk payload, exactly as stored on disk.
+    pub data: Vec<u8>,
+}
+
+/// A decoded `FORM TVPP` (TVPaint project) — **best-effort, non-canonical**.
+///
+/// The DEEP-vocabulary raster (`DGBL` / `DPEL` / `DLOC` / `DBOD` / `DCHG`) is
+/// decoded into `layers` (each `DBOD` is one layer per the §2 RE note); the
+/// TVPP-specific `MIXR` / `BGP1` / `BGP2` chunks are surfaced raw in
+/// `extra_chunks` in document order. See [`parse_tvpp`].
+#[derive(Clone, Debug)]
+pub struct TvppImage {
+    /// Parsed DGBL global header (§1.1, shared with DEEP).
+    pub dgbl: Dgbl,
+    /// Parsed DPEL pixel-element layout (§1.2, shared with DEEP).
+    pub dpel: Dpel,
+    /// Optional DCHG cel-anim timing (§1.6, shared with DEEP).
+    pub dchg: Option<Dchg>,
+    /// One decoded raster per `DBOD` chunk — a TVPaint **layer** (§2).
+    pub layers: Vec<DeepFrame>,
+    /// The TVPP-specific `MIXR` / `BGP1` / `BGP2` chunks, raw and in
+    /// document order. Empty for a TVPP file that carries none.
+    pub extra_chunks: Vec<TvppExtraChunk>,
+}
+
+/// Walk a complete `FORM TVPP` file into a [`TvppImage`] — **best-effort,
+/// non-canonical** (§2 of `iff-truecolor-chunks.md`).
+///
+/// TVPP reuses the DEEP chunk vocabulary for its raster, so the DGBL / DPEL /
+/// DLOC / DBOD / DCHG handling is identical to [`parse_deep_frames`]: every
+/// `DBOD` is decoded (per the DGBL compression method — NOCOMPRESSION and the
+/// §1.5b RUNLENGTH best-effort coding; TVDC / HUFFMAN / DYNAMICHUFF / JPEG
+/// rejected, see [`decode_deep_dbod`]) into one layer, each bound to its
+/// preceding DLOC's dimensions (§1.3) else the DGBL display size. The
+/// TVPP-specific `MIXR` / `BGP1` / `BGP2` chunks are captured **raw** (their
+/// byte layout is not pinned down by any canonical reference); unknown chunks
+/// are skipped.
+///
+/// Returns `Error::invalid` for a wrong outer FORM type, a missing
+/// DGBL / DPEL / DBOD, or a chunk that runs past the FORM.
+pub fn parse_tvpp(bytes: &[u8]) -> Result<TvppImage> {
+    if bytes.len() < 12 || &bytes[0..4] != b"FORM" {
+        return Err(Error::invalid("TVPP: missing FORM signature"));
+    }
+    if &bytes[8..12] != b"TVPP" {
+        return Err(Error::invalid(format!(
+            "TVPP: outer form type is {:?} (expected TVPP)",
+            std::str::from_utf8(&bytes[8..12]).unwrap_or("????")
+        )));
+    }
+    let total = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let body_end = (8 + total).min(bytes.len());
+
+    let mut dgbl: Option<Dgbl> = None;
+    let mut dpel: Option<Dpel> = None;
+    let mut dchg: Option<Dchg> = None;
+    let mut pending_dloc: Option<Dloc> = None;
+    let mut raw_layers: Vec<(Option<Dloc>, &[u8])> = Vec::new();
+    let mut extra_chunks: Vec<TvppExtraChunk> = Vec::new();
+
+    let mut cursor = 12usize;
+    while cursor + 8 <= body_end {
+        let id = [
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ];
+        let size = u32::from_be_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]) as usize;
+        let payload_start = cursor + 8;
+        let payload_end = payload_start + size;
+        if payload_end > body_end {
+            return Err(Error::invalid(format!(
+                "TVPP: chunk {:?} extends past FORM",
+                std::str::from_utf8(&id).unwrap_or("????")
+            )));
+        }
+        let payload = &bytes[payload_start..payload_end];
+        match &id {
+            b"DGBL" => dgbl = Some(Dgbl::parse(payload)?),
+            b"DPEL" => dpel = Some(Dpel::parse(payload)?),
+            b"DLOC" => pending_dloc = Some(Dloc::parse(payload)?),
+            b"DCHG" => dchg = Some(Dchg::parse(payload)?),
+            b"DBOD" => raw_layers.push((pending_dloc.take(), payload)),
+            b"MIXR" | b"BGP1" | b"BGP2" => extra_chunks.push(TvppExtraChunk {
+                id,
+                data: payload.to_vec(),
+            }),
+            _ => { /* unknown chunks skipped */ }
+        }
+        let padded = size + (size & 1);
+        cursor = payload_start + padded;
+    }
+
+    let dgbl = dgbl.ok_or_else(|| Error::invalid("TVPP: missing DGBL chunk"))?;
+    let dpel = dpel.ok_or_else(|| Error::invalid("TVPP: missing DPEL chunk"))?;
+    if raw_layers.is_empty() {
+        return Err(Error::invalid("TVPP: missing DBOD chunk (no raster layer)"));
+    }
+
+    let mut layers = Vec::with_capacity(raw_layers.len());
+    for (dloc, body) in raw_layers {
+        let (width, height) = match dloc {
+            Some(dl) => (dl.w, dl.h),
+            None => (dgbl.display_width, dgbl.display_height),
+        };
+        let rgba = decode_deep_dbod(dgbl.compression, &dpel, width, height, body)?;
+        layers.push(DeepFrame {
+            dloc,
+            width,
+            height,
+            rgba,
+        });
+    }
+
+    Ok(TvppImage {
+        dgbl,
+        dpel,
+        dchg,
+        layers,
+        extra_chunks,
+    })
+}
+
 /// Build a multi-image `FORM DEEP` (§1.4 / §1.6) from a list of equally-sized
 /// RGBA8888 frames, the inverse of [`parse_deep_frames`] for the body codings
 /// that round-trip ([`DeepCompression::None`] / [`DeepCompression::RunLength`]).
@@ -5568,6 +5732,53 @@ impl Demuxer for DeepDemuxer {
     fn duration_micros(&self) -> Option<i64> {
         self.duration_us
     }
+}
+
+fn probe_tvpp(p: &oxideav_core::ProbeData) -> u8 {
+    if p.buf.len() >= 12 && &p.buf[0..4] == b"FORM" && &p.buf[8..12] == b"TVPP" {
+        100
+    } else {
+        0
+    }
+}
+
+/// `FORM TVPP` demuxer (best-effort, §2). Surfaces every decoded DBOD layer as
+/// a `rawvideo` / `Rgba` keyframe in document order. The TVPP-specific
+/// MIXR/BGP1/BGP2 chunks are not exposed through the packet stream; a caller
+/// that wants them uses [`parse_tvpp`] directly.
+fn open_tvpp(
+    mut input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    let full = read_true_color_form(&mut *input, "TVPP", b"TVPP")?;
+    let img = parse_tvpp(&full)?;
+    let width = img.layers[0].width;
+    let height = img.layers[0].height;
+    let frame_count = img.layers.len() as i64;
+
+    let (time_base, frame_duration, duration_us) = match img.dchg.and_then(|d| d.delay_millis()) {
+        Some(ms) => {
+            let dur = i64::from(ms);
+            let total_us = dur.saturating_mul(frame_count).saturating_mul(1_000);
+            (TimeBase::new(1, 1000), dur, Some(total_us))
+        }
+        None => (TimeBase::new(1, 1), 1, None),
+    };
+
+    let mut stream = true_color_stream(width, height);
+    stream.time_base = time_base;
+    stream.duration = Some(frame_duration.saturating_mul(frame_count));
+
+    let frames: std::collections::VecDeque<Vec<u8>> =
+        img.layers.into_iter().map(|f| f.rgba).collect();
+
+    Ok(Box::new(DeepDemuxer {
+        streams: vec![stream],
+        frames,
+        next_pts: 0,
+        frame_duration,
+        duration_us,
+    }))
 }
 
 fn open_deep(

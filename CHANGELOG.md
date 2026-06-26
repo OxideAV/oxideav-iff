@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* **`FORM TVPP` (TVPaint project) best-effort decode** (§2,
+  non-canonical / community RE). `ilbm::parse_tvpp` decodes the DEEP-
+  vocabulary raster (`DGBL` / `DPEL` / `DLOC` / `DBOD` / `DCHG`) exactly as
+  `parse_deep_frames` does — each `DBOD` becomes one decoded layer
+  (`ilbm::TvppImage::layers: Vec<DeepFrame>`), bound to its preceding
+  `DLOC` size (§1.3) else the DGBL display size — and surfaces the
+  TVPP-specific `MIXR` / `BGP1` / `BGP2` chunks **raw** in
+  `extra_chunks: Vec<TvppExtraChunk>` (their byte layout is not pinned
+  down by any canonical reference, so no meaning is invented). A wrong
+  outer FORM type, a missing `DGBL` / `DPEL` / `DBOD`, or a chunk past the
+  FORM are rejected. The `iff_tvpp` container demuxer (extension `tvpp`,
+  `FORM TVPP` signature probe) surfaces each layer as a `rawvideo` / `Rgba`
+  keyframe.
 - *(ilbm)* **DEEP per-component channel extraction + `Dpel` layout
   queries** (§1.2). `ilbm::extract_deep_channel(dpel, w, h, chunky_body,
   c_type)` pulls any one named component out of an *uncompressed* chunky

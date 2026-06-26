@@ -878,10 +878,19 @@ Remaining true-colour frontier: TVDC decode **from a FORM** is blocked —
 data" but the canonical DEEP text names no in-FORM chunk that carries it
 (documented gap; `assemble_deep_tvdc` is the caller-supplies-table escape
 hatch). Also pending: DEEP's HUFFMAN/DYNAMICHUFF/JPEG body codings (wire
-layout undocumented) and the TVPP project-file FORM (§2, non-canonical RE
-— needs a real-file fixture). RUNLENGTH is decoded best-effort per §1.5b
+layout undocumented). RUNLENGTH is decoded best-effort per §1.5b
 (whole-DBOD ByteRun1; a real per-line-framed fixture would let us pin the
 remaining framing ambiguity).
+
+The **TVPP project-file FORM** (§2, non-canonical community RE) now
+decodes best-effort: [`ilbm::parse_tvpp`] reuses the DEEP raster
+vocabulary (DGBL / DPEL / DLOC / DBOD / DCHG) — each `DBOD` is decoded
+into one [`ilbm::TvppImage`] layer — and surfaces the TVPP-specific
+`MIXR` / `BGP1` / `BGP2` chunks **raw** in `extra_chunks` rather than
+inventing semantics for them (their byte layout is pinned by no canonical
+reference). The `iff_tvpp` demuxer (extension `tvpp`, `FORM TVPP` probe)
+emits one keyframe per layer. A real TVPaint fixture would let us
+interpret the extra chunks and confirm the multi-layer model.
 
 AIFF-C coverage is saturated: Apple shipped 13 chunk classes (FVER,
 COMM, SSND, MARK, INST, COMT, AESD, APPL, MIDI, SAXL, NAME, AUTH,
