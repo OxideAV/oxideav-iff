@@ -124,17 +124,26 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     params.width = Some(anim.width);
     params.height = Some(anim.height);
     params.pixel_format = Some(PixelFormat::Rgba);
-    let frames_count = anim.frames.len() as i64;
+    // Build the cumulative playback timeline so packet PTS/duration carry
+    // the real per-frame jiffy delays from ANHD rather than a flat 1/frame.
+    let playback = anim.playback();
+    let total = playback.total_jiffies() as i64;
+    let timing: Vec<(i64, i64)> = playback
+        .frames
+        .iter()
+        .map(|f| (f.start_jiffies as i64, f.duration_jiffies as i64))
+        .collect();
     let stream = StreamInfo {
         index: 0,
         time_base: TimeBase::new(1, 60),
-        duration: Some(frames_count),
+        duration: Some(total),
         start_time: Some(0),
         params,
     };
     Ok(Box::new(AnimDemuxer {
         streams: vec![stream],
         frames: anim.frames.into_iter().map(|f| f.rgba).collect(),
+        timing,
         next: 0,
     }))
 }
@@ -142,6 +151,8 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
 struct AnimDemuxer {
     streams: Vec<StreamInfo>,
     frames: Vec<Vec<u8>>,
+    /// `(start_jiffies, duration_jiffies)` per frame, parallel to `frames`.
+    timing: Vec<(i64, i64)>,
     next: usize,
 }
 
@@ -160,10 +171,11 @@ impl Demuxer for AnimDemuxer {
         let data = std::mem::take(&mut self.frames[i]);
         self.next += 1;
         let stream = &self.streams[0];
+        let (start, dur) = self.timing.get(i).copied().unwrap_or((i as i64, 1));
         let mut pkt = Packet::new(0, stream.time_base, data);
-        pkt.pts = Some(i as i64);
-        pkt.dts = Some(i as i64);
-        pkt.duration = Some(1);
+        pkt.pts = Some(start);
+        pkt.dts = Some(start);
+        pkt.duration = Some(dur);
         pkt.flags.keyframe = true;
         Ok(pkt)
     }
@@ -171,7 +183,13 @@ impl Demuxer for AnimDemuxer {
         &[]
     }
     fn duration_micros(&self) -> Option<i64> {
-        None
+        // Sum of all frame durations in jiffies (1/60 s) → microseconds.
+        let total: i64 = self.timing.iter().map(|(_, d)| *d).sum();
+        if total == 0 {
+            None
+        } else {
+            Some(total * 1_000_000 / 60)
+        }
     }
 }
 
@@ -244,6 +262,26 @@ impl Anhd {
     }
 }
 
+/// Per-frame ANIM timing, lifted from each frame's `ANHD` chunk (§2.1).
+///
+/// Both fields are expressed in **jiffies** (1/60 second), the unit the
+/// ANIM spec uses for `abstime` / `reltime`. `rel_time` is the delay
+/// *after the previous frame* before this frame is displayed; `abs_time`
+/// is the (historically "currently unused") delay relative to the very
+/// first frame. The seed frame (index 0) is displayed at t = 0, so its
+/// timing is `{ rel_time: 0, abs_time: 0 }` unless the leading `FORM
+/// ILBM` carries its own `ANHD` (§1.3 — "an ANHD chunk can appear here
+/// to provide timing data for the first frame").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameTiming {
+    /// Delay relative to the previous frame, in jiffies (1/60 s).
+    pub rel_time: u32,
+    /// Delay relative to the first frame, in jiffies (1/60 s). The 1988
+    /// spec marks this "currently unused"; preserved verbatim for callers
+    /// that key off it.
+    pub abs_time: u32,
+}
+
 /// Decoded ANIM container — the leading frame plus the delta-decoded
 /// follow-on frames.
 #[derive(Clone, Debug)]
@@ -254,6 +292,154 @@ pub struct AnimImage {
     /// Frame `0` is always the seed. Each subsequent frame is the
     /// running state after applying its delta.
     pub frames: Vec<IlbmImage>,
+    /// Per-frame timing (`frame_timing[i]` belongs to `frames[i]`),
+    /// lifted from each frame's `ANHD`. Always the same length as
+    /// `frames`. The seed frame defaults to `FrameTiming::default()`
+    /// (t = 0) unless the leading `FORM ILBM` carries its own `ANHD`.
+    /// See [`AnimImage::playback`] for a cumulative-timeline driver.
+    pub frame_timing: Vec<FrameTiming>,
+}
+
+/// A single entry in an [`AnimPlayback`] timeline: which frame to show,
+/// when to show it (its cumulative start time), and for how long.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaybackFrame {
+    /// Index into [`AnimImage::frames`].
+    pub frame_index: usize,
+    /// Cumulative presentation time of this frame from the start of the
+    /// animation, in jiffies (1/60 s). Frame 0 starts at `0`.
+    pub start_jiffies: u64,
+    /// How long this frame is shown before the next, in jiffies. This is
+    /// the *next* frame's `rel_time`; the final frame holds its own
+    /// `rel_time` (or `1` jiffy if that is `0`, so a looping player still
+    /// advances).
+    pub duration_jiffies: u64,
+}
+
+impl PlaybackFrame {
+    /// Cumulative start time in microseconds (jiffy = 1/60 s).
+    pub fn start_micros(&self) -> u64 {
+        self.start_jiffies * 1_000_000 / 60
+    }
+    /// Frame display duration in microseconds.
+    pub fn duration_micros(&self) -> u64 {
+        self.duration_jiffies * 1_000_000 / 60
+    }
+}
+
+/// A cumulative ANIM playback timeline built from per-frame [`FrameTiming`].
+///
+/// The ANIM spec expresses timing as a per-frame `rel_time` (jiffies of
+/// 1/60 s) — the delay *after the previous frame* before this frame is
+/// flipped up. A player wants the inverse: the absolute time each frame
+/// appears, and how long it stays. [`AnimImage::playback`] computes that
+/// timeline.
+///
+/// Convention: frame 0 starts at t = 0. Frame `i`'s start time is the sum
+/// of `rel_time` for frames `1..=i`. Each frame's *duration* is the
+/// following frame's `rel_time`; the last frame's duration falls back to
+/// its own `rel_time` (and to `1` jiffy if that is `0`) so a looping
+/// player never stalls on a zero-length final frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnimPlayback {
+    /// One entry per frame, in display order.
+    pub frames: Vec<PlaybackFrame>,
+}
+
+impl AnimPlayback {
+    /// Total animation length (sum of every frame's duration) in jiffies.
+    pub fn total_jiffies(&self) -> u64 {
+        self.frames.iter().map(|f| f.duration_jiffies).sum()
+    }
+
+    /// Total animation length in microseconds.
+    pub fn total_micros(&self) -> u64 {
+        self.total_jiffies() * 1_000_000 / 60
+    }
+
+    /// Number of frames in the timeline.
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// `true` when the timeline carries no frames.
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// The frame index that should be on screen at `jiffies` from the
+    /// start of a **single (non-looping)** playthrough.
+    ///
+    /// Returns `None` for an empty timeline. A time at or past the end
+    /// clamps to the final frame (the last frame is held, matching how
+    /// an Amiga player leaves the last frame up until the loop restarts).
+    pub fn frame_at_jiffies(&self, jiffies: u64) -> Option<usize> {
+        if self.frames.is_empty() {
+            return None;
+        }
+        // Walk forward: the active frame is the last one whose window
+        // [start, start+duration) contains `jiffies`, clamped to the end.
+        let mut active = 0usize;
+        for f in &self.frames {
+            if jiffies >= f.start_jiffies {
+                active = f.frame_index;
+            } else {
+                break;
+            }
+        }
+        Some(active)
+    }
+
+    /// The frame index on screen at `micros` microseconds into a single
+    /// playthrough. Thin wrapper over [`Self::frame_at_jiffies`].
+    pub fn frame_at_micros(&self, micros: u64) -> Option<usize> {
+        // jiffies = micros * 60 / 1_000_000, floored.
+        self.frame_at_jiffies(micros * 60 / 1_000_000)
+    }
+}
+
+impl AnimImage {
+    /// Build a cumulative [`AnimPlayback`] timeline from the per-frame
+    /// timing captured during [`parse_anim`].
+    ///
+    /// See [`AnimPlayback`] for the start-time / duration conventions.
+    pub fn playback(&self) -> AnimPlayback {
+        let n = self.frames.len();
+        let mut out = Vec::with_capacity(n);
+        let mut cumulative: u64 = 0;
+        for i in 0..n {
+            // Frame 0 always starts at t = 0; later frames accumulate the
+            // rel_time delay that precedes them.
+            if i > 0 {
+                let rel = self
+                    .frame_timing
+                    .get(i)
+                    .map(|t| t.rel_time as u64)
+                    .unwrap_or(0);
+                cumulative += rel;
+            }
+            // Duration = the *next* frame's rel_time. The last frame falls
+            // back to its own rel_time (>=1 so a player still advances).
+            let duration = if i + 1 < n {
+                self.frame_timing
+                    .get(i + 1)
+                    .map(|t| t.rel_time as u64)
+                    .unwrap_or(0)
+            } else {
+                self.frame_timing
+                    .get(i)
+                    .map(|t| t.rel_time as u64)
+                    .unwrap_or(0)
+                    .max(1)
+            };
+            out.push(PlaybackFrame {
+                frame_index: i,
+                start_jiffies: cumulative,
+                duration_jiffies: duration,
+            });
+        }
+        AnimPlayback { frames: out }
+    }
 }
 
 /// Probe: a `FORM .... ANIM` magic at the start.
@@ -307,6 +493,8 @@ pub fn parse_anim(bytes: &[u8]) -> Result<AnimImage> {
     // defaults to two frames back — the DeluxePaint double-buffering
     // convention) rather than always the immediately-previous frame.
     let mut planar_history: Vec<Vec<Vec<u8>>> = Vec::new();
+    // Per-frame timing, parallel to `frames` (§2.1 ANHD abstime/reltime).
+    let mut frame_timing: Vec<FrameTiming> = Vec::new();
     let mut bmhd: Option<Bmhd> = None;
     let mut palette: Vec<[u8; 3]> = Vec::new();
     let mut camg = Camg::default();
@@ -353,6 +541,12 @@ pub fn parse_anim(bytes: &[u8]) -> Result<AnimImage> {
                     bmhd = Some(img.bmhd);
                     palette = img.palette.clone();
                     camg = img.camg;
+                    // §1.3: the leading FORM ILBM may carry an optional
+                    // ANHD purely to provide timing for the first frame.
+                    // If present we lift its rel/abs time; otherwise the
+                    // seed is displayed at t = 0.
+                    let seed_timing = scan_anhd_timing(&bytes[body_start + 4..body_end_inner]);
+                    frame_timing.push(seed_timing);
                     // Recover the planar form so we can apply deltas
                     // against it. Re-encode by walking the BODY.
                     planar_history.push(rgba_to_planar(&img));
@@ -422,6 +616,10 @@ pub fn parse_anim(bytes: &[u8]) -> Result<AnimImage> {
                     let img = planar_to_rgba(&planar, &bmhd, &palette, &camg)?;
                     planar_history.push(planar);
                     frames.push(img);
+                    frame_timing.push(FrameTiming {
+                        rel_time: anhd.rel_time,
+                        abs_time: anhd.abs_time,
+                    });
                 }
             }
             // Non-ILBM nested FORMs (LIST etc.) are skipped.
@@ -432,11 +630,53 @@ pub fn parse_anim(bytes: &[u8]) -> Result<AnimImage> {
     }
 
     let bmhd = bmhd.ok_or_else(|| Error::invalid("ANIM: no ILBM frames"))?;
+    debug_assert_eq!(frames.len(), frame_timing.len());
     Ok(AnimImage {
         width: bmhd.width as u32,
         height: bmhd.height as u32,
         frames,
+        frame_timing,
     })
+}
+
+/// Scan an inner `FORM ILBM` body (the bytes *after* the 4-byte `ILBM`
+/// form-type tag) for an optional `ANHD` chunk and return its timing.
+///
+/// Used for the seed frame, where the leading ILBM may carry an `ANHD`
+/// purely to express the first frame's timing (§1.3). Returns
+/// `FrameTiming::default()` (t = 0) when no `ANHD` is present.
+fn scan_anhd_timing(ilbm_body: &[u8]) -> FrameTiming {
+    let mut sub = 0usize;
+    while sub + 8 <= ilbm_body.len() {
+        let cid = [
+            ilbm_body[sub],
+            ilbm_body[sub + 1],
+            ilbm_body[sub + 2],
+            ilbm_body[sub + 3],
+        ];
+        let csize = u32::from_be_bytes([
+            ilbm_body[sub + 4],
+            ilbm_body[sub + 5],
+            ilbm_body[sub + 6],
+            ilbm_body[sub + 7],
+        ]) as usize;
+        let cdata_start = sub + 8;
+        let cdata_end = cdata_start + csize;
+        if cdata_end > ilbm_body.len() {
+            break;
+        }
+        if &cid == b"ANHD" {
+            if let Ok(anhd) = Anhd::parse(&ilbm_body[cdata_start..cdata_end]) {
+                return FrameTiming {
+                    rel_time: anhd.rel_time,
+                    abs_time: anhd.abs_time,
+                };
+            }
+            return FrameTiming::default();
+        }
+        sub = cdata_end + (csize & 1);
+    }
+    FrameTiming::default()
 }
 
 /// Re-pack a decoded RGBA frame back into the planar bitplane form
@@ -3378,6 +3618,78 @@ pub fn encode_anim_op0(frames: &[IlbmImage]) -> Result<Vec<u8>> {
         }
         // Pad outer chunk if odd.
         let _ = inner_size_padded;
+    }
+
+    let form_size = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&form_size.to_be_bytes());
+    Ok(out)
+}
+
+/// Encode a sequence of ILBM frames as a FORM/ANIM file using
+/// `operation = 0` (literal full BODY) for every delta frame, with
+/// explicit per-frame [`FrameTiming`] written into each delta frame's
+/// `ANHD` (§2.1 `abstime` / `reltime`).
+///
+/// `timing` is parallel to `frames`. `timing[0]` describes the seed
+/// frame: the seed is always displayed at t = 0, so its entry is
+/// ignored for output (frame 0 carries no `ANHD` in the leading ILBM
+/// here) but is accepted for caller symmetry. `timing[i]` for `i >= 1`
+/// supplies the `rel_time` / `abs_time` of delta frame `i`.
+///
+/// This is the authoring counterpart to [`AnimImage::playback`]:
+/// frames written with custom `rel_time` values round-trip back through
+/// [`parse_anim`] into the same [`AnimImage::frame_timing`], and the
+/// derived [`AnimPlayback`] timeline reflects the authored delays.
+pub fn encode_anim_op0_timed(frames: &[IlbmImage], timing: &[FrameTiming]) -> Result<Vec<u8>> {
+    if frames.is_empty() {
+        return Err(Error::invalid("ANIM encode: at least one frame required"));
+    }
+    if timing.len() != frames.len() {
+        return Err(Error::invalid(format!(
+            "ANIM op-0 timed encode: timing has {} entries, expected {} (one per frame)",
+            timing.len(),
+            frames.len()
+        )));
+    }
+    let leading = crate::ilbm::encode_ilbm(&frames[0])?;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"FORM");
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(b"ANIM");
+    out.extend_from_slice(&leading);
+    if leading.len() & 1 == 1 {
+        out.push(0);
+    }
+
+    for (frame, t) in frames[1..].iter().zip(timing[1..].iter()) {
+        let body = encode_full_body(frame)?;
+        let anhd = Anhd {
+            operation: 0,
+            mask: 0,
+            w: frame.bmhd.width,
+            h: frame.bmhd.height,
+            x: frame.bmhd.x_origin,
+            y: frame.bmhd.y_origin,
+            abs_time: t.abs_time,
+            rel_time: t.rel_time,
+            interleave: 1,
+            pad0: 0,
+            bits: 0,
+        };
+        let anhd_bytes = anhd.write(body.len() as u32);
+        let inner_size = (4 + 8 + 40 + 8 + body.len()) as u32;
+        out.extend_from_slice(b"FORM");
+        out.extend_from_slice(&inner_size.to_be_bytes());
+        out.extend_from_slice(b"ILBM");
+        out.extend_from_slice(b"ANHD");
+        out.extend_from_slice(&40u32.to_be_bytes());
+        out.extend_from_slice(&anhd_bytes);
+        out.extend_from_slice(b"BODY");
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        if body.len() & 1 == 1 {
+            out.push(0);
+        }
     }
 
     let form_size = (out.len() - 8) as u32;

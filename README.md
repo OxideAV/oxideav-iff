@@ -37,7 +37,17 @@ crate ships:
   memory, so op-2 long words may straddle row boundaries. The
   container walker accepts both `BODY` and `DLTA` chunk ids so
   op-0 / op-2 / op-3 / op-5 / op-7 streams decode through the
-  same path.
+  same path. **Per-frame timing** is lifted from every frame's
+  `ANHD` (§2.1 `abstime` / `reltime`, jiffies of 1/60 s) into
+  `AnimImage::frame_timing`; `AnimImage::playback()` inverts the
+  per-frame `reltime` deltas into an `AnimPlayback` timeline
+  (cumulative `start_jiffies` / display `duration_jiffies` per
+  frame, `total_micros`, and `frame_at_jiffies` / `frame_at_micros`
+  scrubbers that clamp past-the-end to the final frame). The
+  `iff_anim` demuxer now emits real `pts` / `dts` / `duration`
+  from this timeline, and `encode_anim_op0_timed` authors ANIMs
+  with explicit per-frame `reltime` / `abstime` that round-trip
+  back through `parse_anim` + `playback`.
 - **FORM/AIFF and FORM/AIFC** — Apple AIFF / AIFF-C (read):
   COMM/SSND/FVER/MARK/INST/COMT/AESD/APPL/MIDI/SAXL/NAME/AUTH/(c) /ANNO
   walker, 80-bit IEEE-extended sample-rate decode, PCM

@@ -24,6 +24,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(anim)* **per-frame timing + an `AnimPlayback` cumulative-timeline
+  driver** (§2.1 ANHD `abstime` / `reltime`). `parse_anim` now lifts each
+  frame's `reltime` (jiffy = 1/60 s delay after the previous frame) and
+  `abstime` into a new `anim::AnimImage::frame_timing: Vec<FrameTiming>`
+  (parallel to `frames`; the seed frame defaults to t = 0 unless its
+  leading `FORM ILBM` carries an `ANHD`, per §1.3). `AnimImage::playback`
+  inverts the per-frame deltas into an absolute timeline
+  (`anim::AnimPlayback`): one `PlaybackFrame` per frame with its
+  cumulative `start_jiffies`, display `duration_jiffies` (= the next
+  frame's `reltime`; the last frame holds its own, floored to 1 so a
+  looping player still advances), `start_micros` / `duration_micros`
+  helpers, plus `total_jiffies` / `total_micros` and `frame_at_jiffies` /
+  `frame_at_micros` scrubbers that map a wall-clock offset to the frame
+  on screen (clamping past-the-end to the final frame). The
+  `iff_anim` demuxer now emits packet `pts` / `dts` / `duration` from
+  this timeline instead of a flat one-tick-per-frame, and
+  `duration_micros()` reports the real animation length. A new
+  `anim::encode_anim_op0_timed(frames, &[FrameTiming])` authors ANIMs
+  with explicit per-frame `reltime` / `abstime`, the round-trip
+  counterpart that `parse_anim` + `playback` decode back exactly.
 - *(ilbm)* **multi-image / cel-anim `FORM DEEP`** decode + encode (§1.4 DBOD,
   §1.3 DLOC, §1.6 DCHG). A FORM DEEP may carry several DBOD frames — successive
   cels of an animation; previously `parse_deep` decoded only the first.
