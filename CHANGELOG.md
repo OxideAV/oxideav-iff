@@ -24,6 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* **`FORM ACBM` (Amiga Contiguous BitMap) read + round-trip.**
+  ACBM is the AmigaBASIC sibling of ILBM whose row-interleaved `BODY` is
+  replaced by an `ABIT` chunk holding the bitplanes plane-by-plane,
+  contiguously, and uncompressed (multimediawiki IFF §4.1). `parse_acbm`
+  de-contiguates ABIT into the scanline-interleaved planar layout the
+  shared indexed-planar renderer (extracted as `render_indexed_planar`,
+  now used by both `parse_ilbm` and `parse_acbm`) expects, so EHB /
+  HAM6 / HAM8 / `HasMask` / SHAM / PCHG / colour-cycling all decode
+  identically to ILBM. `encode_acbm` transposes the per-row plane
+  encoders' output into ABIT's plane-contiguous order and forces
+  `BMHD.compression = 0`. `parse_acbm(encode_acbm(x)) == x` for any
+  indexed / EHB / HAM image. Compressed ABIT, 24-bit literal layouts and
+  the chunky PBM form (none of which have an ACBM analogue) are rejected.
+  New `iff_acbm` demuxer (extension `.acbm`, `FORM ACBM` probe) emits one
+  `rawvideo` / `Rgba` keyframe.
 - *(ilbm)* **`FORM TVPP` (TVPaint project) best-effort decode** (§2,
   non-canonical / community RE). `ilbm::parse_tvpp` decodes the DEEP-
   vocabulary raster (`DGBL` / `DPEL` / `DLOC` / `DBOD` / `DCHG`) exactly as

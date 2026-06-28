@@ -63,6 +63,14 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_extension("lbm", "iff_ilbm");
     reg.register_probe("iff_ilbm", probe);
 
+    // ACBM — Amiga Contiguous BitMap (AmigaBASIC sibling of ILBM). The
+    // BODY is replaced by a plane-contiguous, uncompressed ABIT chunk;
+    // everything else (BMHD/CMAP/CAMG/…) matches ILBM. Decode-only via the
+    // container path; `parse_acbm`/`encode_acbm` cover the round-trip.
+    reg.register_demuxer("iff_acbm", open_acbm);
+    reg.register_extension("acbm", "iff_acbm");
+    reg.register_probe("iff_acbm", probe_acbm);
+
     // Turbo-Silver / Imagine true-colour FORMs (decode-only). Both share the
     // ILBM-like outer container but carry a Turbo-Silver genlock-RLE BODY
     // (`BMHD.compression == 4`). See `iff-truecolor-chunks.md` §3.
@@ -93,6 +101,14 @@ fn probe(p: &oxideav_core::ProbeData) -> u8 {
             b"ILBM" | b"PBM " => 100,
             _ => 0,
         }
+    } else {
+        0
+    }
+}
+
+fn probe_acbm(p: &oxideav_core::ProbeData) -> u8 {
+    if p.buf.len() >= 12 && &p.buf[0..4] == b"FORM" && &p.buf[8..12] == b"ACBM" {
+        100
     } else {
         0
     }
@@ -2241,6 +2257,83 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
         }
     }
 
+    render_indexed_planar(IndexedPlanarParts {
+        rows_planar,
+        n_planes,
+        has_mask_plane,
+        planes_per_row,
+        bmhd,
+        palette,
+        camg,
+        form_type,
+        grab,
+        dest,
+        sprt,
+        sham,
+        pchg,
+        crngs,
+        ccrts,
+        drngs,
+    })
+}
+
+/// The decoded pieces of an indexed planar IFF picture, ready for the
+/// shared render pass. `rows_planar` holds one byte-row per
+/// `(scanline, plane)` in scanline-interleaved order — i.e. for
+/// scanline `y` the slice `rows_planar[y * planes_per_row ..]` carries
+/// colour plane `0..n_planes` followed by the optional `HasMask`
+/// scanline. Both [`parse_ilbm`] (row-interleaved `BODY`) and
+/// [`parse_acbm`] (contiguous plane-by-plane `ABIT`) build this same
+/// layout, then hand it to [`render_indexed_planar`] so the
+/// HAM / EHB / SHAM / PCHG / mask resolution lives in one place.
+struct IndexedPlanarParts {
+    rows_planar: Vec<Vec<u8>>,
+    n_planes: usize,
+    has_mask_plane: bool,
+    planes_per_row: usize,
+    bmhd: Bmhd,
+    palette: Vec<[u8; 3]>,
+    camg: Camg,
+    form_type: [u8; 4],
+    grab: Option<Grab>,
+    dest: Option<Dest>,
+    sprt: Option<Sprt>,
+    sham: Option<Sham>,
+    pchg: Option<Pchg>,
+    crngs: Vec<Crng>,
+    ccrts: Vec<Ccrt>,
+    drngs: Vec<Drng>,
+}
+
+/// Resolve a scanline-interleaved planar buffer to packed RGBA8888,
+/// honouring EHB-expansion, SHAM per-line palettes, PCHG cumulative
+/// palette overlays, HAM6/HAM8 hold-and-modify, the `HasMask`
+/// scanline, and transparent-colour keying — exactly as the
+/// original indexed `parse_ilbm` tail did.
+fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<IlbmImage> {
+    let IndexedPlanarParts {
+        rows_planar,
+        n_planes,
+        has_mask_plane,
+        planes_per_row,
+        bmhd,
+        palette,
+        camg,
+        form_type,
+        grab,
+        dest,
+        sprt,
+        sham,
+        pchg,
+        crngs,
+        ccrts,
+        drngs,
+    } = parts;
+
+    let width = bmhd.width as u32;
+    let height = bmhd.height as u32;
+    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+
     // Decide effective default palette (EHB-expanded if requested).
     let default_palette: Vec<[u8; 3]> = if camg.is_ehb() && palette.len() <= 32 {
         expand_ehb_palette(&palette)
@@ -2372,6 +2465,183 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
         ccrts,
         drngs,
         rgba,
+    })
+}
+
+// ───────────────────── parse_acbm (ACBM / ABIT) ─────────────────────
+
+/// Parse an in-memory `FORM ACBM` (Amiga Contiguous BitMap) picture.
+///
+/// ACBM is the AmigaBASIC sibling of ILBM: it shares the exact same
+/// `BMHD` / `CMAP` / `CAMG` / `GRAB` / `DEST` / `SPRT` / `SHAM` /
+/// `PCHG` / `CRNG` / `CCRT` / `DRNG` chunk vocabulary, but the
+/// row-interleaved `BODY` chunk is replaced by an **`ABIT`** chunk that
+/// stores the bitplanes **plane-by-plane, contiguously** — the whole of
+/// colour plane 0 (`height × row_bytes` bytes) first, then the whole of
+/// plane 1, and so on. (multimediawiki IFF §4.1 ACBM/ABIT: "an ABIT
+/// chunk contains non-interleaved, plane-by-plane planar image data …
+/// conceived because it hugely sped up loading and saving screens from
+/// AmigaBASIC"). The optional `HasMask` scanline forms one extra
+/// contiguous plane after the colour planes, mirroring how a HasMask
+/// ILBM `BODY` carries `n_planes + 1` planes.
+///
+/// Because ABIT is a verbatim memory image its plane data is
+/// **uncompressed**; the canonical ACBM text gives no per-plane
+/// `ByteRun1` framing, so a `BMHD.compression != 0` ACBM is rejected as
+/// a documented gap rather than guessed. After de-contiguating ABIT
+/// into the same scanline-interleaved `rows_planar` layout that
+/// [`parse_ilbm`] builds, the shared [`render_indexed_planar`] pass
+/// resolves EHB / SHAM / PCHG / HAM / mask exactly as for ILBM.
+///
+/// The 24-bit literal-RGB (`n_planes == 24`) true-colour layout is not
+/// defined for ACBM (no producer ever wrote one); such a file is
+/// rejected.
+pub fn parse_acbm(bytes: &[u8]) -> Result<IlbmImage> {
+    if bytes.len() < 12 {
+        return Err(Error::invalid("ACBM: file shorter than FORM header"));
+    }
+    if &bytes[0..4] != b"FORM" {
+        return Err(Error::invalid("ACBM: missing FORM signature"));
+    }
+    let form_type = [bytes[8], bytes[9], bytes[10], bytes[11]];
+    if &form_type != b"ACBM" {
+        return Err(Error::invalid(format!(
+            "ACBM: outer form type is {:?} (expected ACBM)",
+            std::str::from_utf8(&form_type).unwrap_or("????")
+        )));
+    }
+    let total = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let body_end = (8 + total).min(bytes.len());
+
+    let mut bmhd: Option<Bmhd> = None;
+    let mut palette: Vec<[u8; 3]> = Vec::new();
+    let mut camg = Camg::default();
+    let mut abit_data: Option<Vec<u8>> = None;
+    let mut grab: Option<Grab> = None;
+    let mut dest: Option<Dest> = None;
+    let mut sprt: Option<Sprt> = None;
+    let mut sham_raw: Option<Vec<u8>> = None;
+    let mut pchg: Option<Pchg> = None;
+    let mut crngs: Vec<Crng> = Vec::new();
+    let mut ccrts: Vec<Ccrt> = Vec::new();
+    let mut drngs: Vec<Drng> = Vec::new();
+
+    let mut cursor = 12usize;
+    while cursor + 8 <= body_end {
+        let id = [
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ];
+        let size = u32::from_be_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]) as usize;
+        let payload_start = cursor + 8;
+        let payload_end = payload_start + size;
+        if payload_end > body_end {
+            return Err(Error::invalid(format!(
+                "ACBM: chunk {:?} extends past FORM ({} > {})",
+                std::str::from_utf8(&id).unwrap_or("????"),
+                payload_end,
+                body_end
+            )));
+        }
+        let payload = &bytes[payload_start..payload_end];
+        match &id {
+            b"BMHD" => bmhd = Some(Bmhd::parse(payload)?),
+            b"CMAP" => {
+                palette = payload
+                    .chunks_exact(3)
+                    .map(|c| [c[0], c[1], c[2]])
+                    .collect();
+            }
+            b"CAMG" => camg = Camg::parse(payload)?,
+            b"ABIT" => abit_data = Some(payload.to_vec()),
+            b"GRAB" => grab = Some(Grab::parse(payload)?),
+            b"DEST" => dest = Some(Dest::parse(payload)?),
+            b"SPRT" => sprt = Some(Sprt::parse(payload)?),
+            b"SHAM" => sham_raw = Some(payload.to_vec()),
+            b"PCHG" => pchg = Some(Pchg::parse(payload)?),
+            b"CRNG" => crngs.push(Crng::parse(payload)?),
+            b"CCRT" => ccrts.push(Ccrt::parse(payload)?),
+            b"DRNG" => drngs.push(Drng::parse(payload)?),
+            _ => { /* skip unknown chunks (DPI, ANNO, ...) */ }
+        }
+        let padded = size + (size & 1);
+        cursor = payload_start + padded;
+    }
+
+    let bmhd = bmhd.ok_or_else(|| Error::invalid("ACBM: missing BMHD chunk"))?;
+    let abit = abit_data.ok_or_else(|| Error::invalid("ACBM: missing ABIT chunk"))?;
+
+    if bmhd.compression != Compression::None {
+        return Err(Error::unsupported(
+            "ACBM: ABIT plane data is an uncompressed memory image; \
+             the canonical ACBM text defines no per-plane ByteRun1 framing",
+        ));
+    }
+    if bmhd.n_planes == 24 {
+        return Err(Error::unsupported(
+            "ACBM: 24-bit literal-RGB true-colour layout is not defined for ABIT",
+        ));
+    }
+    let n_planes = bmhd.n_planes as usize;
+    if n_planes == 0 || n_planes > 8 {
+        return Err(Error::unsupported(format!(
+            "ACBM: indexed planar supports 1..=8 colour bitplanes (got {n_planes})"
+        )));
+    }
+
+    let row_bytes = bmhd.row_bytes();
+    let height = bmhd.height as usize;
+    let has_mask_plane = bmhd.masking == Masking::HasMask;
+    let planes_per_row = n_planes + if has_mask_plane { 1 } else { 0 };
+
+    // ABIT is `planes_per_row` contiguous planes, each `height * row_bytes`
+    // bytes. De-contiguate into the scanline-interleaved `rows_planar`
+    // layout the shared renderer expects.
+    let plane_size = row_bytes * height;
+    let needed = plane_size * planes_per_row;
+    if abit.len() < needed {
+        return Err(Error::invalid(format!(
+            "ACBM ABIT: need {needed} bytes ({planes_per_row} planes × {height} rows × {row_bytes}), got {}",
+            abit.len()
+        )));
+    }
+    let sham = sham_raw
+        .as_deref()
+        .map(|raw| Sham::parse(raw, bmhd.height as u32))
+        .transpose()?;
+
+    let mut rows_planar: Vec<Vec<u8>> = Vec::with_capacity(height * planes_per_row);
+    for y in 0..height {
+        for p in 0..planes_per_row {
+            let off = p * plane_size + y * row_bytes;
+            rows_planar.push(abit[off..off + row_bytes].to_vec());
+        }
+    }
+
+    render_indexed_planar(IndexedPlanarParts {
+        rows_planar,
+        n_planes,
+        has_mask_plane,
+        planes_per_row,
+        bmhd,
+        palette,
+        camg,
+        form_type,
+        grab,
+        dest,
+        sprt,
+        sham,
+        pchg,
+        crngs,
+        ccrts,
+        drngs,
     })
 }
 
@@ -2565,6 +2835,129 @@ pub fn encode_ilbm(image: &IlbmImage) -> Result<Vec<u8>> {
     }
 
     // Patch FORM size = total - 8.
+    let form_size = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&form_size.to_be_bytes());
+    Ok(out)
+}
+
+// ───────────────────── encode_acbm (ACBM / ABIT) ─────────────────────
+
+/// Encode an [`IlbmImage`] into a `FORM ACBM` byte stream — the
+/// contiguous-bitplane (AmigaBASIC) sibling of [`encode_ilbm`].
+///
+/// The only structural difference from `FORM ILBM` is that the
+/// row-interleaved `BODY` is replaced by an **`ABIT`** chunk holding the
+/// bitplanes plane-by-plane and contiguously (the whole of colour plane
+/// 0, then plane 1, …, then the optional `HasMask` plane). ABIT carries
+/// **no compression** — it is a verbatim memory image — so the BMHD
+/// `compression` byte is forced to `0` regardless of `image.bmhd`.
+///
+/// Indexed (1..=8 bitplanes), EHB and HAM6/HAM8 CAMG modes are all
+/// supported by reusing the same per-row plane encoders [`encode_ilbm`]
+/// uses, then transposing the scanline-interleaved rows into ABIT's
+/// plane-contiguous order. `parse_acbm(encode_acbm(img)) == img` for
+/// every indexed/EHB/HAM image. The chunky `PBM ` and 24-bit literal
+/// true-colour forms have no ACBM analogue and are rejected.
+pub fn encode_acbm(image: &IlbmImage) -> Result<Vec<u8>> {
+    let bmhd = image.bmhd;
+    if bmhd.width == 0 || bmhd.height == 0 {
+        return Err(Error::invalid("ACBM encode: zero-dimension image"));
+    }
+    if &image.form_type == b"PBM " {
+        return Err(Error::invalid(
+            "ACBM encode: chunky PBM has no contiguous-bitplane (ABIT) analogue",
+        ));
+    }
+    if bmhd.n_planes == 24 {
+        return Err(Error::invalid(
+            "ACBM encode: 24-bit literal true-colour has no ABIT analogue",
+        ));
+    }
+    if image.palette.is_empty() {
+        return Err(Error::unsupported(
+            "ACBM encode: indexed paths require a non-empty palette",
+        ));
+    }
+    let n_planes = bmhd.n_planes as usize;
+    if !(1..=8).contains(&n_planes) {
+        return Err(Error::unsupported(format!(
+            "ACBM encode: 1..=8 bitplanes (got {n_planes})"
+        )));
+    }
+
+    // Scanline-interleaved planar rows (one byte-row per (scanline, plane)),
+    // exactly as the ILBM BODY encoders produce them.
+    let rows = if image.camg.is_ham() {
+        encode_ham_planar_rows(image)?
+    } else if image.camg.is_ehb() {
+        encode_ehb_planar_rows(image)?
+    } else {
+        encode_indexed_planar_rows(image)?
+    };
+
+    let has_mask_plane = bmhd.masking == Masking::HasMask;
+    let planes_per_row = n_planes + has_mask_plane as usize;
+    let height = bmhd.height as usize;
+    let row_bytes = bmhd.row_bytes();
+    debug_assert_eq!(rows.len(), height * planes_per_row);
+
+    // Transpose interleaved (scanline, plane) → contiguous (plane, scanline):
+    // ABIT is plane 0's whole bitmap, then plane 1's, …
+    let mut abit = Vec::with_capacity(height * planes_per_row * row_bytes);
+    for p in 0..planes_per_row {
+        for y in 0..height {
+            abit.extend_from_slice(&rows[y * planes_per_row + p]);
+        }
+    }
+
+    // BMHD with compression forced to None (ABIT is uncompressed).
+    let mut bmhd_out = bmhd;
+    bmhd_out.compression = Compression::None;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"FORM");
+    out.extend_from_slice(&0u32.to_be_bytes()); // patched below
+    out.extend_from_slice(b"ACBM");
+
+    push_chunk(&mut out, b"BMHD", &bmhd_out.write());
+
+    if !image.palette.is_empty() {
+        let mut cmap = Vec::with_capacity(image.palette.len() * 3);
+        for c in &image.palette {
+            cmap.extend_from_slice(c);
+        }
+        push_chunk(&mut out, b"CMAP", &cmap);
+    }
+    if image.camg.raw != 0 {
+        push_chunk(&mut out, b"CAMG", &image.camg.to_be_bytes());
+    }
+    if let Some(g) = image.grab {
+        push_chunk(&mut out, b"GRAB", &g.write());
+    }
+    if let Some(d) = image.dest {
+        push_chunk(&mut out, b"DEST", &d.write());
+    }
+    if let Some(s) = image.sprt {
+        push_chunk(&mut out, b"SPRT", &s.write());
+    }
+    if let Some(s) = &image.sham {
+        push_chunk(&mut out, b"SHAM", &s.write());
+    }
+    if let Some(p) = &image.pchg {
+        push_chunk(&mut out, b"PCHG", &p.raw);
+    }
+    for c in &image.crngs {
+        push_chunk(&mut out, b"CRNG", &c.write());
+    }
+    for c in &image.ccrts {
+        push_chunk(&mut out, b"CCRT", &c.write());
+    }
+    for d in &image.drngs {
+        push_chunk(&mut out, b"DRNG", &d.write());
+    }
+
+    push_chunk(&mut out, b"ABIT", &abit);
+
     let form_size = (out.len() - 8) as u32;
     out[4..8].copy_from_slice(&form_size.to_be_bytes());
     Ok(out)
@@ -3058,17 +3451,69 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     Ok(Box::new(IlbmDemuxer {
         streams: vec![stream],
         image: Some(image),
+        format: "iff_ilbm",
+    }))
+}
+
+fn open_acbm(
+    mut input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    let hdr = read_chunk_header(&mut *input)?.ok_or_else(|| Error::invalid("ACBM: empty file"))?;
+    if hdr.id != GROUP_FORM {
+        return Err(Error::invalid(format!(
+            "ACBM: expected FORM chunk, got {}",
+            hdr.id_str()
+        )));
+    }
+    let form_type = read_form_type(&mut *input)?;
+    if &form_type != b"ACBM" {
+        return Err(Error::invalid(format!(
+            "IFF: not an ACBM file (form type {:?})",
+            std::str::from_utf8(&form_type).unwrap_or("????")
+        )));
+    }
+    let body_size = hdr.size as u64 - 4;
+    let mut form_body = vec![0u8; body_size as usize];
+    input.read_exact(&mut form_body)?;
+
+    let mut full = Vec::with_capacity(8 + 4 + form_body.len());
+    full.extend_from_slice(b"FORM");
+    full.extend_from_slice(&hdr.size.to_be_bytes());
+    full.extend_from_slice(&form_type);
+    full.extend_from_slice(&form_body);
+
+    let image = parse_acbm(&full)?;
+    let mut params = CodecParameters::video(CodecId::new("rawvideo"));
+    params.media_type = MediaType::Video;
+    params.width = Some(image.width);
+    params.height = Some(image.height);
+    params.pixel_format = Some(PixelFormat::Rgba);
+
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 1),
+        duration: Some(1),
+        start_time: Some(0),
+        params,
+    };
+
+    Ok(Box::new(IlbmDemuxer {
+        streams: vec![stream],
+        image: Some(image),
+        format: "iff_acbm",
     }))
 }
 
 struct IlbmDemuxer {
     streams: Vec<StreamInfo>,
     image: Option<IlbmImage>,
+    format: &'static str,
 }
 
 impl Demuxer for IlbmDemuxer {
     fn format_name(&self) -> &str {
-        "iff_ilbm"
+        self.format
     }
     fn streams(&self) -> &[StreamInfo] {
         &self.streams

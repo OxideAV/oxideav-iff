@@ -22,6 +22,25 @@ crate ships:
   validating or re-deriving the header hints after editing the
   change list**, CRNG / CCRT / DRNG colour-cycling descriptors).
 - **FORM/PBM** — read+round-trip (DPaint II / Brilliance chunky sibling).
+- **FORM/ACBM** — read+round-trip (Amiga Contiguous BitMap, the
+  AmigaBASIC sibling of ILBM). The row-interleaved `BODY` is replaced by
+  an **`ABIT`** chunk that stores the bitplanes **plane-by-plane,
+  contiguously** and uncompressed (multimediawiki IFF §4.1 — "non-
+  interleaved, plane-by-plane planar image data … conceived because it
+  hugely sped up loading and saving screens from AmigaBASIC"). All other
+  chunks (BMHD / CMAP / CAMG / GRAB / DEST / SPRT / SHAM / PCHG / CRNG /
+  CCRT / DRNG) are shared verbatim with ILBM, and the decode reuses the
+  shared indexed-planar render pass, so EHB, HAM6/HAM8, `HasMask` and the
+  colour-cycling descriptors all work identically. [`ilbm::parse_acbm`]
+  de-contiguates ABIT into the scanline-interleaved planar layout the
+  renderer expects; [`ilbm::encode_acbm`] is the inverse (it transposes
+  the per-row plane encoders' output into ABIT's plane-contiguous order
+  and forces `BMHD.compression = 0`). `parse_acbm(encode_acbm(x)) == x`
+  for any indexed / EHB / HAM image. A compressed ABIT (no documented
+  per-plane ByteRun1 framing), a 24-bit literal layout (no ACBM
+  producer), and the chunky PBM form (no contiguous-bitplane analogue)
+  are each rejected. The `iff_acbm` demuxer (extension `.acbm`,
+  `FORM ACBM` probe) emits one `rawvideo` / `Rgba` keyframe.
 - **FORM/ANIM** — op-0 literal + op-2/op-3 Long/Short Delta
   (encode+decode) + op-5 byte-vertical delta (encode+decode) +
   op-7 Short/Long Vertical Delta (encode+decode) + op-8 Anim8
