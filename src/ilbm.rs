@@ -3574,6 +3574,13 @@ pub enum MuxerMode {
     /// 24-bit ILBM has no defined mask-plane or transparent-colour key.
     /// LightWave 3D / NewTek Toaster IFF24 is the historical producer.
     TrueColor24,
+    /// Contiguous-bitplane `FORM/ACBM` (AmigaBASIC sibling of ILBM).
+    /// Same indexed palette + plane-count derivation as
+    /// [`MuxerMode::IndexedAuto`], but the body is the plane-contiguous,
+    /// uncompressed `ABIT` chunk instead of the row-interleaved `BODY`
+    /// (multimediawiki IFF §4.1). Compression is forced off (ABIT is a
+    /// verbatim memory image).
+    Acbm,
 }
 
 /// Container-level ILBM / PBM muxer. Accepts a single `rawvideo`
@@ -3735,7 +3742,7 @@ impl Muxer for IlbmMuxer {
 
         // Plane count, palette, CAMG flags + form type are mode-driven.
         let (palette, n_planes, camg, form_type) = match self.mode {
-            MuxerMode::IndexedAuto => {
+            MuxerMode::IndexedAuto | MuxerMode::Acbm => {
                 let (pal, _) = build_palette(&self.pending);
                 let np = if pal.len() <= 1 {
                     1
@@ -3743,7 +3750,12 @@ impl Muxer for IlbmMuxer {
                     let bits = (pal.len() as u32 - 1).next_power_of_two().trailing_zeros();
                     bits.max(1) as u8
                 };
-                (pal, np, Camg::default(), *b"ILBM")
+                let ft = if self.mode == MuxerMode::Acbm {
+                    *b"ACBM"
+                } else {
+                    *b"ILBM"
+                };
+                (pal, np, Camg::default(), ft)
             }
             MuxerMode::Ham6 => {
                 // HAM6: 6 bitplanes, palette serves the op-0b00 lookup
@@ -3789,6 +3801,13 @@ impl Muxer for IlbmMuxer {
             self.masking
         };
 
+        // ABIT is always uncompressed; everything else honours the
+        // muxer's compression choice.
+        let compression = if self.mode == MuxerMode::Acbm {
+            Compression::None
+        } else {
+            self.compression
+        };
         let bmhd = Bmhd {
             width: self.width as u16,
             height: self.height as u16,
@@ -3796,7 +3815,7 @@ impl Muxer for IlbmMuxer {
             y_origin: 0,
             n_planes,
             masking,
-            compression: self.compression,
+            compression,
             pad: 0,
             transparent_color: self.transparent_color,
             x_aspect: 1,
@@ -3814,7 +3833,11 @@ impl Muxer for IlbmMuxer {
             rgba: std::mem::take(&mut self.pending),
             ..IlbmImage::default()
         };
-        let bytes = encode_ilbm(&img)?;
+        let bytes = if self.mode == MuxerMode::Acbm {
+            encode_acbm(&img)?
+        } else {
+            encode_ilbm(&img)?
+        };
         self.output.write_all(&bytes)?;
         self.output.flush()?;
         self.written = true;

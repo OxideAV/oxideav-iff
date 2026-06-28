@@ -40,7 +40,10 @@ crate ships:
   per-plane ByteRun1 framing), a 24-bit literal layout (no ACBM
   producer), and the chunky PBM form (no contiguous-bitplane analogue)
   are each rejected. The `iff_acbm` demuxer (extension `.acbm`,
-  `FORM ACBM` probe) emits one `rawvideo` / `Rgba` keyframe.
+  `FORM ACBM` probe) emits one `rawvideo` / `Rgba` keyframe, and the
+  streaming [`ilbm::IlbmMuxer`] gains a [`ilbm::MuxerMode::Acbm`] that
+  emits a `FORM ACBM` (same indexed palette/plane-count derivation as
+  `IndexedAuto`, body forced uncompressed).
 - **FORM/ANIM** — op-0 literal + op-2/op-3 Long/Short Delta
   (encode+decode) + op-5 byte-vertical delta (encode+decode) +
   op-7 Short/Long Vertical Delta (encode+decode) + op-8 Anim8
@@ -334,8 +337,9 @@ list).
   (default — 1..=8 bitplanes, palette greedy-built from the first
   packet), `MuxerMode::Ham6` / `MuxerMode::Ham8` (CAMG-flagged Hold-
   And-Modify), `MuxerMode::Ehb` (32→64 EHB palette mirror),
-  `MuxerMode::Pbm` (chunky `FORM/PBM `), or
-  `MuxerMode::TrueColor24` (24-bit literal-RGB ILBM, no CMAP).
+  `MuxerMode::Pbm` (chunky `FORM/PBM `),
+  `MuxerMode::TrueColor24` (24-bit literal-RGB ILBM, no CMAP), or
+  `MuxerMode::Acbm` (contiguous-bitplane `FORM/ACBM`, uncompressed ABIT).
 - True-colour ILBM follows the EGFF §3.3.4 layout: `BMHD.n_planes == 24`,
   no `CMAP`, 8 red bitplanes (LSB→MSB), then 8 green, then 8 blue per
   scanline. ByteRun1 packs each plane row independently, exactly as in

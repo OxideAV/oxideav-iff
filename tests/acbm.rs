@@ -25,11 +25,15 @@
 #![allow(clippy::needless_range_loop)]
 
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use oxideav_core::{ContainerRegistry, Error, ReadSeek};
+use oxideav_core::{
+    CodecId, CodecParameters, ContainerRegistry, Error, MediaType, Muxer, Packet, PixelFormat,
+    ReadSeek, StreamInfo, TimeBase, WriteSeek,
+};
 use oxideav_iff::ilbm::{
     encode_acbm, encode_ilbm, indices_to_planar_row, parse_acbm, parse_ilbm, Bmhd, Camg,
-    Compression, Grab, IlbmImage, Masking, CAMG_EHB, CAMG_HAM,
+    Compression, Grab, IlbmImage, IlbmMuxer, Masking, MuxerMode, CAMG_EHB, CAMG_HAM,
 };
 
 fn bmhd(w: u16, h: u16, n_planes: u8, masking: Masking) -> Bmhd {
@@ -334,6 +338,73 @@ fn acbm_extension_routes_to_demuxer() {
     let mut reg = ContainerRegistry::new();
     oxideav_iff::register_containers(&mut reg);
     assert_eq!(reg.container_for_extension("acbm"), Some("iff_acbm"));
+}
+
+// ───────────────────── streaming muxer (MuxerMode::Acbm) ─────────────────────
+
+static CTR: AtomicU64 = AtomicU64::new(0);
+
+fn unique_path() -> std::path::PathBuf {
+    let n = CTR.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("oxideav-iff-acbm-{}-{n}.acbm", std::process::id()))
+}
+
+fn rgba_stream(width: u32, height: u32) -> StreamInfo {
+    let mut params = CodecParameters::video(CodecId::new("rawvideo"));
+    params.media_type = MediaType::Video;
+    params.width = Some(width);
+    params.height = Some(height);
+    params.pixel_format = Some(PixelFormat::Rgba);
+    StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 1),
+        duration: Some(1),
+        start_time: Some(0),
+        params,
+    }
+}
+
+#[test]
+fn muxer_acbm_mode_roundtrip() {
+    let w = 12u32;
+    let h = 8u32;
+    // A 4-colour checkerboard so the indexed palette stays small.
+    let palette = [[10u8, 20, 30], [200, 0, 0], [0, 200, 0], [0, 0, 200]];
+    let mut rgba = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let p = palette[((x + y) % 4) as usize];
+            rgba.extend_from_slice(&[p[0], p[1], p[2], 0xFF]);
+        }
+    }
+
+    let stream = rgba_stream(w, h);
+    let path = unique_path();
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = IlbmMuxer::new(ws, std::slice::from_ref(&stream))
+            .unwrap()
+            .with_mode(MuxerMode::Acbm);
+        mux.write_header().unwrap();
+        mux.write_packet(&Packet::new(0, stream.time_base, rgba.clone()))
+            .unwrap();
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).ok();
+
+    assert_eq!(&bytes[0..4], b"FORM");
+    assert_eq!(&bytes[8..12], b"ACBM");
+    assert!(find_chunk(&bytes, b"ABIT").is_some());
+    assert!(find_chunk(&bytes, b"BODY").is_none());
+
+    let dec = parse_acbm(&bytes).unwrap();
+    assert_eq!(&dec.form_type, b"ACBM");
+    assert_eq!(dec.bmhd.compression, Compression::None);
+    assert_eq!(dec.width, w);
+    assert_eq!(dec.height, h);
+    assert_eq!(dec.rgba, rgba, "ACBM muxer-mode round-trips the RGBA");
 }
 
 // ───────────────────── rejection cases ─────────────────────

@@ -38,7 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indexed / EHB / HAM image. Compressed ABIT, 24-bit literal layouts and
   the chunky PBM form (none of which have an ACBM analogue) are rejected.
   New `iff_acbm` demuxer (extension `.acbm`, `FORM ACBM` probe) emits one
-  `rawvideo` / `Rgba` keyframe.
+  `rawvideo` / `Rgba` keyframe, and the streaming `IlbmMuxer` gains a
+  `MuxerMode::Acbm` (same indexed palette/plane derivation as
+  `IndexedAuto`; body forced uncompressed).
 - *(ilbm)* **`FORM TVPP` (TVPaint project) best-effort decode** (§2,
   non-canonical / community RE). `ilbm::parse_tvpp` decodes the DEEP-
   vocabulary raster (`DGBL` / `DPEL` / `DLOC` / `DBOD` / `DCHG`) exactly as
