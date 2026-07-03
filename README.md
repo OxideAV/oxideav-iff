@@ -1,5 +1,7 @@
 # oxideav-iff
 
+[![CI](https://github.com/OxideAV/oxideav-iff/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-iff/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-iff.svg)](https://crates.io/crates/oxideav-iff) [![docs.rs](https://docs.rs/oxideav-iff/badge.svg)](https://docs.rs/oxideav-iff) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust EA IFF 85 container support for oxideav — the chunk reader
 that underlies the entire `FORM / LIST / CAT` family. Today this
 crate ships:
