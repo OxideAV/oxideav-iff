@@ -378,7 +378,10 @@ Read + round-trip support for `FORM / ILBM`:
 chunks with ILBM but stores the BODY as a chunky 8-bit-per-pixel byte
 stream (no bitplane interleave). Read + write supported with
 uncompressed and ByteRun1 BODY; HAM and `HasMask`-plane masking are
-not legal in PBM and are rejected on encode/decode.
+not legal in PBM and are rejected on encode/decode. The
+`HasTransparentColor` colour key and the `Lasso` seed-fill
+transparency both decode identically to the planar ILBM path (the
+lasso fill runs on the chunky index buffer).
 
 ### ANIM — animated ILBM
 

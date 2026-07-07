@@ -118,6 +118,71 @@ fn lasso_enclosed_transparent_pixel_stays_opaque() {
     assert_eq!(&img.rgba[i..i + 3], &[10, 20, 30]);
 }
 
+/// Chunky `FORM PBM ` (8-bit-per-pixel) sibling of `build_ilbm`; same 5×5
+/// index layout, BODY is one byte per pixel word-padded to `stride = 6`.
+fn build_pbm(masking: u8) -> Vec<u8> {
+    let mut bmhd = Vec::new();
+    bmhd.extend_from_slice(&5u16.to_be_bytes()); // width
+    bmhd.extend_from_slice(&5u16.to_be_bytes()); // height
+    bmhd.extend_from_slice(&0i16.to_be_bytes());
+    bmhd.extend_from_slice(&0i16.to_be_bytes());
+    bmhd.push(8); // nPlanes — PBM is 8 bits/pixel
+    bmhd.push(masking);
+    bmhd.push(0); // compression none
+    bmhd.push(0);
+    bmhd.extend_from_slice(&0u16.to_be_bytes()); // transparentColor = 0
+    bmhd.push(1);
+    bmhd.push(1);
+    bmhd.extend_from_slice(&5i16.to_be_bytes());
+    bmhd.extend_from_slice(&5i16.to_be_bytes());
+
+    let cmap = [10u8, 20, 30, 200, 100, 50];
+
+    let idx: [[u8; 5]; 5] = [
+        [0, 0, 0, 0, 0],
+        [0, 1, 1, 1, 0],
+        [0, 1, 0, 1, 0],
+        [0, 1, 1, 1, 0],
+        [0, 0, 0, 0, 0],
+    ];
+    let mut body = Vec::new();
+    for row in idx {
+        for v in row {
+            body.push(v);
+        }
+        body.push(0); // stride padding to even (6 bytes/row)
+    }
+
+    let mut inner = Vec::new();
+    inner.extend_from_slice(b"PBM ");
+    push_chunk(&mut inner, b"BMHD", &bmhd);
+    push_chunk(&mut inner, b"CMAP", &cmap);
+    push_chunk(&mut inner, b"BODY", &body);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"FORM");
+    out.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+    out.extend_from_slice(&inner);
+    out
+}
+
+#[test]
+fn pbm_lasso_matches_planar_semantics() {
+    let img = parse_ilbm(&build_pbm(3)).unwrap();
+    assert_eq!(&img.form_type, b"PBM ");
+    // Border 0-pixels transparent, box opaque, enclosed centre opaque.
+    assert_eq!(alpha_at(&img, 0, 0), 0x00);
+    assert_eq!(alpha_at(&img, 1, 1), 0xFF);
+    assert_eq!(
+        alpha_at(&img, 2, 2),
+        0xFF,
+        "enclosed pixel opaque under lasso"
+    );
+    // Colour key variant makes the enclosed pixel transparent.
+    let keyed = parse_ilbm(&build_pbm(2)).unwrap();
+    assert_eq!(alpha_at(&keyed, 2, 2), 0x00);
+}
+
 #[test]
 fn plain_transparent_color_keys_the_enclosed_pixel() {
     // Contrast: with mskHasTransparentColor (== 2) the enclosed pixel IS

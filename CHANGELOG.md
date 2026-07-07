@@ -32,9 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pixels 4-connected to the image edge become transparent while an
   enclosed pocket of that colour stays opaque (the lasso-vs-plain-colour-
   key distinction). Applied to indexed (non-HAM) BODIES; the masking byte
-  round-trips through `encode_ilbm` with no mask plane written. New
-  `ilbm_lasso.rs` test (4 cases, incl. a `mskHasTransparentColor`
-  contrast).
+  round-trips through `encode_ilbm` with no mask plane written. The
+  chunky `FORM PBM ` path applies the same fill on its index buffer. New
+  `ilbm_lasso.rs` test (5 cases, incl. a `mskHasTransparentColor`
+  contrast and a PBM case).
 - *(ilbm)* **`PCHG` change-list encoder (`Pchg::encode` /
   `Pchg::from_lines`).** The inverse of `Pchg::parse` for the
   uncompressed change-record encodings: it rebuilds the 20-byte header

@@ -2302,6 +2302,20 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
                 rgba[dst + 3] = alpha;
             }
         }
+        // `mskLasso` on the chunky PBM form: same §BMHD seed fill as the
+        // planar path. Build a width-contiguous index buffer (dropping the
+        // even-stride padding) and clear the alpha of every filled pixel.
+        if bmhd.masking == Masking::Lasso {
+            let w = bmhd.width as usize;
+            let h = bmhd.height as usize;
+            let mut contiguous = Vec::with_capacity(w * h);
+            for y in 0..h {
+                contiguous.extend_from_slice(&indices_all[y * stride..y * stride + w]);
+            }
+            for i in lasso_transparent_mask(&contiguous, w, h, bmhd.transparent_color) {
+                rgba[i * 4 + 3] = 0x00;
+            }
+        }
         return Ok(IlbmImage {
             width,
             height,
