@@ -24,6 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* **`mskLasso` (BMHD masking == 3) seed-fill transparency.**
+  Previously the masking value was tolerated but the image decoded fully
+  opaque. `render_indexed_planar` now implements the ilbm.txt §BMHD lasso
+  algorithm — conceptually ring the image with a 1-pixel border of
+  `transparentColor`, then seed-fill inward — so only `transparentColor`
+  pixels 4-connected to the image edge become transparent while an
+  enclosed pocket of that colour stays opaque (the lasso-vs-plain-colour-
+  key distinction). Applied to indexed (non-HAM) BODIES; the masking byte
+  round-trips through `encode_ilbm` with no mask plane written. New
+  `ilbm_lasso.rs` test (4 cases, incl. a `mskHasTransparentColor`
+  contrast).
 - *(ilbm)* **`PCHG` change-list encoder (`Pchg::encode` /
   `Pchg::from_lines`).** The inverse of `Pchg::parse` for the
   uncompressed change-record encodings: it rebuilds the 20-byte header

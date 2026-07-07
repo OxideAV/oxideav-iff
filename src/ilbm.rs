@@ -127,8 +127,11 @@ pub enum Masking {
     HasMask,
     /// Pixels equal to `BMHD.transparent_colour` are transparent.
     HasTransparentColor,
-    /// Lasso (an Amiga editor tool); we tolerate the value but treat
-    /// the image as opaque.
+    /// Lasso (an Amiga editor cookie-cut tool). No mask plane is stored;
+    /// the transparent region is derived by a seed fill from the image
+    /// border through pixels equal to `BMHD.transparent_colour`, so an
+    /// enclosed run of that colour stays opaque (ilbm.txt §BMHD). Applied
+    /// on decode for indexed (non-HAM) BODIES.
     Lasso,
 }
 
@@ -2441,11 +2444,84 @@ struct IndexedPlanarParts {
     drngs: Vec<Drng>,
 }
 
+/// Compute the `mskLasso` transparent-pixel set (ilbm.txt §BMHD).
+///
+/// The spec algorithm: conceptually surround the `width × height` image
+/// with a one-pixel border of `transparent_color`, then flood-fill (seed
+/// fill) inward from that border; every pixel the fill reaches is
+/// transparent. Because the virtual border is entirely
+/// `transparent_color`, the fill enters the image at any edge pixel whose
+/// index equals `transparent_color` and spreads through 4-connected
+/// runs of `transparent_color`. Interior `transparent_color` pixels that
+/// are fully enclosed by non-transparent pixels are *not* reached and
+/// stay opaque — that is the whole point of a lasso versus a plain
+/// colour key.
+///
+/// Returns the flat pixel indices (`y * width + x`) that are transparent.
+fn lasso_transparent_mask(
+    indices: &[u8],
+    width: usize,
+    height: usize,
+    transparent_color: u16,
+) -> Vec<usize> {
+    if width == 0 || height == 0 || transparent_color > u8::MAX as u16 {
+        return Vec::new();
+    }
+    let key = transparent_color as u8;
+    let mut visited = vec![false; width * height];
+    let mut stack: Vec<usize> = Vec::new();
+
+    // Seed from every edge pixel that matches the transparent colour —
+    // exactly the image cells the virtual border touches.
+    let seed = |x: usize, y: usize, stack: &mut Vec<usize>, visited: &mut [bool]| {
+        let p = y * width + x;
+        if !visited[p] && indices.get(p).copied() == Some(key) {
+            visited[p] = true;
+            stack.push(p);
+        }
+    };
+    for x in 0..width {
+        seed(x, 0, &mut stack, &mut visited);
+        seed(x, height - 1, &mut stack, &mut visited);
+    }
+    for y in 0..height {
+        seed(0, y, &mut stack, &mut visited);
+        seed(width - 1, y, &mut stack, &mut visited);
+    }
+
+    let mut out: Vec<usize> = Vec::new();
+    while let Some(p) = stack.pop() {
+        out.push(p);
+        let x = p % width;
+        let y = p / width;
+        let visit = |nx: usize, ny: usize, stack: &mut Vec<usize>, visited: &mut [bool]| {
+            let q = ny * width + nx;
+            if !visited[q] && indices.get(q).copied() == Some(key) {
+                visited[q] = true;
+                stack.push(q);
+            }
+        };
+        if x > 0 {
+            visit(x - 1, y, &mut stack, &mut visited);
+        }
+        if x + 1 < width {
+            visit(x + 1, y, &mut stack, &mut visited);
+        }
+        if y > 0 {
+            visit(x, y - 1, &mut stack, &mut visited);
+        }
+        if y + 1 < height {
+            visit(x, y + 1, &mut stack, &mut visited);
+        }
+    }
+    out
+}
+
 /// Resolve a scanline-interleaved planar buffer to packed RGBA8888,
 /// honouring EHB-expansion, SHAM per-line palettes, PCHG cumulative
 /// palette overlays, HAM6/HAM8 hold-and-modify, the `HasMask`
-/// scanline, and transparent-colour keying — exactly as the
-/// original indexed `parse_ilbm` tail did.
+/// scanline, transparent-colour keying, and `mskLasso` seed-fill
+/// transparency — exactly as the original indexed `parse_ilbm` tail did.
 fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<IlbmImage> {
     let IndexedPlanarParts {
         rows_planar,
@@ -2469,6 +2545,23 @@ fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<IlbmImage> {
     let width = bmhd.width as u32;
     let height = bmhd.height as u32;
     let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+
+    // `mskLasso` (BMHD masking == 3) derives its transparency by a seed
+    // fill rather than a stored mask plane (ilbm.txt §BMHD: "put a 1
+    // pixel border of transparentColor around the image rectangle. Then
+    // do a seed fill from this border. Filled pixels are to be
+    // transparent."). It only applies to indexed BODIES keyed on
+    // `transparentColor` (§BMHD: "This only applies if masking is
+    // mskHasTransparentColor or mskLasso"); HAM has no fixed index→colour
+    // map so, like the transparent-colour path, lasso is disabled there.
+    // We retain every scanline's palette index to run the fill after the
+    // rows are laid out.
+    let do_lasso = bmhd.masking == Masking::Lasso && !camg.is_ham() && !has_mask_plane;
+    let mut lasso_indices: Vec<u8> = if do_lasso {
+        Vec::with_capacity((width as usize) * (height as usize))
+    } else {
+        Vec::new()
+    };
 
     // Decide effective default palette (EHB-expanded if requested).
     let default_palette: Vec<[u8; 3]> = if camg.is_ehb() && palette.len() <= 32 {
@@ -2515,6 +2608,9 @@ fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<IlbmImage> {
             .map(|p| rows_planar[row_base + p].as_slice())
             .collect();
         let indices = planar_row_to_indices(&plane_refs, bmhd.width);
+        if do_lasso {
+            lasso_indices.extend_from_slice(&indices);
+        }
 
         // Resolve to RGB.
         let row_palette: &[[u8; 3]] = if let Some(sham) = &sham {
@@ -2582,6 +2678,19 @@ fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<IlbmImage> {
                 0xFF
             };
             rgba[dst + 3] = alpha;
+        }
+    }
+
+    // `mskLasso` second pass: seed-fill the transparent region from the
+    // image border and clear the alpha of every filled pixel.
+    if do_lasso {
+        for i in lasso_transparent_mask(
+            &lasso_indices,
+            width as usize,
+            height as usize,
+            bmhd.transparent_color,
+        ) {
+            rgba[i * 4 + 3] = 0x00;
         }
     }
 

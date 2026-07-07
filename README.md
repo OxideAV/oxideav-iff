@@ -289,6 +289,7 @@ Read + round-trip support for `FORM / ILBM`:
 | HAM8 (8-plane Hold-And-Modify, 6-bit ch) |  Y   |   Y   |
 | `Masking::HasMask` plane → alpha         |  Y   |   Y   |
 | `Masking::HasTransparentColor` keying    |  Y   |   Y   |
+| `Masking::Lasso` seed-fill transparency  |  Y   |   Y   |
 | `GRAB` hotspot (mouse-pointer anchor)    |  Y   |   Y   |
 | `DEST` destination-merge (depth/pick/on/mask) |  Y   |   Y   |
 | `SPRT` sprite precedence (UWORD, 0=foremost) |  Y   |   Y   |
@@ -357,6 +358,14 @@ Read + round-trip support for `FORM / ILBM`:
   literal-RGB BODY and the decoder rejects it; alpha is always
   `0xFF` on decode and is dropped on encode (24-bit ILBM has no
   transparent-colour key either).
+- `Masking::Lasso` (BMHD masking == 3) stores no mask plane; its
+  transparency is *derived* on decode by the ilbm.txt §BMHD seed-fill:
+  the reader conceptually rings the image with a 1-pixel border of
+  `transparentColor` and flood-fills inward, so only pixels of that
+  colour connected to the image edge become transparent — an enclosed
+  pocket of `transparentColor` stays opaque (the lasso-vs-plain-colour-
+  key distinction). Applied to indexed (non-HAM) BODIES; the masking
+  byte round-trips through `encode_ilbm` (no mask plane is written).
 - Cross-validated end-to-end against an external ILBM-capable image
   tool (decode → PPM → pixel-compare; black-box validator only). Set
   `OXIDEAV_IFF_MAGICK_CROSS=1` to enable the cross-decode tests; they
