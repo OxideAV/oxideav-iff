@@ -294,16 +294,24 @@ Read + round-trip support for `FORM / ILBM`:
 | `SPRT` sprite precedence (UWORD, 0=foremost) |  Y   |   Y   |
 | `SHAM` Sliced HAM (per-line 16×RGB444)   |  Y   |   Y   |
 | `PCHG` palette change list (small fmt)   |  Y   |   Y   |
-| `PCHG` palette change list (big fmt)     |  Y   |   N*  |
+| `PCHG` palette change list (big fmt)     |  Y   |   Y   |
 | `CRNG` DPaint colour-range cycling       |  Y   |   Y   |
 | `CCRT` Graphicraft colour-cycling timing |  Y   |   Y   |
 | `DRNG` DPaint IV extended range cycling  |  Y   |   Y   |
 | `IlbmMuxer` mode select (HAM/EHB/PBM)    |  -   |   Y   |
 | Output pixel format                      | RGBA |  -    |
 
-`*` PCHG big-format chunks are decoded but the writer round-trips
-the original raw bytes verbatim (no re-encode from the parsed entry
-list).
+- `PCHG` chunks round-trip byte-verbatim through `encode_ilbm` (the
+  writer preserves `Pchg::raw`). On top of that, [`ilbm::Pchg::encode`]
+  re-encodes a change list into a fresh, self-consistent chunk body for
+  either the `Small` (12-bit RGB444) or `Big` (24-bit RGB888)
+  [`ilbm::PchgKind`], re-deriving all 20-byte-header hints so
+  `header_matches_payload()` holds; [`ilbm::Pchg::from_lines`] builds a
+  `Pchg` from a decoded change list for authoring PCHG-aware images from
+  scratch. `parse(encode(Big)).lines == lines` losslessly; `Small` is
+  4-bit-per-channel lossy. The annex Huffman mode (`Compression == 1`)
+  is neither decoded nor emitted (its wire layout is undocumented in the
+  staged spec); such chunks still round-trip via `Pchg::raw`.
 
 - Public API: [`ilbm::parse_ilbm`], [`ilbm::encode_ilbm`],
   [`ilbm::IlbmImage`], [`ilbm::Bmhd`], [`ilbm::Camg`],

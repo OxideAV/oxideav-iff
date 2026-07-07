@@ -24,6 +24,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* **`PCHG` change-list encoder (`Pchg::encode` /
+  `Pchg::from_lines`).** The inverse of `Pchg::parse` for the
+  uncompressed change-record encodings: it rebuilds the 20-byte header
+  (re-deriving every hint via `derive_header_hints` so
+  `header_matches_payload()` holds) and the per-line change records from
+  the decoded `PchgLine` list, for either the `Small` (12-bit RGB444) or
+  `Big` (24-bit RGB888) `PchgKind`. The covered scanline window is
+  derived from the change list (`StartLine` = smallest changed line,
+  `LineCount` spanning through the largest, gap lines emitted as
+  zero-change records), and an unsorted list is placed in scanline order.
+  `parse(encode(Big)).lines == lines` losslessly; `Small` quantises each
+  channel to 4 bits. `Pchg::from_lines` builds a self-consistent `Pchg`
+  (its `raw` is the encoded body, its `lines` the re-parse of that body)
+  so a hand-authored PCHG serialises through `encode_ilbm` and survives a
+  `parse_ilbm` round-trip. This closes the former big-format write gap:
+  the writer can now re-encode from the parsed entry list rather than
+  only round-tripping the original raw bytes. The annex Huffman mode
+  (`Compression == 1`) stays undecoded/unemitted (undocumented wire
+  layout) and continues to round-trip via `Pchg::raw`.
 - *(ilbm)* **`FORM ACBM` (Amiga Contiguous BitMap) read + round-trip.**
   ACBM is the AmigaBASIC sibling of ILBM whose row-interleaved `BODY` is
   replaced by an `ABIT` chunk holding the bitplanes plane-by-plane,

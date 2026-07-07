@@ -1013,6 +1013,142 @@ impl Pchg {
             && h.max_changes == mc
             && h.total_changes == tc
     }
+
+    /// Serialise [`Self::lines`] into a fresh, self-consistent PCHG chunk
+    /// body — the exact inverse of [`Pchg::parse`] for the uncompressed
+    /// (`Compression == 0`) change-record encodings.
+    ///
+    /// This is the "re-encode from the parsed entry list" path: unlike the
+    /// byte-verbatim round-trip that preserves [`Self::raw`], this rebuilds
+    /// the 20-byte header (with every hint re-derived by
+    /// [`Self::derive_header_hints`] so [`Self::header_matches_payload`]
+    /// holds on the result) and the per-line change records from the
+    /// decoded [`PchgLine`] list. Callers that edited the change list — or
+    /// built a `Pchg` from scratch with [`Pchg::from_lines`] — use this to
+    /// emit a valid chunk body without carrying the original wire bytes.
+    ///
+    /// The covered scanline range is derived from the change list: the
+    /// header `StartLine` is the smallest `line` present and `LineCount`
+    /// spans through the largest, with the intervening gap lines emitted as
+    /// zero-change records (exactly what [`Pchg::parse`] round-trips back to
+    /// the same `lines`). An empty change list yields a 20-byte
+    /// header-only body with `StartLine = 0`, `LineCount = 0`.
+    ///
+    /// `kind` selects the record encoding written:
+    ///
+    /// * [`PchgKind::Small`] — 12-bit channels. Each change is
+    ///   `(u8 RegisterIndex, u16 RGB444)`; the 8-bit RGB in each
+    ///   [`PchgChange`] is quantised to 4 bits per channel (high nibble),
+    ///   so this encoding is lossy unless every channel is already a
+    ///   multiple of `0x11`. Register indices above `0xFF` and per-line
+    ///   change counts above `0xFF` saturate to their field maxima.
+    /// * [`PchgKind::Big`] — 24-bit channels. Each change is
+    ///   `(u16 RegisterIndex, u8 R, u8 G, u8 B)`, a lossless 8-bit-per-
+    ///   channel encoding; per-line change counts above `0xFFFF` saturate.
+    ///
+    /// `parse(encode(Big)).lines == lines` for any change list whose line
+    /// numbers fit `i16` and whose register indices fit `u16`; the same
+    /// holds for `Small` once each channel is 4-bit-quantised.
+    pub fn encode(&self, kind: PchgKind) -> Vec<u8> {
+        // Establish the covered scanline window from the change list.
+        let mut start = u32::MAX;
+        let mut end = 0u32;
+        for l in &self.lines {
+            if l.changes.is_empty() {
+                continue;
+            }
+            start = start.min(l.line);
+            end = end.max(l.line);
+        }
+        let (start_line_i, line_count) = if start == u32::MAX {
+            (0i16, 0u16)
+        } else {
+            let sl = i16::try_from(start).unwrap_or(i16::MAX);
+            // span = end - start + 1, clamped into the u16 LineCount field.
+            let span = (end - start).saturating_add(1);
+            (sl, u16::try_from(span).unwrap_or(u16::MAX))
+        };
+
+        let (changed_lines, min_reg, max_reg, max_changes, total_changes) =
+            self.derive_header_hints();
+
+        let big = matches!(kind, PchgKind::Big);
+        let flags: u16 = if big { 0x0002 } else { 0x0001 };
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u16.to_be_bytes()); // Compression = 0 (none)
+        out.extend_from_slice(&flags.to_be_bytes());
+        out.extend_from_slice(&start_line_i.to_be_bytes());
+        out.extend_from_slice(&line_count.to_be_bytes());
+        out.extend_from_slice(&changed_lines.to_be_bytes());
+        out.extend_from_slice(&min_reg.to_be_bytes());
+        out.extend_from_slice(&max_reg.to_be_bytes());
+        out.extend_from_slice(&max_changes.to_be_bytes());
+        out.extend_from_slice(&total_changes.to_be_bytes());
+
+        if line_count == 0 {
+            return out;
+        }
+
+        // Index the (possibly unsorted) change list by absolute line so the
+        // per-line records emit in scanline order with zero-change gaps.
+        let start = start_line_i as i32;
+        for li in 0..line_count as i32 {
+            let line_no = (start + li) as u32;
+            let changes: &[PchgChange] = self
+                .lines
+                .iter()
+                .find(|l| l.line == line_no && !l.changes.is_empty())
+                .map(|l| l.changes.as_slice())
+                .unwrap_or(&[]);
+            if big {
+                let cc = u16::try_from(changes.len()).unwrap_or(u16::MAX);
+                out.extend_from_slice(&cc.to_be_bytes());
+                for ch in changes.iter().take(cc as usize) {
+                    out.extend_from_slice(&ch.index.to_be_bytes());
+                    out.extend_from_slice(&ch.rgb);
+                }
+            } else {
+                let cc = u8::try_from(changes.len()).unwrap_or(u8::MAX);
+                out.push(cc);
+                for ch in changes.iter().take(cc as usize) {
+                    let idx = u8::try_from(ch.index).unwrap_or(u8::MAX);
+                    let r4 = ch.rgb[0] >> 4;
+                    let g4 = ch.rgb[1] >> 4;
+                    let b4 = ch.rgb[2] >> 4;
+                    out.push(idx);
+                    out.push(r4); // byte1: low nibble = R
+                    out.push((g4 << 4) | b4); // byte2: (G << 4) | B
+                }
+            }
+        }
+        out
+    }
+
+    /// Build a `Pchg` from a decoded change list, encoding a fresh,
+    /// self-consistent [`Self::raw`] with [`Pchg::encode`].
+    ///
+    /// The stored [`Self::lines`] are the round-trip of the encoded bytes
+    /// (i.e. `parse(encode(...)).lines`) so the struct is internally
+    /// consistent — for [`PchgKind::Small`] this means the channels in the
+    /// returned `lines` are 4-bit-quantised copies of the input. The
+    /// resulting `Pchg` serialises through [`encode_ilbm`] (which emits
+    /// `raw` verbatim) into a valid `PCHG` chunk, so callers can author a
+    /// per-scanline palette-change list from scratch.
+    pub fn from_lines(lines: Vec<PchgLine>, kind: PchgKind) -> Self {
+        let staged = Self {
+            raw: Vec::new(),
+            lines,
+        };
+        let raw = staged.encode(kind);
+        // Re-parse so `lines` reflects exactly what the bytes decode to
+        // (folding in the Small-format 4-bit quantisation). `encode`
+        // always emits a structurally valid body, so this never fails.
+        Self::parse(&raw).unwrap_or(Self {
+            raw,
+            lines: staged.lines,
+        })
+    }
 }
 
 // ───────────────────── CRNG (Color Range) ─────────────────────
