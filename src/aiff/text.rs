@@ -201,7 +201,7 @@ mod tests {
         // a literal `[c] ` would be a typographic transcription of the
         // round-bracket form. We use the canonical round-bracket form
         // throughout: `0x28 0x63 0x29 0x20`.
-        assert_eq!(TextKind::Copyright.ck_id(), [b'(', b'c', b')', b' ']);
+        assert_eq!(TextKind::Copyright.ck_id(), *b"(c) ");
     }
 
     #[test]

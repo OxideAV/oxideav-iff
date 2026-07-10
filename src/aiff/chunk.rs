@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn truncated_header_errors() {
-        let buf = [b'X', b'Y', b'Z']; // 3 bytes — no full header.
+        let buf = *b"XYZ"; // 3 bytes — no full header.
         let mut it = ChunkIter::new(&buf);
         assert!(matches!(it.next(), Some(Err(AiffError::Truncated(_)))));
         assert!(it.next().is_none());
