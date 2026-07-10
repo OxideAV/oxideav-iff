@@ -273,11 +273,124 @@ impl Bmhd {
 
 // ───────────────────── CAMG ─────────────────────
 
-/// `CAMG` viewport-mode flag bits we recognise. Other bits (interlace,
-/// hires, lace, etc.) are preserved on round-trip but ignored by the
-/// pixel pipeline.
-pub const CAMG_HAM: u32 = 0x0800;
+// `CAMG` stores one 32-bit big-endian longword whose meaning changed
+// between AmigaOS releases: under 1.x only the low 16 bits are
+// meaningful (a copy of the `ViewPort.Modes` bitmask), while under
+// 2.0+ the full value is a ModeID / DisplayID — a 16-bit monitor key
+// in the high word ORed with a mode key in the low word. A legacy
+// 16-bit ViewMode is promoted to a DisplayID by treating the monitor
+// part as `DEFAULT_MONITOR_ID` (0).
+//
+// The pixel pipeline only acts on the low-word format bits (HAM /
+// EHB / HIRES / SUPERHIRES / LACE / dual-playfield); the monitor part
+// selects display timing and is irrelevant to pixel reconstruction.
+// Every bit is preserved on round-trip.
+
+/// `CAMG` ViewMode bit — genlock: bit 0 of a color register becomes a
+/// video-overlay control bit.
+pub const CAMG_GENLOCK_VIDEO: u32 = 0x0002;
+/// `CAMG` ViewMode bit — interlaced (double vertical resolution,
+/// field-alternating).
+pub const CAMG_LACE: u32 = 0x0004;
+/// `CAMG` ViewMode bit — doublescan / scan-doubled (ECS+).
+pub const CAMG_DOUBLESCAN: u32 = 0x0008;
+/// `CAMG` ViewMode bit — super-hires horizontal resolution (~1280 px,
+/// ECS+).
+pub const CAMG_SUPERHIRES: u32 = 0x0020;
+/// `CAMG` ViewMode bit — dual-playfield: playfield 2 has display
+/// priority over playfield 1.
+pub const CAMG_PFBA: u32 = 0x0040;
+/// `CAMG` ViewMode bit — Extra-Half-Brite: 64 colors, the 32 CMAP
+/// entries plus the same 32 at half intensity.
 pub const CAMG_EHB: u32 = 0x0080;
+/// `CAMG` ViewMode bit — genlock: audio bit / external audio sync.
+pub const CAMG_GENLOCK_AUDIO: u32 = 0x0100;
+/// `CAMG` ViewMode bit — dual-playfield mode (two independent overlaid
+/// playfields).
+pub const CAMG_DUALPF: u32 = 0x0400;
+/// `CAMG` ViewMode bit — Hold-And-Modify 4096-color mode; 2 of the 6
+/// bitplanes select "hold, modify R/G/B".
+pub const CAMG_HAM: u32 = 0x0800;
+/// `CAMG` ViewMode bit — ECS extended-mode flag (present with newer
+/// DisplayIDs).
+pub const CAMG_EXTENDED_MODE: u32 = 0x1000;
+/// `CAMG` ViewMode bit — ViewPort should be hidden / not displayed.
+pub const CAMG_VP_HIDE: u32 = 0x2000;
+/// `CAMG` ViewMode bit — ViewPort uses sprites.
+pub const CAMG_SPRITES: u32 = 0x4000;
+/// `CAMG` ViewMode bit — high horizontal resolution (~640 px).
+pub const CAMG_HIRES: u32 = 0x8000;
+
+/// The `CAMG` bits that are **not** display-format bits: the
+/// traditional "old ViewMode" mask strips these (plus any high-word
+/// monitor bits) before interpreting a CAMG as a 16-bit ViewMode.
+pub const CAMG_JUNK_MASK: u32 =
+    CAMG_EXTENDED_MODE | CAMG_SPRITES | CAMG_VP_HIDE | CAMG_GENLOCK_AUDIO | CAMG_GENLOCK_VIDEO;
+
+/// The low-word format bits a raster decoder acts on: HAM, EHB, HIRES,
+/// SUPERHIRES, LACE and the dual-playfield pair (DUALPF / PFBA).
+pub const CAMG_FORMAT_MASK: u32 =
+    CAMG_HAM | CAMG_EHB | CAMG_HIRES | CAMG_SUPERHIRES | CAMG_LACE | CAMG_DUALPF | CAMG_PFBA;
+
+// DisplayID / ModeID keys. A 32-bit ModeID = monitor ID (high word,
+// selects the monitor/timing) OR mode key (low word, selects
+// resolution/format); build a specific mode by ORing the two, e.g.
+// `PAL_MONITOR_ID | HAMLACE_KEY`.
+
+/// Isolates the monitor part of a 32-bit ModeID.
+pub const MONITOR_ID_MASK: u32 = 0xFFFF_1000;
+
+/// Native NTSC/PAL per machine.
+pub const DEFAULT_MONITOR_ID: u32 = 0x0000_0000;
+pub const NTSC_MONITOR_ID: u32 = 0x0001_1000;
+pub const PAL_MONITOR_ID: u32 = 0x0002_1000;
+pub const VGA_MONITOR_ID: u32 = 0x0003_1000;
+pub const A2024_MONITOR_ID: u32 = 0x0004_1000;
+pub const PROTO_MONITOR_ID: u32 = 0x0005_1000;
+pub const EURO72_MONITOR_ID: u32 = 0x0006_1000;
+pub const EURO36_MONITOR_ID: u32 = 0x0007_1000;
+pub const SUPER72_MONITOR_ID: u32 = 0x0008_1000;
+pub const DBLNTSC_MONITOR_ID: u32 = 0x0009_1000;
+pub const DBLPAL_MONITOR_ID: u32 = 0x000A_1000;
+
+// Base mode keys (default monitor; OR with a monitor ID for a specific
+// one). The keys fold the equivalent low-word ViewMode format bits;
+// additionally `0x0001` marks the flicker-fixed (FF) scan variants and
+// `0x0008` the scan-doubled (DBL) modes on the multiscan monitors.
+pub const LORES_KEY: u32 = 0x0000_0000;
+pub const HIRES_KEY: u32 = 0x0000_8000;
+pub const SUPER_KEY: u32 = 0x0000_8020;
+pub const HAM_KEY: u32 = 0x0000_0800;
+pub const EXTRAHALFBRITE_KEY: u32 = 0x0000_0080;
+pub const LORESDPF_KEY: u32 = 0x0000_0400;
+pub const HIRESDPF_KEY: u32 = 0x0000_8400;
+pub const SUPERDPF_KEY: u32 = 0x0000_8420;
+pub const LORESDPF2_KEY: u32 = 0x0000_0440;
+pub const LORESLACE_KEY: u32 = 0x0000_0004;
+pub const HIRESLACE_KEY: u32 = 0x0000_8004;
+pub const SUPERLACE_KEY: u32 = 0x0000_8024;
+pub const HAMLACE_KEY: u32 = 0x0000_0804;
+pub const EXTRAHALFBRITELACE_KEY: u32 = 0x0000_0084;
+pub const HIRESHAM_KEY: u32 = 0x0000_8800;
+pub const SUPERHAM_KEY: u32 = 0x0000_8820;
+pub const LORESSDBL_KEY: u32 = 0x0000_0008;
+
+// Selected monitor-qualified keys (monitor ID | mode key). The full
+// permutation space (VGA / EURO72 / SUPER72 / DBLNTSC / DBLPAL, each
+// with LORES/HIRES/SUPER x HAM/EHB/DPF/DPF2 x LACE/FF/DBL) is
+// systematic; these cover the common named ones.
+pub const VGALORES_KEY: u32 = 0x0003_9004;
+/// VGA "productivity" super-hires.
+pub const VGAPRODUCT_KEY: u32 = 0x0003_9024;
+pub const VGAHAM_KEY: u32 = 0x0003_1804;
+pub const DBLNTSCLORES_KEY: u32 = 0x0009_1000;
+pub const DBLNTSCHIRES_KEY: u32 = 0x0009_9000;
+pub const DBLPALLORES_KEY: u32 = 0x000A_1000;
+pub const DBLPALHIRES_KEY: u32 = 0x000A_9000;
+pub const SUPER72LORESDBL_KEY: u32 = 0x0008_1008;
+pub const SUPER72HIRESDBL_KEY: u32 = 0x0008_9008;
+pub const A2024TENHERTZ_KEY: u32 = 0x0004_1000;
+pub const A2024FIFTEENHERTZ_KEY: u32 = 0x0004_9000;
 
 /// A parsed `CAMG` viewport mode. `raw` retains every flag bit so a
 /// round-trip preserves the original word.
@@ -298,12 +411,125 @@ impl Camg {
             raw: u32::from_be_bytes([body[0], body[1], body[2], body[3]]),
         })
     }
+    /// Hold-And-Modify ([`CAMG_HAM`]).
     pub fn is_ham(self) -> bool {
         self.raw & CAMG_HAM != 0
     }
+    /// Extra-Half-Brite ([`CAMG_EHB`]).
     pub fn is_ehb(self) -> bool {
         self.raw & CAMG_EHB != 0
     }
+    /// Interlaced ([`CAMG_LACE`]).
+    pub fn is_lace(self) -> bool {
+        self.raw & CAMG_LACE != 0
+    }
+    /// High horizontal resolution (~640 px, [`CAMG_HIRES`]).
+    pub fn is_hires(self) -> bool {
+        self.raw & CAMG_HIRES != 0
+    }
+    /// Super-hires horizontal resolution (~1280 px,
+    /// [`CAMG_SUPERHIRES`]).
+    pub fn is_superhires(self) -> bool {
+        self.raw & CAMG_SUPERHIRES != 0
+    }
+    /// Doublescan / scan-doubled ([`CAMG_DOUBLESCAN`]).
+    pub fn is_doublescan(self) -> bool {
+        self.raw & CAMG_DOUBLESCAN != 0
+    }
+    /// Dual-playfield mode ([`CAMG_DUALPF`]).
+    pub fn is_dualpf(self) -> bool {
+        self.raw & CAMG_DUALPF != 0
+    }
+    /// Dual-playfield priority: playfield 2 above playfield 1
+    /// ([`CAMG_PFBA`]).
+    pub fn is_pfba(self) -> bool {
+        self.raw & CAMG_PFBA != 0
+    }
+    /// Genlock video-overlay control ([`CAMG_GENLOCK_VIDEO`]).
+    pub fn is_genlock_video(self) -> bool {
+        self.raw & CAMG_GENLOCK_VIDEO != 0
+    }
+    /// Genlock audio bit ([`CAMG_GENLOCK_AUDIO`]).
+    pub fn is_genlock_audio(self) -> bool {
+        self.raw & CAMG_GENLOCK_AUDIO != 0
+    }
+    /// ECS extended-mode flag ([`CAMG_EXTENDED_MODE`]).
+    pub fn is_extended_mode(self) -> bool {
+        self.raw & CAMG_EXTENDED_MODE != 0
+    }
+    /// Hidden ViewPort ([`CAMG_VP_HIDE`]).
+    pub fn is_vp_hide(self) -> bool {
+        self.raw & CAMG_VP_HIDE != 0
+    }
+    /// ViewPort uses sprites ([`CAMG_SPRITES`]).
+    pub fn is_sprites(self) -> bool {
+        self.raw & CAMG_SPRITES != 0
+    }
+
+    /// True when the value carries a real monitor key in the high
+    /// word, i.e. it should be read as a full 32-bit ModeID/DisplayID
+    /// rather than a legacy 16-bit ViewMode.
+    pub fn is_mode_id(self) -> bool {
+        self.raw >> 16 != 0
+    }
+
+    /// The monitor part of a 32-bit ModeID (`raw & MONITOR_ID_MASK`).
+    /// Only meaningful when [`Self::is_mode_id`]; a legacy ViewMode's
+    /// [`CAMG_EXTENDED_MODE`] bit would otherwise leak into the mask.
+    pub fn monitor_id(self) -> u32 {
+        self.raw & MONITOR_ID_MASK
+    }
+
+    /// Name of a known monitor ID, when this value is a 32-bit ModeID
+    /// with a recognised monitor part.
+    pub fn monitor_name(self) -> Option<&'static str> {
+        if !self.is_mode_id() {
+            return None;
+        }
+        match self.monitor_id() {
+            DEFAULT_MONITOR_ID => Some("DEFAULT"),
+            NTSC_MONITOR_ID => Some("NTSC"),
+            PAL_MONITOR_ID => Some("PAL"),
+            VGA_MONITOR_ID => Some("VGA"),
+            A2024_MONITOR_ID => Some("A2024"),
+            PROTO_MONITOR_ID => Some("PROTO"),
+            EURO72_MONITOR_ID => Some("EURO72"),
+            EURO36_MONITOR_ID => Some("EURO36"),
+            SUPER72_MONITOR_ID => Some("SUPER72"),
+            DBLNTSC_MONITOR_ID => Some("DBLNTSC"),
+            DBLPAL_MONITOR_ID => Some("DBLPAL"),
+            _ => None,
+        }
+    }
+
+    /// The legacy 16-bit ViewMode with the non-format "junk" bits
+    /// ([`CAMG_JUNK_MASK`]) and any monitor bits stripped — the
+    /// traditional mask ILBM tools apply before interpreting an old
+    /// CAMG.
+    pub fn view_mode(self) -> u32 {
+        self.raw & 0xFFFF & !CAMG_JUNK_MASK
+    }
+
+    /// Only the low-word display-format bits ([`CAMG_FORMAT_MASK`]) —
+    /// what a raster decoder acts on, valid for both the legacy
+    /// ViewMode and the 32-bit ModeID forms (mode keys fold the same
+    /// format bits into the low word).
+    pub fn format_bits(self) -> u32 {
+        self.raw & CAMG_FORMAT_MASK
+    }
+
+    /// Classic "bad CAMG" heuristic: true when the value looks like a
+    /// broken pre-2.0 CAMG — either only junk bits are set, or the
+    /// whole word is 0 for an image deeper than 5 bitplanes (where
+    /// HAM or EHB must have been in effect on real hardware). Callers
+    /// may then infer HAM/EHB from `n_planes` instead of trusting the
+    /// chunk.
+    pub fn looks_bad_for_planes(self, n_planes: u8) -> bool {
+        let junk_only = self.raw != 0 && self.raw & !CAMG_JUNK_MASK == 0;
+        let zero_deep = self.raw == 0 && n_planes > 5;
+        junk_only || zero_deep
+    }
+
     pub fn to_be_bytes(self) -> [u8; 4] {
         self.raw.to_be_bytes()
     }

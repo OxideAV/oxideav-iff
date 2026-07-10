@@ -59,7 +59,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   automatically when any change carries an alpha. New public
   flag/mode constants `PCHGF_12BIT`, `PCHGF_32BIT`,
   `PCHGF_USE_ALPHA`, `PCHG_COMP_NONE`, `PCHG_COMP_HUFFMAN`.
-- *(ilbm)* **`mskLasso` (BMHD masking == 3) seed-fill transparency.**
+- *(ilbm)* **complete `CAMG` ViewMode / DisplayID bitfield decode.**
+  Previously only the HAM and EHB bits were recognised. `Camg` now
+  exposes every `ViewPort.Modes` flag (`is_lace`, `is_hires`,
+  `is_superhires`, `is_doublescan`, `is_dualpf`, `is_pfba`,
+  `is_genlock_video`, `is_genlock_audio`, `is_extended_mode`,
+  `is_vp_hide`, `is_sprites`) with matching `CAMG_*` bit constants,
+  plus the AmigaOS 2.0+ 32-bit ModeID/DisplayID space: `is_mode_id`
+  (real monitor key in the high word), `monitor_id` /
+  `MONITOR_ID_MASK`, `monitor_name` over the eleven documented
+  monitor IDs, and the base + monitor-qualified mode-key constants
+  (`LORES_KEY` … `SUPERHAM_KEY`, `VGAHAM_KEY`, `DBLPALHIRES_KEY`,
+  …). `view_mode()` applies the traditional junk-bit strip
+  (`CAMG_JUNK_MASK`), `format_bits()` isolates the raster-format bits
+  (`CAMG_FORMAT_MASK`), and `looks_bad_for_planes()` implements the
+  classic broken-pre-2.0-CAMG heuristic (junk-only value, or zero on
+  a deeper-than-5-plane image). HAM/EHB detection keeps working on
+  DisplayID-form values since the mode keys fold the format bits into
+  the low word.
   Previously the masking value was tolerated but the image decoded fully
   opaque. `render_indexed_planar` now implements the ilbm.txt §BMHD lasso
   algorithm — conceptually ring the image with a 1-pixel border of

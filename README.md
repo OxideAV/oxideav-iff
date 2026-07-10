@@ -14,15 +14,14 @@ crate ships:
   SPRT sprite-precedence flag, SHAM per-line palette **with typed
   row-palette accessors (`row_palette` / `palette_at_line` /
   `is_empty` / `rows`) mirroring the `Pchg::palette_at_line`
-  shape**, PCHG Small + Big palette-change list **with a typed
-  `PchgHeader` accessor surfacing every 20-byte header field
-  (`compression` / `flags` / `start_line` / `line_count` /
-  `changed_lines` / `min_reg` / `max_reg` / `max_changes` /
-  `total_changes`), a `PchgKind` (Small / Big) enum derived from
-  the flag word, and a `derive_header_hints` re-derivation helper
-  + `header_matches_payload` consistency check for callers
-  validating or re-deriving the header hints after editing the
-  change list**, CRNG / CCRT / DRNG colour-cycling descriptors).
+  shape**, PCHG 12-bit + 32-bit palette-change list **in raw and
+  Huffman-compressed wire forms, with a typed `PchgHeader` accessor
+  surfacing every 20-byte header field, a `PchgKind` enum derived
+  from the flag word, per-record alpha (`PCHGF_USE_ALPHA`), and a
+  `derive_header_hints` re-derivation helper +
+  `header_matches_payload` consistency check**, full CAMG
+  ViewMode/DisplayID bitfield decode, CRNG / CCRT / DRNG
+  colour-cycling descriptors).
 - **FORM/PBM** — read+round-trip (DPaint II / Brilliance chunky sibling).
 - **FORM/ACBM** — read+round-trip (Amiga Contiguous BitMap, the
   AmigaBASIC sibling of ILBM). The row-interleaved `BODY` is replaced by
@@ -278,7 +277,7 @@ Read + round-trip support for `FORM / ILBM`:
 |------------------------------------------|:----:|:-----:|
 | `BMHD` bitmap header (20 bytes)          |  Y   |   Y   |
 | `CMAP` palette (R, G, B triples)         |  Y   |   Y   |
-| `CAMG` viewport flags (HAM, EHB)         |  Y   |   Y   |
+| `CAMG` full ViewMode/DisplayID bitfield  |  Y   |   Y   |
 | `BODY` uncompressed planar               |  Y   |   Y   |
 | `BODY` ByteRun1 (PackBits) compression   |  Y   |   Y   |
 | `BODY` Auto-picker (RDO, picks shorter)  |  -   |   Y   |
@@ -294,25 +293,44 @@ Read + round-trip support for `FORM / ILBM`:
 | `DEST` destination-merge (depth/pick/on/mask) |  Y   |   Y   |
 | `SPRT` sprite precedence (UWORD, 0=foremost) |  Y   |   Y   |
 | `SHAM` Sliced HAM (per-line 16×RGB444)   |  Y   |   Y   |
-| `PCHG` palette change list (small fmt)   |  Y   |   Y   |
-| `PCHG` palette change list (big fmt)     |  Y   |   Y   |
+| `PCHG` palette change list (12-bit fmt)  |  Y   |   Y   |
+| `PCHG` palette change list (32-bit fmt)  |  Y   |   Y   |
+| `PCHG` Huffman compression (`Comp == 1`) |  Y   |   Y   |
 | `CRNG` DPaint colour-range cycling       |  Y   |   Y   |
 | `CCRT` Graphicraft colour-cycling timing |  Y   |   Y   |
 | `DRNG` DPaint IV extended range cycling  |  Y   |   Y   |
 | `IlbmMuxer` mode select (HAM/EHB/PBM)    |  -   |   Y   |
 | Output pixel format                      | RGBA |  -    |
 
-- `PCHG` chunks round-trip byte-verbatim through `encode_ilbm` (the
-  writer preserves `Pchg::raw`). On top of that, [`ilbm::Pchg::encode`]
-  re-encodes a change list into a fresh, self-consistent chunk body for
-  either the `Small` (12-bit RGB444) or `Big` (24-bit RGB888)
+- `PCHG` decodes the full spec wire layout: the LineMask bitmap
+  followed by per-set-bit change records — 12-bit `SmallLineChanges`
+  (packed `(reg<<12)|R4<<8|G4<<4|B4` words with the split
+  ChangeCount16 / ChangeCount32 register groups) or 32-bit
+  `BigLineChanges` (6-byte `Register, A, R, B, G` records with opt-in
+  `PCHGF_USE_ALPHA` alpha) — in both raw and Huffman-compressed
+  (`Compression == 1`) forms; decode of all four combinations is
+  verified pixel-exact against an independent ILBM→PPM converter run
+  as a black box. Chunks round-trip byte-verbatim through
+  `encode_ilbm` (the writer preserves `Pchg::raw`); on top of that,
+  [`ilbm::Pchg::encode`] / [`ilbm::Pchg::encode_huffman`] re-encode a
+  change list into a fresh, self-consistent chunk body for either
   [`ilbm::PchgKind`], re-deriving all 20-byte-header hints so
-  `header_matches_payload()` holds; [`ilbm::Pchg::from_lines`] builds a
-  `Pchg` from a decoded change list for authoring PCHG-aware images from
-  scratch. `parse(encode(Big)).lines == lines` losslessly; `Small` is
-  4-bit-per-channel lossy. The annex Huffman mode (`Compression == 1`)
-  is neither decoded nor emitted (its wire layout is undocumented in the
-  staged spec); such chunks still round-trip via `Pchg::raw`.
+  `header_matches_payload()` holds, and [`ilbm::Pchg::from_lines`]
+  builds a `Pchg` from scratch. `parse(encode(Big)).lines == lines`
+  losslessly; `Small` is 4-bit-per-channel lossy and saturates
+  registers above 31. When both `PCHG` and `SHAM` are present, PCHG
+  drives the per-line palette.
+
+- `CAMG` surfaces the complete ViewMode / DisplayID bit space: every
+  `ViewPort.Modes` flag accessor (`is_ham` / `is_ehb` / `is_lace` /
+  `is_hires` / `is_superhires` / `is_doublescan` / `is_dualpf` /
+  `is_pfba` / genlock / sprites / VP_HIDE / EXTENDED_MODE), the 32-bit
+  ModeID form (`is_mode_id`, `monitor_id`, `monitor_name` over the
+  eleven documented monitor IDs, `MONITOR_ID_MASK`, the base and
+  monitor-qualified mode-key constants), junk-bit stripping
+  (`view_mode`, `CAMG_JUNK_MASK`), raster-format extraction
+  (`format_bits`, `CAMG_FORMAT_MASK`) and the classic "bad CAMG"
+  heuristic (`looks_bad_for_planes`).
 
 - Public API: [`ilbm::parse_ilbm`], [`ilbm::encode_ilbm`],
   [`ilbm::IlbmImage`], [`ilbm::Bmhd`], [`ilbm::Camg`],
