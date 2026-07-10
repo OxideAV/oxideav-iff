@@ -3,16 +3,18 @@
 //! Feed arbitrary fuzz-supplied bytes through `ilbm::Pchg::parse`.
 //!
 //! `Pchg::parse` decodes a PCHG (Palette CHanGes per scan-line) chunk
-//! body as defined by the Vigna 1994 IFF Annex. The chunk carries:
+//! body. The chunk carries:
 //!
 //!  * a fixed 20-byte header (Compression, Flags, StartLine,
 //!    LineCount, ChangedLines, MinReg, MaxReg, MaxChanges,
 //!    TotalChanges),
-//!  * an optional ByteRun1 / SmallLineChanges compression mode that
-//!    wraps the payload,
-//!  * a per-line mask of which scan-lines carry changes,
-//!  * for each such line, a run-length-encoded list of palette-entry
-//!    overrides (small or big variant depending on Flags).
+//!  * an optional Huffman compression mode (PCHGCompHeader +
+//!    serialized signed-16-bit tree + MSB-first bitstream) wrapping
+//!    the LineData,
+//!  * a LineMask bitmap of which scan-lines carry changes,
+//!  * for each set mask bit, a change record — 12-bit
+//!    SmallLineChanges packed words or 32-bit BigLineChanges 6-byte
+//!    records depending on Flags.
 //!
 //! The chunk is the most failure-mode-dense single body the crate
 //! parses: tabular header arithmetic, two compression modes, two

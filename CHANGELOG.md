@@ -77,6 +77,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a deeper-than-5-plane image). HAM/EHB detection keeps working on
   DisplayID-form values since the mode keys fold the format bits into
   the low word.
+- *(ilbm)* deterministic in-test fuzz suite for `Pchg::parse`
+  (`ilbm_pchg_robustness.rs`): 60k pure-noise / plausible-header /
+  mutated-valid-chunk inputs across both record kinds and both
+  compression modes must return `Ok`/`Err` without panicking, plus a
+  randomised encode → parse round-trip property (400 change lists ×
+  Small/Big × raw/Huffman).
   Previously the masking value was tolerated but the image decoded fully
   opaque. `render_indexed_planar` now implements the ilbm.txt §BMHD lasso
   algorithm — conceptually ring the image with a 1-pixel border of
