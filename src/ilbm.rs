@@ -10,8 +10,10 @@
 //! - **`CMAP`** (ColourMAP): a packed array of 3-byte RGB triples —
 //!   one per palette index. The size of the chunk divided by three
 //!   gives the entry count (typical: 2, 4, 8, 16, 32, 64 or 256).
-//! - **`CAMG`** (Commodore Amiga Graphics, 4 bytes): viewport flags.
-//!   We pick out only two bits worth caring about for round 1:
+//! - **`CAMG`** (Commodore Amiga Graphics, 4 bytes): the full Amiga
+//!   ViewMode / DisplayID longword — see the [`Camg`] accessors for
+//!   every `ViewPort.Modes` flag and the 32-bit monitor|mode-key
+//!   space. The two bits that change pixel reconstruction:
 //!   * `0x80` — "extra-half-brite" (EHB). 32-entry palette is
 //!     mirrored to a 64-entry palette where `pal[i+32] = pal[i] / 2`.
 //!   * `0x800` — Hold-And-Modify (HAM). The plane count picks the
@@ -923,7 +925,7 @@ pub enum PchgKind {
 /// All fields are surfaced verbatim as parsed off the wire. Together
 /// they describe the change-record encoding ([`Self::kind`]), the
 /// scanline range the chunk covers (`start_line` / `line_count`), and
-/// the four header hints the annex defines as upper-bound summaries of
+/// the four header hints the PCHG spec defines as upper-bound summaries of
 /// the change records that follow (`changed_lines` / `min_reg` /
 /// `max_reg` / `max_changes` / `total_changes`).
 ///
@@ -973,8 +975,9 @@ pub struct PchgHeader {
 impl PchgHeader {
     /// Decode the [`PchgKind`] from [`Self::flags`].
     ///
-    /// Returns `Big` when flag bit 1 is set, otherwise `Small` (the
-    /// annex's documented default when no flag bits are set, and the
+    /// Returns `Big` when flag bit 1 is set, otherwise `Small` (our
+    /// default when no flag bits are set — the spec leaves that
+    /// case undefined — and the
     /// only valid choice when bit 0 is set). [`Pchg::parse`] rejects
     /// the both-bits-set case before this struct is constructed, so
     /// the choice here is unambiguous on any header produced by the
@@ -1141,7 +1144,7 @@ impl Pchg {
     /// `MinReg`, `MaxReg`, `MaxChanges`, `TotalChanges`) directly
     /// from [`Self::lines`].
     ///
-    /// The annex defines these as upper-bound summaries an encoder
+    /// The PCHG spec defines these as upper-bound summaries an encoder
     /// fills in for downstream readers. This helper computes the
     /// canonical values from the decoded change records so callers
     /// can either validate a parsed header against the records that
@@ -1151,7 +1154,7 @@ impl Pchg {
     /// Returns the tuple
     /// `(changed_lines, min_reg, max_reg, max_changes, total_changes)`
     /// with `min_reg` / `max_reg` set to `0` when no changes are
-    /// present (matching the annex's treatment of empty PCHGs as
+    /// present (matching the spec's treatment of empty PCHGs as
     /// `MinReg == MaxReg == 0`).
     pub fn derive_header_hints(&self) -> (u16, u16, u16, u16, u32) {
         let mut changed_lines: u16 = 0;
