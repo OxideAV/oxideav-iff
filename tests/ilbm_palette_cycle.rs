@@ -432,17 +432,11 @@ fn mk_pchg() -> Pchg {
         lines: vec![
             PchgLine {
                 line: 2,
-                changes: vec![PchgChange {
-                    index: 1,
-                    rgb: [200, 0, 0],
-                }],
+                changes: vec![PchgChange::new(1, [200, 0, 0])],
             },
             PchgLine {
                 line: 5,
-                changes: vec![PchgChange {
-                    index: 2,
-                    rgb: [0, 200, 0],
-                }],
+                changes: vec![PchgChange::new(2, [0, 200, 0])],
             },
         ],
     }
@@ -533,16 +527,10 @@ fn pchg_palette_at_line_skips_out_of_range_index() {
             line: 0,
             changes: vec![
                 // First entry: in-range — should apply.
-                PchgChange {
-                    index: 0,
-                    rgb: [255, 255, 255],
-                },
+                PchgChange::new(0, [255, 255, 255]),
                 // Second entry: index past the base palette length —
                 // skipped silently (parser-tolerant semantics).
-                PchgChange {
-                    index: 999,
-                    rgb: [1, 2, 3],
-                },
+                PchgChange::new(999, [1, 2, 3]),
             ],
         }],
     };
@@ -598,10 +586,7 @@ fn cycle_then_pchg_resolve_compose_cleanly() {
         raw: Vec::new(),
         lines: vec![PchgLine {
             line: 3,
-            changes: vec![PchgChange {
-                index: 1,
-                rgb: [255, 0, 0],
-            }],
+            changes: vec![PchgChange::new(1, [255, 0, 0])],
         }],
     };
     let img = mk_image_with_pchg(Some(pchg));

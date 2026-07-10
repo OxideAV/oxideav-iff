@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(ilbm)* **`PCHG` wire layout is now spec-conformant.** The previous
+  parser/encoder pair omitted the LineMask bitmap entirely and used
+  incorrect change-record shapes. Per the PCHG spec staged in
+  `docs/image/iff/camg-viewmode-pchg.md`, the LineData now begins with
+  the MSB-first LineMask (`((LineCount + 31) / 32) * 4` bytes, one bit
+  per covered line) followed by one record per **set** bit only;
+  12-bit `SmallLineChanges` records are a `ChangeCount16` /
+  `ChangeCount32` byte pair followed by packed big-endian
+  `(reg << 12) | (R4 << 8) | (G4 << 4) | B4` words, with the second
+  count group addressing registers 16..=31; 32-bit `BigLineChanges`
+  records are 6-byte `(u16 Register, u8 Alpha, u8 Red, u8 Blue,
+  u8 Green)` — note the on-disk A, R, B, G component order. Decode of
+  all four Small/Big × raw/Huffman combinations was verified
+  pixel-exact against an independent ILBM→PPM converter run as a
+  black box.
+- *(ilbm)* when an ILBM carries both `PCHG` and `SHAM`, the per-line
+  palette now follows `PCHG` — the most expressive of the sliced
+  palette chunks and the designated successor of SHAM/CTBL/DYCP —
+  instead of SHAM.
 - *(anim)* the §2.1 ANHD `interleave` field is now honoured during
   delta-frame reconstruction. A delta modifies the frame `interleave`
   frames back — `0` defaults to **two** frames back (the DeluxePaint
@@ -24,6 +43,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* **`PCHG` Huffman compression (`Compression == 1`).**
+  `Pchg::parse` transparently expands the compressed form — 8-byte
+  `PCHGCompHeader` (`CompInfoSize`, `OriginalDataSize`), serialized
+  Huffman tree (big-endian signed 16-bit nodes, root in the last
+  slot, decoded MSB-first walking left via slot adjacency and right
+  via negative byte-offset links), then the compressed bitstream —
+  with allocation caps and walk bounds enforced against malformed
+  trees. The new `Pchg::encode_huffman` writes the same form (its
+  tree serialization tops out at the spec's stated 1022-byte bound).
+- *(ilbm)* `PCHG` 32-bit records now surface their alpha component:
+  `PchgChange` gained an `alpha: Option<u8>` field (populated only
+  when the header sets `PCHGF_USE_ALPHA`; a `PchgChange::new` helper
+  covers the common no-alpha case), and the encoder raises the flag
+  automatically when any change carries an alpha. New public
+  flag/mode constants `PCHGF_12BIT`, `PCHGF_32BIT`,
+  `PCHGF_USE_ALPHA`, `PCHG_COMP_NONE`, `PCHG_COMP_HUFFMAN`.
 - *(ilbm)* **`mskLasso` (BMHD masking == 3) seed-fill transparency.**
   Previously the masking value was tolerated but the image decoded fully
   opaque. `render_indexed_planar` now implements the ilbm.txt §BMHD lasso
@@ -42,10 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (re-deriving every hint via `derive_header_hints` so
   `header_matches_payload()` holds) and the per-line change records from
   the decoded `PchgLine` list, for either the `Small` (12-bit RGB444) or
-  `Big` (24-bit RGB888) `PchgKind`. The covered scanline window is
+  `Big` (32-bit) `PchgKind`. The covered scanline window is
   derived from the change list (`StartLine` = smallest changed line,
-  `LineCount` spanning through the largest, gap lines emitted as
-  zero-change records), and an unsorted list is placed in scanline order.
+  `LineCount` spanning through the largest, gap lines left as clear
+  LineMask bits), and an unsorted list is placed in scanline order.
   `parse(encode(Big)).lines == lines` losslessly; `Small` quantises each
   channel to 4 bits. `Pchg::from_lines` builds a self-consistent `Pchg`
   (its `raw` is the encoded body, its `lines` the re-parse of that body)

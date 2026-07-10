@@ -2,36 +2,37 @@
 //!
 //! Covers the [`Pchg::header`] / [`Pchg::kind`] /
 //! [`Pchg::derive_header_hints`] / [`Pchg::header_matches_payload`]
-//! surface added in this round. The PCHG IFF Annex (Sebastiano Vigna
-//! 1994) defines a 20-byte fixed-layout header in front of every
-//! change-record stream:
+//! surface. The PCHG spec defines a 20-byte fixed-layout header in
+//! front of every LineData stream:
 //!
 //! ```text
 //! u16 Compression
-//! u16 Flags          (bit 0 = Small, bit 1 = Big)
+//! u16 Flags          (bit 0 = 12-bit, bit 1 = 32-bit, bit 2 = alpha)
 //! i16 StartLine
 //! u16 LineCount
-//! u16 ChangedLines   (hint: number of lines with ChangeCount > 0)
-//! u16 MinReg         (hint: smallest RegisterIndex touched)
-//! u16 MaxReg         (hint: largest RegisterIndex touched)
+//! u16 ChangedLines   (hint: number of lines with a change record)
+//! u16 MinReg         (hint: smallest Register touched)
+//! u16 MaxReg         (hint: largest Register touched)
 //! u16 MaxChanges     (hint: longest per-line change list)
 //! u32 TotalChanges   (hint: sum of per-line ChangeCounts)
 //! ```
 //!
-//! These tests build hand-rolled PCHG bodies, parse them, and check
-//! both the typed-field round-trip and the
-//! `derive_header_hints` / `header_matches_payload` re-derivation
-//! invariants.
+//! followed by the LineMask bitmap (`((LineCount + 31) / 32) * 4`
+//! bytes, MSB-first) and one change record per set mask bit. These
+//! tests build hand-rolled PCHG bodies, parse them, and check both the
+//! typed-field round-trip and the `derive_header_hints` /
+//! `header_matches_payload` re-derivation invariants.
 
 use oxideav_iff::ilbm::{Pchg, PchgChange, PchgHeader, PchgKind, PchgLine};
 
 // 20-byte PCHG header for the Small format with one line of one
-// change touching register 1 (RGB444 0x0F0 → 8-bit 0x00 0xFF 0x00).
+// change touching register 1 (packed word 0x10F0: reg 1, RGB444
+// 0x0F0 → 8-bit 0x00 0xFF 0x00).
 fn small_one_change_body() -> Vec<u8> {
     let mut raw = Vec::new();
     // Compression = 0 (uncompressed).
     raw.extend_from_slice(&0u16.to_be_bytes());
-    // Flags = 1 (Small).
+    // Flags = 1 (12-bit / Small).
     raw.extend_from_slice(&1u16.to_be_bytes());
     // StartLine = 0.
     raw.extend_from_slice(&0i16.to_be_bytes());
@@ -44,21 +45,21 @@ fn small_one_change_body() -> Vec<u8> {
     raw.extend_from_slice(&1u16.to_be_bytes());
     raw.extend_from_slice(&1u16.to_be_bytes());
     raw.extend_from_slice(&1u32.to_be_bytes());
-    // Row 0: ChangeCount = 0.
+    // LineMask (one longword for 2 lines): line 0 clear, line 1 set.
+    raw.extend_from_slice(&[0x40, 0x00, 0x00, 0x00]);
+    // Line 1 record: ChangeCount16 = 1, ChangeCount32 = 0, then the
+    // packed word (1 << 12) | (0x0 << 8) | (0xF << 4) | 0x0.
+    raw.push(1);
     raw.push(0);
-    // Row 1: ChangeCount = 1, RegisterIndex = 1, RGB444 = 0x0F0.
-    raw.push(1);
-    raw.push(1);
-    raw.push(0x00);
-    raw.push(0xF0);
+    raw.extend_from_slice(&0x10F0u16.to_be_bytes());
     raw
 }
 
 // Big-format header with one line of two changes touching registers
-// 3 and 7 (24-bit RGB).
+// 3 and 7 (6-byte records, on-disk component order A, R, B, G).
 fn big_two_changes_body() -> Vec<u8> {
     let mut raw = Vec::new();
-    // Compression = 0, Flags = 2 (Big).
+    // Compression = 0, Flags = 2 (32-bit / Big).
     raw.extend_from_slice(&0u16.to_be_bytes());
     raw.extend_from_slice(&2u16.to_be_bytes());
     // StartLine = 5, LineCount = 1.
@@ -71,14 +72,16 @@ fn big_two_changes_body() -> Vec<u8> {
     raw.extend_from_slice(&7u16.to_be_bytes());
     raw.extend_from_slice(&2u16.to_be_bytes());
     raw.extend_from_slice(&2u32.to_be_bytes());
-    // Row 0 (= scanline 5): ChangeCount = 2 as u16.
+    // LineMask (one longword for 1 line): line set.
+    raw.extend_from_slice(&[0x80, 0x00, 0x00, 0x00]);
+    // Line record (= scanline 5): ChangeCount = 2 as u16.
     raw.extend_from_slice(&2u16.to_be_bytes());
-    // RegisterIndex 3 → RGB(0x11, 0x22, 0x33).
+    // Register 3 → RGB(0x11, 0x22, 0x33): bytes A, R, B, G.
     raw.extend_from_slice(&3u16.to_be_bytes());
-    raw.extend_from_slice(&[0x11, 0x22, 0x33]);
-    // RegisterIndex 7 → RGB(0x44, 0x55, 0x66).
+    raw.extend_from_slice(&[0x00, 0x11, 0x33, 0x22]);
+    // Register 7 → RGB(0x44, 0x55, 0x66).
     raw.extend_from_slice(&7u16.to_be_bytes());
-    raw.extend_from_slice(&[0x44, 0x55, 0x66]);
+    raw.extend_from_slice(&[0x00, 0x44, 0x66, 0x55]);
     raw
 }
 
@@ -255,10 +258,7 @@ fn header_helper_returns_none_for_handcrafted_short_raw() {
         raw: vec![0u8; 10],
         lines: vec![PchgLine {
             line: 0,
-            changes: vec![PchgChange {
-                index: 0,
-                rgb: [0; 3],
-            }],
+            changes: vec![PchgChange::new(0, [0; 3])],
         }],
     };
     assert_eq!(pchg.header(), None);
@@ -271,7 +271,7 @@ fn header_helper_returns_none_for_handcrafted_short_raw() {
 
 #[test]
 fn kind_decodes_default_zero_flags_as_small() {
-    // The annex defines neither-bit-set as defaulting to Small.
+    // Neither format bit set defaults to Small (non-Option accessor).
     let mut raw = Vec::new();
     raw.extend_from_slice(&0u16.to_be_bytes()); // Compression
     raw.extend_from_slice(&0u16.to_be_bytes()); // Flags = 0

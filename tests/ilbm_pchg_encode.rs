@@ -22,7 +22,7 @@ fn line(l: u32, changes: &[(u16, [u8; 3])]) -> PchgLine {
         line: l,
         changes: changes
             .iter()
-            .map(|&(index, rgb)| PchgChange { index, rgb })
+            .map(|&(index, rgb)| PchgChange::new(index, rgb))
             .collect(),
     }
 }
@@ -73,7 +73,7 @@ fn small_encode_is_lossy_for_non_multiples() {
 #[test]
 fn header_window_and_hints_are_derived() {
     // Changes on lines 3 and 9 → StartLine=3, LineCount=7, with the gap
-    // lines 4..=8 emitted as zero-change records.
+    // lines 4..=8 left as clear LineMask bits (no records).
     let lines = vec![
         line(3, &[(0, [0x10, 0x20, 0x30])]),
         line(9, &[(1, [0x40, 0x50, 0x60]), (2, [0x70, 0x80, 0x90])]),

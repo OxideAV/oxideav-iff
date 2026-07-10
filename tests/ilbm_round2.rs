@@ -353,22 +353,18 @@ fn pchg_small_format_roundtrip() {
     raw.extend_from_slice(&1u16.to_be_bytes());
     raw.extend_from_slice(&1u16.to_be_bytes());
     raw.extend_from_slice(&1u32.to_be_bytes());
-    // Row 0: ChangeCount=0.
-    raw.push(0);
-    // Row 1: ChangeCount=1, then (RegIndex=1, RGB444=0x0F0).
-    // Small format change record = (u8 reg, u8 R-nibble, u8 GB-nibble).
+    // LineMask (one longword covers LineCount=2): row 0 clear, row 1 set.
+    raw.extend_from_slice(&[0x40, 0x00, 0x00, 0x00]);
+    // Row 1 record: ChangeCount16=1, ChangeCount32=0, then the packed
+    // word (reg 1 << 12) | (R4 0x0 << 8) | (G4 0xF << 4) | B4 0x0.
     raw.push(1);
-    raw.push(1); // register index = 1
-    raw.push(0x00); // R nibble = 0 → R = 0x00
-    raw.push(0xF0); // G nibble = F, B nibble = 0 → G = 0xFF, B = 0x00
+    raw.push(0);
+    raw.extend_from_slice(&0x10F0u16.to_be_bytes());
     let pchg = oxideav_iff::ilbm::Pchg {
         raw: raw.clone(),
         lines: vec![PchgLine {
             line: 1,
-            changes: vec![PchgChange {
-                index: 1,
-                rgb: [0, 0xFF, 0],
-            }],
+            changes: vec![PchgChange::new(1, [0, 0xFF, 0])],
         }],
     };
 

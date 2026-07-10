@@ -610,12 +610,46 @@ impl Sham {
 
 // ───────────────────── PCHG (Palette CHanGe) ─────────────────────
 
+/// PCHG `Flags` bit — change records use the small 12-bit (OCS
+/// 4-bit-per-gun) `SmallLineChanges` layout.
+pub const PCHGF_12BIT: u16 = 1 << 0;
+/// PCHG `Flags` bit — change records use the big 32-bit-per-register
+/// `BigLineChanges` layout.
+pub const PCHGF_32BIT: u16 = 1 << 1;
+/// PCHG `Flags` bit — only meaningful together with [`PCHGF_32BIT`]:
+/// the Alpha byte in each `BigPaletteChange` record is meaningful.
+pub const PCHGF_USE_ALPHA: u16 = 1 << 2;
+
+/// PCHG `Compression` value — the data after the 20-byte header is the
+/// raw LineData (LineMask + change records) directly.
+pub const PCHG_COMP_NONE: u16 = 0;
+/// PCHG `Compression` value — the data after the 20-byte header is a
+/// `PCHGCompHeader` followed by a serialized Huffman tree and the
+/// compressed bitstream that expands to the LineData.
+pub const PCHG_COMP_HUFFMAN: u16 = 1;
+
 /// One palette entry change at a given index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PchgChange {
-    /// Palette index whose RGB to overwrite (0..=255).
+    /// Palette register whose RGB to overwrite (0..=255).
     pub index: u16,
     pub rgb: [u8; 3],
+    /// Alpha component of a `BigLineChanges` record. `Some` only when
+    /// the chunk is the 32-bit form **and** its header sets
+    /// [`PCHGF_USE_ALPHA`]; `None` otherwise (the on-disk Alpha byte is
+    /// declared meaningless in that case and is not surfaced).
+    pub alpha: Option<u8>,
+}
+
+impl PchgChange {
+    /// Build an opaque (no-alpha) palette change.
+    pub fn new(index: u16, rgb: [u8; 3]) -> Self {
+        Self {
+            index,
+            rgb,
+            alpha: None,
+        }
+    }
 }
 
 /// All changes to apply at the start of a given scanline.
@@ -628,28 +662,32 @@ pub struct PchgLine {
 /// Which of the two PCHG change-record encodings a chunk uses, decoded
 /// from the 16-bit `Flags` field in the PCHG header.
 ///
-/// Per the PCHG IFF Annex header layout, two flag bits select the
-/// per-change record encoding:
+/// Per the PCHG spec header layout, two flag bits select the per-line
+/// change-record encoding:
 ///
-/// * Flag bit `1` (`0x0001`) — `SmallLineChanges`: 12-bit channel
-///   palette; each change record is `(u8 RegisterIndex, u16
-///   RGB444 big-endian)` for a 3-byte payload.
-/// * Flag bit `2` (`0x0002`) — `BigLineChanges`: 24-bit channel
-///   palette; each change record is `(u16 RegisterIndex, u8 R, u8 G,
-///   u8 B)` for a 5-byte payload, with a 2-byte `u16` ChangeCount
-///   instead of the Small format's 1-byte count.
+/// * [`PCHGF_12BIT`] — `SmallLineChanges`: per changed line a
+///   `u8 ChangeCount16` (changes to registers 0..=15), a
+///   `u8 ChangeCount32` (changes to registers 16..=31), then
+///   `ChangeCount16 + ChangeCount32` big-endian 16-bit words each
+///   packed as `(reg << 12) | (R4 << 8) | (G4 << 4) | B4`. Words in
+///   the second group address registers 16..=31 (add 16 to the packed
+///   4-bit register number).
+/// * [`PCHGF_32BIT`] — `BigLineChanges`: per changed line a
+///   `u16 ChangeCount`, then 6-byte `BigPaletteChange` records laid
+///   out `(u16 Register, u8 Alpha, u8 Red, u8 Blue, u8 Green)` —
+///   note the on-disk component order is A, R, B, G.
 ///
 /// The two bits are mutually exclusive — both being set is a malformed
-/// PCHG and rejected by [`Pchg::parse`]. When neither bit is set the
-/// annex defines the encoding to default to Small; we report that as
-/// [`PchgKind::Small`] so callers can rely on a non-`Option` accessor.
+/// PCHG and rejected by [`Pchg::parse`]. When neither bit is set we
+/// default to [`PchgKind::Small`] so callers can rely on a non-`Option`
+/// accessor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PchgKind {
-    /// 12-bit channel encoding — 1-byte RegisterIndex + 2-byte RGB444
-    /// per change, 1-byte ChangeCount per line.
+    /// 12-bit channel encoding — packed RGB444 words with a split
+    /// per-line 0..=15 / 16..=31 register-count pair.
     Small,
-    /// 24-bit channel encoding — 2-byte RegisterIndex + 3-byte RGB888
-    /// per change, 2-byte ChangeCount per line.
+    /// 32-bit-per-register encoding — 6-byte `(Register, A, R, B, G)`
+    /// records with a `u16` per-line ChangeCount.
     Big,
 }
 
@@ -670,10 +708,11 @@ pub enum PchgKind {
 /// hints after editing the per-line change list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PchgHeader {
-    /// `Compression` (u16) — `0` = uncompressed change records (the
-    /// only mode [`Pchg::parse`] actually decodes), `1` = the
-    /// annex-defined Huffman-compressed mode (not yet decoded; the
-    /// raw bytes still round-trip via [`Pchg::raw`]).
+    /// `Compression` (u16) — [`PCHG_COMP_NONE`] (`0`) = the LineData
+    /// follows the header raw; [`PCHG_COMP_HUFFMAN`] (`1`) = the
+    /// header is followed by a `PCHGCompHeader`, a serialized Huffman
+    /// tree, and the compressed bitstream. [`Pchg::parse`] decodes
+    /// both.
     pub compression: u16,
     /// `Flags` (u16) — the raw 16-bit flag word. Bit 0 selects Small,
     /// bit 1 selects Big; higher bits are reserved. [`Self::kind`]
@@ -722,26 +761,32 @@ impl PchgHeader {
         }
     }
 
-    /// True when `Compression == 1`, the annex-defined Huffman-
-    /// compressed change-record encoding. [`Pchg::parse`] does not
-    /// decode that variant yet; callers detecting this should fall
-    /// back to the raw bytes via [`Pchg::raw`] if they need the
-    /// original payload.
+    /// True when `Compression == 1` ([`PCHG_COMP_HUFFMAN`]), the
+    /// Huffman-compressed LineData encoding. [`Pchg::parse`] expands
+    /// it transparently; the compressed wire bytes still round-trip
+    /// verbatim via [`Pchg::raw`].
     pub fn is_compressed(&self) -> bool {
-        self.compression == 1
+        self.compression == PCHG_COMP_HUFFMAN
     }
 }
 
 /// `PCHG` — Palette CHanGe list (Sebastiano Vigna). Per-scanline CMAP
-/// overrides; supports two formats encoded in a 12-bit "small/big"
-/// flag:
+/// overrides — the general, register-granular successor of the older
+/// SHAM / CTBL "sliced palette" hacks. On the wire a PCHG body is:
 ///
-/// * **SmallLineChanges** (flag bit `1`) — 12-bit channel palette,
-///   1 byte index + 2 bytes RGB444 per change.
-/// * **BigLineChanges** (flag bit `2`) — 24-bit channel palette,
-///   2 bytes index + 3 bytes RGB888 per change.
+/// ```text
+/// PCHGHeader (20 bytes)
+/// [PCHGCompHeader + Huffman tree, when Compression == 1]
+/// LineData:
+///   LineMask   — ((LineCount + 31) / 32) * 4 bytes, one bit per
+///                covered line, consumed MSB-first; a set bit means
+///                "this line has a change record".
+///   records    — one SmallLineChanges / BigLineChanges record per
+///                set mask bit, in ascending line order.
+/// ```
 ///
-/// We parse both and surface the cumulative-state palette per line as
+/// We parse both record encodings (see [`PchgKind`]) and both
+/// compression modes, surfacing the per-line palette overrides as
 /// 8-bit RGB in [`Pchg::lines`]. The original wire bytes are kept in
 /// [`Pchg::raw`] for byte-exact round-trip.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -753,7 +798,7 @@ pub struct Pchg {
 
 impl Pchg {
     pub fn parse(body: &[u8]) -> Result<Self> {
-        // Header layout per the PCHG IFF Annex (Sebastiano Vigna 1994):
+        // Header layout per the PCHG spec:
         // u16 Compression; u16 Flags; i16 StartLine; u16 LineCount;
         // u16 ChangedLines; u16 MinReg; u16 MaxReg; u16 MaxChanges;
         // u32 TotalChanges;
@@ -763,113 +808,43 @@ impl Pchg {
                 body.len()
             )));
         }
-        let _comp = u16::from_be_bytes([body[0], body[1]]);
+        let comp = u16::from_be_bytes([body[0], body[1]]);
         let flags = u16::from_be_bytes([body[2], body[3]]);
         let start_line = i16::from_be_bytes([body[4], body[5]]);
         let line_count = u16::from_be_bytes([body[6], body[7]]) as usize;
-        let _changed_lines = u16::from_be_bytes([body[8], body[9]]);
-        let _min_reg = u16::from_be_bytes([body[10], body[11]]);
-        let _max_reg = u16::from_be_bytes([body[12], body[13]]);
-        let _max_changes = u16::from_be_bytes([body[14], body[15]]);
-        let total_changes = u32::from_be_bytes([body[16], body[17], body[18], body[19]]) as usize;
+        // Bytes 8..20 are the ChangedLines / MinReg / MaxReg /
+        // MaxChanges / TotalChanges hints — decode-tolerant, see
+        // `header_matches_payload` for the validation surface.
 
-        let big = flags & 2 != 0;
-        let small = flags & 1 != 0;
+        let big = flags & PCHGF_32BIT != 0;
+        let small = flags & PCHGF_12BIT != 0;
         if big && small {
             return Err(Error::invalid(
-                "ILBM PCHG: both Small and Big flag bits set",
+                "ILBM PCHG: both 12-bit and 32-bit flag bits set",
             ));
         }
+        // The Alpha byte of a BigPaletteChange is only meaningful when
+        // the header opts in; otherwise it's declared junk.
+        let use_alpha = big && flags & PCHGF_USE_ALPHA != 0;
 
-        // Compression byte 0 = uncompressed; we don't yet support
-        // compressed (Compression == 1, Huffman). The spec calls for
-        // a separate sub-chunk header with tree data we don't
-        // implement on round 1. Surface the raw bytes regardless so
-        // round-trip preserves the chunk verbatim.
-        let mut out_lines: Vec<PchgLine> = Vec::new();
-
-        // Small / default format: ChangeStructure begins after the
-        // 20-byte header. For each line in [start_line, start_line +
-        // line_count) we read a u8 ChangeCount, then ChangeCount
-        // entries of (u8 RegisterIndex, u16 RGB444 BE).
-        // Big format: u16 ChangeCount, then (u16 RegisterIndex, 3
-        // bytes RGB888).
-        // Lines with ChangeCount == 0 are emitted nowhere in our
-        // out_lines list.
-        let mut cur = 20usize;
-        let mut total_seen = 0usize;
-        if !big {
-            for li in 0..line_count {
-                if cur >= body.len() {
-                    break;
-                }
-                let cc = body[cur] as usize;
-                cur += 1;
-                if cc > 0 {
-                    let mut entries = Vec::with_capacity(cc);
-                    for _ in 0..cc {
-                        if cur + 3 > body.len() {
-                            break;
-                        }
-                        let reg = body[cur] as u16;
-                        let hi = body[cur + 1];
-                        let lo = body[cur + 2];
-                        cur += 3;
-                        let r4 = hi & 0x0F;
-                        let g4 = (lo >> 4) & 0x0F;
-                        let b4 = lo & 0x0F;
-                        entries.push(PchgChange {
-                            index: reg,
-                            rgb: [r4 * 0x11, g4 * 0x11, b4 * 0x11],
-                        });
-                        total_seen += 1;
-                    }
-                    let line = (start_line as i32 + li as i32).max(0) as u32;
-                    out_lines.push(PchgLine {
-                        line,
-                        changes: entries,
-                    });
-                }
+        let lines = match comp {
+            PCHG_COMP_NONE => {
+                decode_pchg_line_data(&body[20..], big, use_alpha, start_line, line_count)?
             }
-        } else {
-            for li in 0..line_count {
-                if cur + 2 > body.len() {
-                    break;
-                }
-                let cc = u16::from_be_bytes([body[cur], body[cur + 1]]) as usize;
-                cur += 2;
-                if cc > 0 {
-                    let mut entries = Vec::with_capacity(cc);
-                    for _ in 0..cc {
-                        if cur + 5 > body.len() {
-                            break;
-                        }
-                        let reg = u16::from_be_bytes([body[cur], body[cur + 1]]);
-                        let r = body[cur + 2];
-                        let g = body[cur + 3];
-                        let b = body[cur + 4];
-                        cur += 5;
-                        entries.push(PchgChange {
-                            index: reg,
-                            rgb: [r, g, b],
-                        });
-                        total_seen += 1;
-                    }
-                    let line = (start_line as i32 + li as i32).max(0) as u32;
-                    out_lines.push(PchgLine {
-                        line,
-                        changes: entries,
-                    });
-                }
+            PCHG_COMP_HUFFMAN => {
+                let expanded = pchg_huffman_expand(&body[20..])?;
+                decode_pchg_line_data(&expanded, big, use_alpha, start_line, line_count)?
             }
-        }
-        // Tolerant: total_changes mismatch is just a header hint.
-        let _ = total_changes;
-        let _ = total_seen;
+            other => {
+                return Err(Error::unsupported(format!(
+                    "ILBM PCHG: unknown Compression mode {other}"
+                )))
+            }
+        };
 
         Ok(Self {
             raw: body.to_vec(),
-            lines: out_lines,
+            lines,
         })
     }
 
@@ -1032,28 +1007,95 @@ impl Pchg {
     ///
     /// The covered scanline range is derived from the change list: the
     /// header `StartLine` is the smallest `line` present and `LineCount`
-    /// spans through the largest, with the intervening gap lines emitted as
-    /// zero-change records (exactly what [`Pchg::parse`] round-trips back to
-    /// the same `lines`). An empty change list yields a 20-byte
+    /// spans through the largest; intervening gap lines simply have a
+    /// clear LineMask bit (exactly what [`Pchg::parse`] round-trips back
+    /// to the same `lines`). An empty change list yields a 20-byte
     /// header-only body with `StartLine = 0`, `LineCount = 0`.
     ///
     /// `kind` selects the record encoding written:
     ///
-    /// * [`PchgKind::Small`] — 12-bit channels. Each change is
-    ///   `(u8 RegisterIndex, u16 RGB444)`; the 8-bit RGB in each
-    ///   [`PchgChange`] is quantised to 4 bits per channel (high nibble),
-    ///   so this encoding is lossy unless every channel is already a
-    ///   multiple of `0x11`. Register indices above `0xFF` and per-line
-    ///   change counts above `0xFF` saturate to their field maxima.
-    /// * [`PchgKind::Big`] — 24-bit channels. Each change is
-    ///   `(u16 RegisterIndex, u8 R, u8 G, u8 B)`, a lossless 8-bit-per-
-    ///   channel encoding; per-line change counts above `0xFFFF` saturate.
+    /// * [`PchgKind::Small`] — 12-bit channels. Each change is one
+    ///   big-endian word `(reg << 12) | (R4 << 8) | (G4 << 4) | B4`,
+    ///   split into the registers-0..=15 and registers-16..=31 count
+    ///   groups; the 8-bit RGB in each [`PchgChange`] is quantised to
+    ///   4 bits per channel (high nibble), so this encoding is lossy
+    ///   unless every channel is already a multiple of `0x11`. Register
+    ///   indices above `31` saturate to `31` (the layout cannot address
+    ///   beyond the 32-register OCS/ECS palette) and per-group change
+    ///   counts above `0xFF` saturate.
+    /// * [`PchgKind::Big`] — 32-bit-per-register records
+    ///   `(u16 Register, u8 A, u8 R, u8 B, u8 G)`, a lossless
+    ///   8-bit-per-channel encoding; per-line change counts above
+    ///   `0xFFFF` saturate. When any change carries `alpha: Some(..)`
+    ///   the header sets [`PCHGF_USE_ALPHA`] and each record's Alpha
+    ///   byte is written (changes without one default to opaque
+    ///   `0xFF`); otherwise the Alpha bytes are written as `0`.
     ///
     /// `parse(encode(Big)).lines == lines` for any change list whose line
     /// numbers fit `i16` and whose register indices fit `u16`; the same
-    /// holds for `Small` once each channel is 4-bit-quantised.
+    /// holds for `Small` once each channel is 4-bit-quantised and every
+    /// register is `<= 31`.
     pub fn encode(&self, kind: PchgKind) -> Vec<u8> {
-        // Establish the covered scanline window from the change list.
+        let mut out = self.encode_header(kind, PCHG_COMP_NONE);
+        out.extend_from_slice(&self.encode_line_data(kind));
+        out
+    }
+
+    /// Serialise [`Self::lines`] like [`Pchg::encode`] but with the
+    /// LineData Huffman-compressed (`Compression == 1`): the 20-byte
+    /// header is followed by the 8-byte `PCHGCompHeader`
+    /// (`CompInfoSize`, `OriginalDataSize`), the serialized Huffman
+    /// tree, and the MSB-first compressed bitstream.
+    ///
+    /// The record encoding and every saturation/quantisation rule match
+    /// [`Pchg::encode`]; `parse(encode_huffman(kind)).lines ==
+    /// parse(encode(kind)).lines` always holds. Note the spec's own
+    /// practical caveat: small 12-bit change streams are highly
+    /// entropic, so the tree often costs more than the compression
+    /// saves — encoders typically reserve Huffman for the 32-bit form.
+    pub fn encode_huffman(&self, kind: PchgKind) -> Vec<u8> {
+        let mut out = self.encode_header(kind, PCHG_COMP_HUFFMAN);
+        let line_data = self.encode_line_data(kind);
+        let (tree, stream) = pchg_huffman_compress(&line_data);
+        out.extend_from_slice(&(tree.len() as u32).to_be_bytes()); // CompInfoSize
+        out.extend_from_slice(&(line_data.len() as u32).to_be_bytes()); // OriginalDataSize
+        out.extend_from_slice(&tree);
+        out.extend_from_slice(&stream);
+        out
+    }
+
+    /// Build the 20-byte PCHG header for [`Self::lines`] with every
+    /// hint re-derived, ready to be followed by the (possibly
+    /// compressed) LineData.
+    fn encode_header(&self, kind: PchgKind, compression: u16) -> Vec<u8> {
+        let (start_line_i, line_count) = self.line_window();
+        let (changed_lines, min_reg, max_reg, max_changes, total_changes) =
+            self.derive_header_hints();
+
+        let mut flags: u16 = match kind {
+            PchgKind::Big => PCHGF_32BIT,
+            PchgKind::Small => PCHGF_12BIT,
+        };
+        if matches!(kind, PchgKind::Big) && self.any_alpha() {
+            flags |= PCHGF_USE_ALPHA;
+        }
+
+        let mut out = Vec::with_capacity(20);
+        out.extend_from_slice(&compression.to_be_bytes());
+        out.extend_from_slice(&flags.to_be_bytes());
+        out.extend_from_slice(&start_line_i.to_be_bytes());
+        out.extend_from_slice(&line_count.to_be_bytes());
+        out.extend_from_slice(&changed_lines.to_be_bytes());
+        out.extend_from_slice(&min_reg.to_be_bytes());
+        out.extend_from_slice(&max_reg.to_be_bytes());
+        out.extend_from_slice(&max_changes.to_be_bytes());
+        out.extend_from_slice(&total_changes.to_be_bytes());
+        out
+    }
+
+    /// Derive the `(StartLine, LineCount)` window bracketing every
+    /// non-empty change line, saturating into the header field types.
+    fn line_window(&self) -> (i16, u16) {
         let mut start = u32::MAX;
         let mut end = 0u32;
         for l in &self.lines {
@@ -1063,65 +1105,94 @@ impl Pchg {
             start = start.min(l.line);
             end = end.max(l.line);
         }
-        let (start_line_i, line_count) = if start == u32::MAX {
-            (0i16, 0u16)
+        if start == u32::MAX {
+            (0, 0)
         } else {
             let sl = i16::try_from(start).unwrap_or(i16::MAX);
             // span = end - start + 1, clamped into the u16 LineCount field.
             let span = (end - start).saturating_add(1);
             (sl, u16::try_from(span).unwrap_or(u16::MAX))
-        };
-
-        let (changed_lines, min_reg, max_reg, max_changes, total_changes) =
-            self.derive_header_hints();
-
-        let big = matches!(kind, PchgKind::Big);
-        let flags: u16 = if big { 0x0002 } else { 0x0001 };
-
-        let mut out = Vec::new();
-        out.extend_from_slice(&0u16.to_be_bytes()); // Compression = 0 (none)
-        out.extend_from_slice(&flags.to_be_bytes());
-        out.extend_from_slice(&start_line_i.to_be_bytes());
-        out.extend_from_slice(&line_count.to_be_bytes());
-        out.extend_from_slice(&changed_lines.to_be_bytes());
-        out.extend_from_slice(&min_reg.to_be_bytes());
-        out.extend_from_slice(&max_reg.to_be_bytes());
-        out.extend_from_slice(&max_changes.to_be_bytes());
-        out.extend_from_slice(&total_changes.to_be_bytes());
-
-        if line_count == 0 {
-            return out;
         }
+    }
 
-        // Index the (possibly unsorted) change list by absolute line so the
-        // per-line records emit in scanline order with zero-change gaps.
+    /// True when any change in [`Self::lines`] carries an alpha value.
+    fn any_alpha(&self) -> bool {
+        self.lines
+            .iter()
+            .any(|l| l.changes.iter().any(|c| c.alpha.is_some()))
+    }
+
+    /// Serialise the uncompressed LineData for [`Self::lines`]: the
+    /// MSB-first LineMask bitmap followed by one change record per set
+    /// bit, in ascending line order.
+    fn encode_line_data(&self, kind: PchgKind) -> Vec<u8> {
+        let (start_line_i, line_count) = self.line_window();
+        if line_count == 0 {
+            return Vec::new();
+        }
+        let big = matches!(kind, PchgKind::Big);
+        let use_alpha = big && self.any_alpha();
+        let line_count = line_count as usize;
+        let mask_bytes = line_count.div_ceil(32) * 4;
+        let mut out = vec![0u8; mask_bytes];
+
+        // Index the (possibly unsorted) change list by absolute line so
+        // the per-line records emit in scanline order.
         let start = start_line_i as i32;
-        for li in 0..line_count as i32 {
-            let line_no = (start + li) as u32;
+        for li in 0..line_count {
+            let line_no = (start + li as i32) as u32;
             let changes: &[PchgChange] = self
                 .lines
                 .iter()
                 .find(|l| l.line == line_no && !l.changes.is_empty())
                 .map(|l| l.changes.as_slice())
                 .unwrap_or(&[]);
+            if changes.is_empty() {
+                continue;
+            }
+            // Set this line's LineMask bit (bit 31 of the first
+            // longword = StartLine; MSB-first within each byte).
+            out[li >> 3] |= 0x80 >> (li & 7);
+
             if big {
                 let cc = u16::try_from(changes.len()).unwrap_or(u16::MAX);
                 out.extend_from_slice(&cc.to_be_bytes());
                 for ch in changes.iter().take(cc as usize) {
                     out.extend_from_slice(&ch.index.to_be_bytes());
-                    out.extend_from_slice(&ch.rgb);
+                    // On-disk BigPaletteChange component order: A, R, B, G.
+                    out.push(if use_alpha {
+                        ch.alpha.unwrap_or(0xFF)
+                    } else {
+                        0
+                    });
+                    out.push(ch.rgb[0]);
+                    out.push(ch.rgb[2]);
+                    out.push(ch.rgb[1]);
                 }
             } else {
-                let cc = u8::try_from(changes.len()).unwrap_or(u8::MAX);
-                out.push(cc);
-                for ch in changes.iter().take(cc as usize) {
-                    let idx = u8::try_from(ch.index).unwrap_or(u8::MAX);
-                    let r4 = ch.rgb[0] >> 4;
-                    let g4 = ch.rgb[1] >> 4;
-                    let b4 = ch.rgb[2] >> 4;
-                    out.push(idx);
-                    out.push(r4); // byte1: low nibble = R
-                    out.push((g4 << 4) | b4); // byte2: (G << 4) | B
+                // Split into the registers-0..=15 and 16..=31 groups.
+                // The 12-bit layout cannot address past register 31;
+                // saturate anything higher into register 31.
+                let mut low: Vec<u16> = Vec::new();
+                let mut high: Vec<u16> = Vec::new();
+                for ch in changes {
+                    let reg = ch.index.min(31);
+                    let r4 = u16::from(ch.rgb[0] >> 4);
+                    let g4 = u16::from(ch.rgb[1] >> 4);
+                    let b4 = u16::from(ch.rgb[2] >> 4);
+                    let word = ((reg & 0x0F) << 12) | (r4 << 8) | (g4 << 4) | b4;
+                    if reg < 16 {
+                        low.push(word);
+                    } else {
+                        high.push(word);
+                    }
+                }
+                low.truncate(0xFF);
+                high.truncate(0xFF);
+                out.push(low.len() as u8); // ChangeCount16
+                out.push(high.len() as u8); // ChangeCount32
+                for word in low.iter().chain(high.iter()) {
+                    out.extend_from_slice(&word.to_be_bytes());
                 }
             }
         }
@@ -1151,6 +1222,377 @@ impl Pchg {
             raw,
             lines: staged.lines,
         })
+    }
+}
+
+/// Decode a PCHG LineData block (the uncompressed byte stream that
+/// follows the header, or the output of [`pchg_huffman_expand`]): a
+/// LineMask bitmap of `line_count` bits (MSB-first,
+/// `((line_count + 31) / 32) * 4` bytes), then one change record per
+/// set bit in ascending line order.
+///
+/// Truncated change records are tolerated (decode keeps everything
+/// read so far) because historical PCHG writers were sloppy about
+/// trailing bytes, but a LineMask shorter than the header's LineCount
+/// demands is a structural error. Lines whose mask bit is clear — and
+/// mask-set lines whose record carries zero changes — contribute no
+/// [`PchgLine`].
+fn decode_pchg_line_data(
+    data: &[u8],
+    big: bool,
+    use_alpha: bool,
+    start_line: i16,
+    line_count: usize,
+) -> Result<Vec<PchgLine>> {
+    let mask_bytes = line_count.div_ceil(32) * 4;
+    if data.len() < mask_bytes {
+        return Err(Error::invalid(format!(
+            "ILBM PCHG: LineMask needs {mask_bytes} bytes for {line_count} lines, got {}",
+            data.len()
+        )));
+    }
+    let mut cur = mask_bytes;
+    let mut out: Vec<PchgLine> = Vec::new();
+    for li in 0..line_count {
+        // Bit 31 of the first longword = the line at StartLine; the
+        // big-endian longword layout makes this plain MSB-first byte
+        // order.
+        if (data[li >> 3] >> (7 - (li & 7))) & 1 == 0 {
+            continue;
+        }
+        let line = (start_line as i32 + li as i32).max(0) as u32;
+        if cur + 2 > data.len() {
+            break;
+        }
+        let mut entries: Vec<PchgChange>;
+        if big {
+            let cc = u16::from_be_bytes([data[cur], data[cur + 1]]) as usize;
+            cur += 2;
+            entries = Vec::with_capacity(cc.min((data.len() - cur) / 6));
+            for _ in 0..cc {
+                if cur + 6 > data.len() {
+                    break;
+                }
+                let reg = u16::from_be_bytes([data[cur], data[cur + 1]]);
+                // On-disk BigPaletteChange component order: A, R, B, G.
+                let a = data[cur + 2];
+                let r = data[cur + 3];
+                let b = data[cur + 4];
+                let g = data[cur + 5];
+                cur += 6;
+                entries.push(PchgChange {
+                    index: reg,
+                    rgb: [r, g, b],
+                    alpha: use_alpha.then_some(a),
+                });
+            }
+        } else {
+            let cc16 = data[cur] as usize; // changes to registers 0..=15
+            let cc32 = data[cur + 1] as usize; // changes to registers 16..=31
+            cur += 2;
+            let total = cc16 + cc32;
+            entries = Vec::with_capacity(total.min((data.len() - cur) / 2));
+            for i in 0..total {
+                if cur + 2 > data.len() {
+                    break;
+                }
+                let word = u16::from_be_bytes([data[cur], data[cur + 1]]);
+                cur += 2;
+                // (reg << 12) | (R4 << 8) | (G4 << 4) | B4; the second
+                // count group addresses registers 16..=31.
+                let mut reg = (word >> 12) & 0x0F;
+                if i >= cc16 {
+                    reg += 16;
+                }
+                let r4 = ((word >> 8) & 0x0F) as u8;
+                let g4 = ((word >> 4) & 0x0F) as u8;
+                let b4 = (word & 0x0F) as u8;
+                // Replicate the nibble (v<<4 | v) to widen 4→8 bits.
+                entries.push(PchgChange {
+                    index: reg,
+                    rgb: [r4 * 0x11, g4 * 0x11, b4 * 0x11],
+                    alpha: None,
+                });
+            }
+        }
+        if !entries.is_empty() {
+            out.push(PchgLine {
+                line,
+                changes: entries,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Expand a Huffman-compressed PCHG payload (`Compression == 1`): an
+/// 8-byte `PCHGCompHeader` (`u32 CompInfoSize`, `u32 OriginalDataSize`),
+/// then the serialized tree (`CompInfoSize` bytes of big-endian signed
+/// 16-bit nodes), then the compressed bitstream. Returns the
+/// reconstructed LineData.
+///
+/// The tree walk starts at the **end** of the node array and consumes
+/// bits MSB-first:
+///
+/// * bit `1` — inspect the current node value: non-negative is a leaf
+///   (emit the low byte, reset to the tree end); negative is a byte
+///   offset to follow (`p += value / 2` in node units).
+/// * bit `0` — step to the previous node (`p -= 1`); if that node
+///   carries the `0x0100` leaf tag, emit its low byte and reset.
+fn pchg_huffman_expand(data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < 8 {
+        return Err(Error::invalid(format!(
+            "ILBM PCHG: compressed payload needs an 8-byte PCHGCompHeader, got {}",
+            data.len()
+        )));
+    }
+    let comp_info_size = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let original_size = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let tree_end = 8usize
+        .checked_add(comp_info_size)
+        .filter(|&e| e <= data.len())
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "ILBM PCHG: CompInfoSize {comp_info_size} overruns the chunk"
+            ))
+        })?;
+    if original_size == 0 {
+        return Ok(Vec::new());
+    }
+    if comp_info_size < 2 || comp_info_size % 2 != 0 {
+        return Err(Error::invalid(format!(
+            "ILBM PCHG: CompInfoSize {comp_info_size} is not a positive even node count"
+        )));
+    }
+    let stream = &data[tree_end..];
+    // Every decompressed byte consumes at least one bit, so a claimed
+    // OriginalDataSize beyond 8x the stream is unsatisfiable — reject
+    // before allocating an attacker-controlled buffer.
+    if original_size > stream.len().saturating_mul(8) {
+        return Err(Error::invalid(format!(
+            "ILBM PCHG: OriginalDataSize {original_size} exceeds the compressed stream capacity"
+        )));
+    }
+    let nodes: Vec<i16> = data[8..tree_end]
+        .chunks_exact(2)
+        .map(|c| i16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    let n = nodes.len();
+
+    let mut out: Vec<u8> = Vec::with_capacity(original_size);
+    let mut p = n - 1;
+    'stream: for &byte in stream {
+        for shift in (0..8).rev() {
+            if out.len() >= original_size {
+                break 'stream;
+            }
+            if (byte >> shift) & 1 == 1 {
+                // Right branch: the node value is a leaf or a link.
+                let v = nodes[p];
+                if v >= 0 {
+                    out.push((v & 0xFF) as u8);
+                    p = n - 1;
+                } else {
+                    // Negative byte offset, halved into node units.
+                    let np = p as i64 + i64::from(v) / 2;
+                    if np < 0 {
+                        return Err(Error::invalid(
+                            "ILBM PCHG: Huffman link walks out of the tree",
+                        ));
+                    }
+                    p = np as usize;
+                }
+            } else {
+                // Left branch: step down one node.
+                if p == 0 {
+                    return Err(Error::invalid(
+                        "ILBM PCHG: Huffman left walk out of the tree",
+                    ));
+                }
+                p -= 1;
+                let v = nodes[p];
+                if v > 0 && v & 0x0100 != 0 {
+                    out.push((v & 0xFF) as u8);
+                    p = n - 1;
+                }
+            }
+        }
+    }
+    if out.len() < original_size {
+        return Err(Error::invalid(format!(
+            "ILBM PCHG: compressed stream exhausted after {} of {original_size} bytes",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// A node of the in-memory Huffman code tree built by
+/// [`pchg_huffman_compress`].
+enum PchgHuffNode {
+    Leaf(u8),
+    Internal(Box<PchgHuffNode>, Box<PchgHuffNode>),
+}
+
+/// Huffman-compress a PCHG LineData block, returning the serialized
+/// tree (`CompInfo`) and the MSB-first compressed bitstream —
+/// [`pchg_huffman_expand`]'s exact inverse.
+///
+/// Serialization layout: an array of big-endian signed 16-bit nodes
+/// with the tree root in the **last** slot. Each internal node's slot
+/// value describes its right branch — a non-negative leaf value
+/// (symbol in the low byte) or a negative byte offset to the right
+/// subtree's root slot. The left child lives in the adjacent slot
+/// below: either another internal node, or a `0x0100 | symbol` leaf
+/// marker. With at most 256 distinct symbols this tops out at
+/// 511 slots (1022 bytes), matching the spec's stated bound.
+fn pchg_huffman_compress(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    if data.is_empty() {
+        // OriginalDataSize == 0: the expander never walks the tree, but
+        // emit one placeholder slot so CompInfoSize stays a valid node
+        // count.
+        return (vec![0, 0], Vec::new());
+    }
+
+    let mut freq = [0u64; 256];
+    for &b in data {
+        freq[b as usize] += 1;
+    }
+
+    // Standard Huffman construction: repeatedly merge the two
+    // lowest-weight subtrees. `seq` breaks weight ties deterministically
+    // (insertion order) so the output is stable across runs.
+    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32, usize)>> =
+        std::collections::BinaryHeap::new();
+    let mut arena: Vec<PchgHuffNode> = Vec::new();
+    let mut seq = 0u32;
+    for (sym, &f) in freq.iter().enumerate() {
+        if f > 0 {
+            arena.push(PchgHuffNode::Leaf(sym as u8));
+            heap.push(std::cmp::Reverse((f, seq, arena.len() - 1)));
+            seq += 1;
+        }
+    }
+    if heap.len() == 1 {
+        // Degenerate single-symbol stream: hang the lone leaf off the
+        // root's right branch so its code is the single bit `1`.
+        let std::cmp::Reverse((_, _, idx)) = heap.pop().expect("one entry");
+        let sym = match arena[idx] {
+            PchgHuffNode::Leaf(s) => s,
+            PchgHuffNode::Internal(..) => unreachable!("single entry is a leaf"),
+        };
+        let tree = vec![0x01, sym]; // one slot: 0x0100 | sym (right leaf)
+        let mut writer = PchgBitWriter::default();
+        for _ in 0..data.len() {
+            writer.push(true);
+        }
+        return (tree, writer.finish());
+    }
+    while heap.len() > 1 {
+        let std::cmp::Reverse((fa, _, a)) = heap.pop().expect("len > 1");
+        let std::cmp::Reverse((fb, _, b)) = heap.pop().expect("len > 1");
+        // Splice the two subtrees out of the arena by index; order the
+        // lighter subtree on the left.
+        let node = PchgHuffNode::Internal(
+            Box::new(std::mem::replace(&mut arena[a], PchgHuffNode::Leaf(0))),
+            Box::new(std::mem::replace(&mut arena[b], PchgHuffNode::Leaf(0))),
+        );
+        arena.push(node);
+        heap.push(std::cmp::Reverse((fa + fb, seq, arena.len() - 1)));
+        seq += 1;
+    }
+    let std::cmp::Reverse((_, _, root_idx)) = heap.pop().expect("root remains");
+    let root = std::mem::replace(&mut arena[root_idx], PchgHuffNode::Leaf(0));
+
+    // Assign codes (left = 0, right = 1) and serialize the tree.
+    let mut codes: Vec<Vec<bool>> = vec![Vec::new(); 256];
+    let mut path: Vec<bool> = Vec::new();
+    assign_pchg_codes(&root, &mut path, &mut codes);
+    let mut slots: Vec<i16> = Vec::new();
+    emit_pchg_tree(&root, &mut slots);
+
+    let mut tree_bytes = Vec::with_capacity(slots.len() * 2);
+    for s in &slots {
+        tree_bytes.extend_from_slice(&s.to_be_bytes());
+    }
+    let mut writer = PchgBitWriter::default();
+    for &b in data {
+        for &bit in &codes[b as usize] {
+            writer.push(bit);
+        }
+    }
+    (tree_bytes, writer.finish())
+}
+
+/// Record each leaf's root-to-leaf bit path (left = 0, right = 1).
+fn assign_pchg_codes(node: &PchgHuffNode, path: &mut Vec<bool>, codes: &mut [Vec<bool>]) {
+    match node {
+        PchgHuffNode::Leaf(sym) => codes[*sym as usize] = path.clone(),
+        PchgHuffNode::Internal(l, r) => {
+            path.push(false);
+            assign_pchg_codes(l, path, codes);
+            path.pop();
+            path.push(true);
+            assign_pchg_codes(r, path, codes);
+            path.pop();
+        }
+    }
+}
+
+/// Serialize an internal node's subtree into `slots`, returning the
+/// slot index of its root. Right subtrees are emitted first (at lower
+/// addresses, reachable via a negative byte-offset link); the left
+/// child always lands in the slot directly below its parent.
+fn emit_pchg_tree(node: &PchgHuffNode, slots: &mut Vec<i16>) -> usize {
+    let PchgHuffNode::Internal(l, r) = node else {
+        unreachable!("emit_pchg_tree is only called on internal nodes");
+    };
+    // Right branch: an embedded leaf value, or a link to the right
+    // subtree's root emitted below us.
+    let right_slot: std::result::Result<usize, i16> = match r.as_ref() {
+        PchgHuffNode::Leaf(sym) => Err(i16::from(*sym)),
+        internal => Ok(emit_pchg_tree(internal, slots)),
+    };
+    // Left child: marker slot or adjacent subtree root.
+    match l.as_ref() {
+        PchgHuffNode::Leaf(sym) => slots.push(0x0100 | i16::from(*sym)),
+        internal => {
+            let li = emit_pchg_tree(internal, slots);
+            debug_assert_eq!(li, slots.len() - 1, "left root must sit directly below");
+        }
+    }
+    let my = slots.len();
+    let v = match right_slot {
+        Err(leaf) => leaf,
+        Ok(ri) => ((ri as i32 - my as i32) * 2) as i16,
+    };
+    slots.push(v);
+    my
+}
+
+/// MSB-first bit accumulator for the PCHG Huffman bitstream.
+#[derive(Default)]
+struct PchgBitWriter {
+    out: Vec<u8>,
+    cur: u8,
+    used: u8,
+}
+
+impl PchgBitWriter {
+    fn push(&mut self, bit: bool) {
+        self.cur = (self.cur << 1) | u8::from(bit);
+        self.used += 1;
+        if self.used == 8 {
+            self.out.push(self.cur);
+            self.cur = 0;
+            self.used = 0;
+        }
+    }
+    fn finish(mut self) -> Vec<u8> {
+        if self.used > 0 {
+            self.out.push(self.cur << (8 - self.used));
+        }
+        self.out
     }
 }
 
@@ -2626,14 +3068,17 @@ fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<IlbmImage> {
             lasso_indices.extend_from_slice(&indices);
         }
 
-        // Resolve to RGB.
-        let row_palette: &[[u8; 3]] = if let Some(sham) = &sham {
+        // Resolve to RGB. When both a PCHG and a SHAM per-line palette
+        // are present, PCHG wins — it is the most expressive of the
+        // sliced-palette chunks and the designated successor of
+        // SHAM/CTBL/DYCP.
+        let row_palette: &[[u8; 3]] = if let Some(lp) = &line_palettes {
+            lp[y].as_slice()
+        } else if let Some(sham) = &sham {
             sham.palettes
                 .get(y)
                 .map(|p| p.as_slice())
                 .unwrap_or(&default_palette)
-        } else if let Some(lp) = &line_palettes {
-            lp[y].as_slice()
         } else {
             &default_palette
         };
