@@ -127,6 +127,7 @@ impl Channels {
 /// the 16-entry version from the Amiga ROM Kernel Manual / AmigaOS wiki
 /// rather than the 17-entry variant sometimes cited — a 4-bit code only
 /// covers codes 0..15 so the 17th value (`34`) is unreachable.
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub const FIB_DELTA_TABLE: [i32; 16] =
     [-34, -21, -13, -8, -5, -3, -2, -1, 0, 1, 2, 3, 5, 8, 13, 21];
 
@@ -154,6 +155,7 @@ fn fib_pick_nibble(prev: i32, target: i32) -> (u8, i32) {
 /// deltas share one byte, high nibble first. If the sample count after
 /// the initial is odd the final low nibble is padded with index 8 (delta
 /// 0) so the result is always a whole number of bytes.
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub fn fibonacci_encode_channel(samples: &[i8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(0u8); // pad byte
@@ -189,6 +191,7 @@ pub fn fibonacci_encode_channel(samples: &[i8]) -> Vec<u8> {
 /// caller is responsible for knowing how many samples the channel should
 /// produce (typically `VHDR.oneShotHiSamples`); callers can truncate the
 /// output.
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub fn fibonacci_decode_channel(body: &[u8]) -> Result<Vec<i8>> {
     if body.len() < 2 {
         return Err(Error::invalid(

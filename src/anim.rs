@@ -465,6 +465,7 @@ impl AnimImage {
 }
 
 /// Probe: a `FORM .... ANIM` magic at the start.
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub fn probe(buf: &[u8]) -> u8 {
     if buf.len() >= 12 && &buf[0..4] == b"FORM" && &buf[8..12] == b"ANIM" {
         100

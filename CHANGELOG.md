@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Marked clearly-internal plumbing `#[doc(hidden)]` so API-diff tooling
+  no longer tracks it as part of the stable surface: the 8SVX
+  Fibonacci-delta codec helpers (`svx::FIB_DELTA_TABLE`,
+  `svx::fibonacci_encode_channel`, `svx::fibonacci_decode_channel`) and
+  the ANIM registry probe scorer (`anim::probe`). No signature,
+  visibility, or behaviour change; the documented FORM/chunk-walker,
+  typed chunk accessors, and encode/decode entry points stay visible.
+
 ### Fixed
 
 - *(ilbm)* **`PCHG` wire layout is now spec-conformant.** The previous
