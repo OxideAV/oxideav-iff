@@ -65,6 +65,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `iff_rgbn` muxers wrap one packet via `encode_rgb8` /
   `encode_rgbn`. Dimension bounds (16-bit raster headers), packet
   size, pixel format, and single-frame limits are all validated.
+- *(anim)* **container-level `iff_anim` muxer** — `AnimMuxer` accepts a
+  `rawvideo` / `Rgba` stream with one packet per frame and emits an
+  op-5 (Byte Vertical Delta) `FORM ANIM`: seed `FORM ILBM` + ANHD +
+  delta bodies, one shared CMAP greedy-built from the unique RGB
+  triples of all frames (≤ 256, first-seen order — ANIM shares a
+  single palette), packet durations converted through the stream time
+  base into the §2.1 jiffy `reltime` chain (frame `i` displays for
+  frame `i+1`'s `rel_time`; with the demuxer's `1/60` base the
+  timeline round-trips demux → mux → demux; the wire has no
+  trailing-frame delay, so the final duration is representable only
+  when it equals the previous one). Backed by the new
+  **`encode_anim_op5_timed`** authoring API — the op-5 counterpart of
+  `encode_anim_op0_timed` (`encode_anim_op5` now delegates to it with
+  the uniform 1-jiffy default; identical wire output).
 - *(fuzz)* new `deep_decode` libFuzzer target feeding the three
   `FORM DEEP` whole-FORM walkers (`parse_deep_frames`, the TVDC
   table-supplied variant, `extract_deep_jpeg_frames`); ~29.7M-exec

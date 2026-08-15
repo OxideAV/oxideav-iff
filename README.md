@@ -437,13 +437,31 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
   [`anim::encode_anim_op2`], [`anim::encode_anim_op3`],
   [`anim::encode_op23_body`],
   [`anim::encode_anim_op4`], [`anim::encode_op4_body`],
-  [`anim::encode_anim_op5`], [`anim::encode_op5_body`],
+  [`anim::encode_anim_op5`], [`anim::encode_anim_op5_timed`],
+  [`anim::encode_op5_body`],
   [`anim::encode_anim_op7`], [`anim::encode_op7_body`],
   [`anim::encode_anim_op8`], [`anim::encode_op8_body`],
-  [`anim::AnimImage`], [`anim::Anhd`].
+  [`anim::AnimImage`], [`anim::Anhd`], [`anim::AnimMuxer`].
 - Container id: `"iff_anim"`, probes `FORM....ANIM` and matches
   `.anim` by extension. Multi-frame `rawvideo` / `Rgba` stream;
   every frame is emitted as a keyframe packet.
+- **Container-level muxer**: [`anim::AnimMuxer`] (registered under
+  `"iff_anim"`) accepts a `rawvideo` / `Rgba` stream with one packet
+  per frame and emits an **op-5** animation — seed `FORM ILBM` plus
+  `ANHD` + Byte-Vertical-Delta bodies. One shared CMAP is greedy-built
+  from the unique RGB triples of all frames (first-seen order, ≤ 256 —
+  ANIM shares a single palette), so an animation with ≤ 256 unique
+  colours round-trips pixel-exactly through the `iff_anim` demuxer.
+  Packet `duration`s are converted through the stream time base to the
+  §2.1 jiffy `reltime` written into the *next* frame's ANHD (frame `i`
+  stays on screen for frame `i+1`'s `rel_time`); with the demuxer's own
+  `1/60` time base durations pass through as-is, so demux → mux →
+  demux preserves the timeline (the wire carries no delay after the
+  final frame, so the last packet's duration is representable only
+  when it matches the previous one). [`anim::encode_anim_op5_timed`]
+  is the underlying authoring API — the op-5 counterpart of
+  [`anim::encode_anim_op0_timed`], writing caller-chosen
+  `rel_time` / `abs_time` per delta frame.
 - Op-1 (XOR ILBM mode) is the original ANIM compression method
   (§1.2.1 / §1.3): a delta frame stores the byte-for-byte XOR of the
   new frame against the previous frame's planar bitmap, run-length-

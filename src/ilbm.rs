@@ -7550,7 +7550,7 @@ impl DeepMuxer {
 /// Shared stream-shape validation for the true-colour muxers: exactly one
 /// `rawvideo`-style video stream, `PixelFormat::Rgba`, with dimensions that
 /// fit the 16-bit fields every IFF raster header uses.
-fn true_color_muxer_stream_shape(
+pub(crate) fn true_color_muxer_stream_shape(
     label: &str,
     streams: &[StreamInfo],
 ) -> Result<(u16, u16, TimeBase)> {

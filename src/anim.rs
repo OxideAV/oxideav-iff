@@ -68,8 +68,8 @@ use std::io::Read;
 
 use oxideav_core::ReadSeek;
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error, MediaType, Packet,
-    PixelFormat, Result, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error, MediaType, Muxer,
+    Packet, PixelFormat, Result, StreamInfo, TimeBase, WriteSeek,
 };
 
 use crate::chunk::{read_chunk_header, read_form_type, GROUP_FORM};
@@ -86,6 +86,7 @@ use crate::ilbm::{
 /// `anim::encode_anim_op0` helper is the only writer (used by tests).
 pub fn register(reg: &mut ContainerRegistry) {
     reg.register_demuxer("iff_anim", open);
+    reg.register_muxer("iff_anim", open_anim_muxer);
     reg.register_extension("anim", "iff_anim");
     reg.register_probe("iff_anim", probe_data);
 }
@@ -191,6 +192,176 @@ impl Demuxer for AnimDemuxer {
             Some(total * 1_000_000 / 60)
         }
     }
+}
+
+// ───────────────────── container-level ANIM muxer ─────────────────────
+
+/// Container-level `FORM ANIM` muxer (`iff_anim`). Accepts a single
+/// `rawvideo` / `Rgba` video stream and one packet per frame, and emits an
+/// op-5 (Byte Vertical Delta — the DeluxePaint workhorse) animation: the
+/// seed frame is a full `FORM ILBM`, every later frame an `ANHD` + delta
+/// `BODY` against the previous frame.
+///
+/// * **Palette**: one shared CMAP is greedy-built from the unique RGB
+///   triples of *all* frames (first-seen order, capped at 256 — ANIM
+///   shares a single palette across the animation); frames quantise to it
+///   by nearest fit, so an animation with ≤ 256 unique colours round-trips
+///   pixel-exactly.
+/// * **Timing** (§2.1 `reltime`, jiffies of 1/60 s): each packet's
+///   `duration` is converted through the stream time base to the jiffy
+///   delay written into the *next* frame's `ANHD` — per the playback
+///   model, frame `i` stays on screen for frame `i+1`'s `rel_time`. With a
+///   `1/60` time base (what the `iff_anim` demuxer advertises), durations
+///   pass through as-is, so demux → mux → demux preserves the timeline.
+///   The wire format carries no delay *after* the last frame, so the final
+///   packet's duration is representable only when it equals the previous
+///   one (players fall back to the last delta's `rel_time`). Packets
+///   without durations produce the uniform 1-jiffy default.
+pub struct AnimMuxer {
+    output: Box<dyn WriteSeek>,
+    width: u16,
+    height: u16,
+    time_base: TimeBase,
+    frames: Vec<Vec<u8>>,
+    durations: Vec<Option<i64>>,
+    written: bool,
+}
+
+impl AnimMuxer {
+    pub fn new(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Self> {
+        let (width, height, time_base) =
+            crate::ilbm::true_color_muxer_stream_shape("ANIM", streams)?;
+        Ok(Self {
+            output,
+            width,
+            height,
+            time_base,
+            frames: Vec::new(),
+            durations: Vec::new(),
+            written: false,
+        })
+    }
+
+    /// Convert a packet duration (stream time-base ticks) to §2.1 jiffies
+    /// (1/60 s), clamped to at least one jiffy so a frame always advances.
+    fn jiffies_of(&self, duration: i64) -> u32 {
+        let num = self.time_base.num().max(0);
+        let den = self.time_base.den().max(1);
+        let j = duration.saturating_mul(60).saturating_mul(num) / den;
+        u32::try_from(j.max(1)).unwrap_or(u32::MAX)
+    }
+}
+
+impl Muxer for AnimMuxer {
+    fn format_name(&self) -> &str {
+        "iff_anim"
+    }
+    fn write_header(&mut self) -> Result<()> {
+        Ok(()) // the FORM is assembled at write_trailer time
+    }
+    fn write_packet(&mut self, packet: &Packet) -> Result<()> {
+        let expected = usize::from(self.width) * usize::from(self.height) * 4;
+        if packet.data.len() != expected {
+            return Err(Error::invalid(format!(
+                "ANIM muxer: packet size {} does not match width*height*4 = {expected}",
+                packet.data.len()
+            )));
+        }
+        self.frames.push(packet.data.clone());
+        self.durations.push(packet.duration);
+        Ok(())
+    }
+    fn write_trailer(&mut self) -> Result<()> {
+        if self.written {
+            return Ok(());
+        }
+        if self.frames.is_empty() {
+            return Err(Error::invalid("ANIM muxer: no frames written"));
+        }
+
+        // One shared CMAP across the whole animation: unique RGB triples in
+        // first-seen order over every frame, capped at 256 (8 bitplanes).
+        let mut palette: Vec<[u8; 3]> = Vec::new();
+        for frame in &self.frames {
+            for px in frame.chunks_exact(4) {
+                let triple = [px[0], px[1], px[2]];
+                if !palette.contains(&triple) {
+                    if palette.len() >= 256 {
+                        break;
+                    }
+                    palette.push(triple);
+                }
+            }
+        }
+        let n_planes = if palette.len() <= 1 {
+            1
+        } else {
+            let bits = (palette.len() as u32 - 1)
+                .next_power_of_two()
+                .trailing_zeros();
+            bits.max(1) as u8
+        };
+
+        let bmhd = Bmhd {
+            width: self.width,
+            height: self.height,
+            x_origin: 0,
+            y_origin: 0,
+            n_planes,
+            masking: Masking::None,
+            compression: Compression::ByteRun1,
+            pad: 0,
+            transparent_color: 0,
+            x_aspect: 1,
+            y_aspect: 1,
+            page_width: self.width.min(i16::MAX as u16) as i16,
+            page_height: self.height.min(i16::MAX as u16) as i16,
+        };
+
+        let images: Vec<IlbmImage> = self
+            .frames
+            .iter()
+            .map(|rgba| IlbmImage {
+                width: u32::from(self.width),
+                height: u32::from(self.height),
+                bmhd,
+                palette: palette.clone(),
+                rgba: rgba.clone(),
+                ..IlbmImage::default()
+            })
+            .collect();
+
+        // §2.1 timing: delta frame i's rel_time is the jiffy delay before
+        // it replaces frame i-1, i.e. packet i-1's duration. abs_time is
+        // the cumulative start ("currently unused" per the 1988 spec but
+        // written for players that key off it).
+        let mut timing = Vec::with_capacity(images.len());
+        let mut cumulative: u32 = 0;
+        timing.push(FrameTiming {
+            rel_time: 0,
+            abs_time: 0,
+        });
+        for i in 1..images.len() {
+            let rel = self.durations[i - 1]
+                .map(|d| self.jiffies_of(d))
+                .unwrap_or(1);
+            cumulative = cumulative.saturating_add(rel);
+            timing.push(FrameTiming {
+                rel_time: rel,
+                abs_time: cumulative,
+            });
+        }
+
+        let form = encode_anim_op5_timed(&images, &timing)?;
+        self.output.write_all(&form)?;
+        self.output.flush()?;
+        self.written = true;
+        Ok(())
+    }
+}
+
+fn open_anim_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
+    Ok(Box::new(AnimMuxer::new(output, streams)?))
 }
 
 /// `ANHD` — Animation Header. 40-byte chunk per spec, but only a few
@@ -2200,10 +2371,40 @@ fn encode_op5_column(
 /// Compatible with the in-tree [`parse_anim`] op-5 decoder; tested via
 /// `tests/anim_op5.rs`.
 pub fn encode_anim_op5(frames: &[IlbmImage]) -> Result<Vec<u8>> {
+    let timing = vec![
+        FrameTiming {
+            rel_time: 1,
+            abs_time: 0,
+        };
+        frames.len()
+    ];
+    encode_anim_op5_timed(frames, &timing)
+}
+
+/// [`encode_anim_op5`] with explicit per-frame [`FrameTiming`] written into
+/// each delta frame's `ANHD` (§2.1 `abstime` / `reltime`, jiffies of
+/// 1/60 s) — the op-5 counterpart of [`encode_anim_op0_timed`].
+///
+/// `timing` is parallel to `frames`. `timing[0]` describes the seed frame:
+/// the seed is always displayed at t = 0 and carries no `ANHD`, so its entry
+/// is ignored for output but accepted for caller symmetry. `timing[i]` for
+/// `i >= 1` supplies the `rel_time` / `abs_time` of delta frame `i` — per
+/// the playback model, frame `i-1` stays on screen for `timing[i].rel_time`
+/// jiffies before frame `i` replaces it. Frames written here round-trip
+/// through [`parse_anim`] into the same [`AnimImage::frame_timing`] and the
+/// derived [`AnimPlayback`] timeline reflects the authored delays.
+pub fn encode_anim_op5_timed(frames: &[IlbmImage], timing: &[FrameTiming]) -> Result<Vec<u8>> {
     if frames.is_empty() {
         return Err(Error::invalid(
             "ANIM op 5 encode: at least one frame required",
         ));
+    }
+    if timing.len() != frames.len() {
+        return Err(Error::invalid(format!(
+            "ANIM op-5 timed encode: timing has {} entries, expected {} (one per frame)",
+            timing.len(),
+            frames.len()
+        )));
     }
     if frames[0].bmhd.n_planes > 8 {
         return Err(Error::unsupported(format!(
@@ -2225,7 +2426,7 @@ pub fn encode_anim_op5(frames: &[IlbmImage]) -> Result<Vec<u8>> {
     // frame's RGBA the same way the decoder does.
     let mut prev_planar = rgba_to_planar(&frames[0]);
 
-    for frame in &frames[1..] {
+    for (frame, t) in frames[1..].iter().zip(timing[1..].iter()) {
         let cur_planar = rgba_to_planar(frame);
         let body = encode_op5_body(&prev_planar, &cur_planar, &frame.bmhd)?;
         let anhd = Anhd {
@@ -2235,8 +2436,8 @@ pub fn encode_anim_op5(frames: &[IlbmImage]) -> Result<Vec<u8>> {
             h: frame.bmhd.height,
             x: frame.bmhd.x_origin,
             y: frame.bmhd.y_origin,
-            abs_time: 0,
-            rel_time: 1,
+            abs_time: t.abs_time,
+            rel_time: t.rel_time,
             // These encoders compute each frame as a delta against the
             // immediately-previous frame, so the §2.1 `interleave` tag
             // is `1` (modify one frame back), not the `0` double-buffer
