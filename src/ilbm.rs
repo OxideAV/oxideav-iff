@@ -394,6 +394,18 @@ pub const SUPER72HIRESDBL_KEY: u32 = 0x0008_9008;
 pub const A2024TENHERTZ_KEY: u32 = 0x0004_1000;
 pub const A2024FIFTEENHERTZ_KEY: u32 = 0x0004_9000;
 
+/// Which of the two overlaid playfields of a dual-playfield display
+/// ([`CAMG_DUALPF`]) is in front, per the [`CAMG_PFBA`] bit ("playfield 2
+/// has display priority over playfield 1"). See
+/// [`Camg::dual_playfield_priority`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayfieldPriority {
+    /// PFBA clear — playfield 1 keeps display priority.
+    Playfield1InFront,
+    /// PFBA set — playfield 2 has display priority over playfield 1.
+    Playfield2InFront,
+}
+
 /// A parsed `CAMG` viewport mode. `raw` retains every flag bit so a
 /// round-trip preserves the original word.
 #[derive(Clone, Copy, Debug, Default)]
@@ -446,6 +458,31 @@ impl Camg {
     /// ([`CAMG_PFBA`]).
     pub fn is_pfba(self) -> bool {
         self.raw & CAMG_PFBA != 0
+    }
+    /// The dual-playfield display priority this CAMG requests, or `None`
+    /// when [`CAMG_DUALPF`] is clear (a single-playfield display, where
+    /// PFBA has nothing to order).
+    ///
+    /// The staged ViewMode table defines PFBA as "playfield 2 has display
+    /// priority over playfield 1", so within a DUALPF mode a set bit puts
+    /// playfield 2 in front and a clear bit leaves playfield 1 in front
+    /// (the `LORESDPF_KEY` vs `LORESDPF2_KEY` mode-key pair encodes exactly
+    /// this DUALPF-without/with-PFBA distinction).
+    ///
+    /// Note this crate does **not** composite dual-playfield ILBMs: the
+    /// staged docs pin only these two mode bits, not the display rules a
+    /// compositor needs (which bitplanes feed which playfield, where
+    /// playfield 2's colors start in the CMAP, or how a playfield shows
+    /// through the one in front) — see the README for the documented gap.
+    pub fn dual_playfield_priority(self) -> Option<PlayfieldPriority> {
+        if !self.is_dualpf() {
+            return None;
+        }
+        Some(if self.is_pfba() {
+            PlayfieldPriority::Playfield2InFront
+        } else {
+            PlayfieldPriority::Playfield1InFront
+        })
     }
     /// Genlock video-overlay control ([`CAMG_GENLOCK_VIDEO`]).
     pub fn is_genlock_video(self) -> bool {
@@ -5288,6 +5325,19 @@ fn read_true_color_form(
     let body_size = (hdr.size as u64)
         .checked_sub(4)
         .ok_or_else(|| Error::invalid(format!("{label}: FORM size shorter than form type")))?;
+    // Allocation guard: bound the declared FORM size by what the stream can
+    // actually supply before reserving the buffer, so a forged multi-gigabyte
+    // size field fails as a truncation error instead of an attacker-sized
+    // allocation.
+    let here = input.stream_position()?;
+    let end = input.seek(SeekFrom::End(0))?;
+    input.seek(SeekFrom::Start(here))?;
+    if body_size > end.saturating_sub(here) {
+        return Err(Error::invalid(format!(
+            "{label}: FORM declares {body_size} body bytes but only {} remain",
+            end.saturating_sub(here)
+        )));
+    }
     let mut form_body = vec![0u8; body_size as usize];
     input.read_exact(&mut form_body)?;
     let mut full = Vec::with_capacity(12 + form_body.len());
@@ -6149,6 +6199,17 @@ pub fn decode_deep_runlength_body(
     let need = total
         .checked_mul(pixel_bytes)
         .ok_or_else(|| Error::invalid("DEEP: width * height * pixel_bytes overflows"))?;
+    // Allocation guard: a ByteRun1 source byte can contribute at most 64
+    // output bytes (a replicate run codes up to 128 bytes from 2 source
+    // bytes), so a body too small to ever produce `need` bytes is rejected
+    // before reserving an attacker-sized buffer.
+    if need > body.len().saturating_mul(64) {
+        return Err(Error::invalid(format!(
+            "DEEP RUNLENGTH: {need} chunky bytes cannot come from a {}-byte body \
+             (ByteRun1 expands at most 64x)",
+            body.len()
+        )));
+    }
     let mut chunky = Vec::with_capacity(need);
     let consumed = byterun1_decode_row(body, need, &mut chunky)?;
     // A well-formed whole-DBOD RUNLENGTH stream unpacks to exactly `need`
@@ -6506,6 +6567,21 @@ pub fn assemble_deep_tvdc(
     let w = width as usize;
     let h = height as usize;
     let total = w * h;
+    // Allocation guard: a TVDC source byte holds two nibbles and an
+    // escape-nibble + count-nibble pair emits at most 15 bytes, so one source
+    // byte can never contribute more than 15 output bytes. A body too small
+    // to ever produce the `w × h × nElements` component bytes is rejected
+    // before allocating an attacker-sized canvas.
+    let component_bytes = total
+        .checked_mul(dpel.elements.len())
+        .ok_or_else(|| Error::invalid("DEEP TVDC: width * height * components overflows"))?;
+    if component_bytes > body.len().saturating_mul(15) {
+        return Err(Error::invalid(format!(
+            "DEEP TVDC: {component_bytes} component bytes cannot come from a {}-byte body \
+             (TVDC expands at most 15x)",
+            body.len()
+        )));
+    }
     let mut rgba = vec![0u8; total * 4];
     // A pixel with no alpha-bearing component is fully opaque.
     for px in rgba.chunks_exact_mut(4) {
@@ -6541,11 +6617,31 @@ pub fn assemble_deep_tvdc(
 /// §1.2 pixel layout), the optional DLOC placement, and the first DBOD body.
 /// Dimensions come from the DLOC preceding the DBOD if present, else from the
 /// DGBL display size (§1.3). The DBOD is assembled per DGBL.Compression:
-/// NOCOMPRESSION is decoded; every other method (RUNLENGTH / HUFFMAN /
-/// DYNAMICHUFF / JPEG / TVDC) is rejected here — see the module comment for
-/// the TVDC delta-table gap and use [`assemble_deep_tvdc`] when the caller
-/// has the table.
+/// NOCOMPRESSION and RUNLENGTH (§1.5b best-effort ByteRun1) decode here; a
+/// TVDC body needs the §1.5 delta table, which the FORM does not carry — use
+/// [`parse_deep_with_tvdc_table`] when the caller has it. HUFFMAN /
+/// DYNAMICHUFF are rejected (no staged wire layout) and a JPEG body is
+/// surfaced — not pixel-decoded — via [`extract_deep_jpeg_frames`].
 pub fn parse_deep(bytes: &[u8]) -> Result<DeepImage> {
+    parse_deep_inner(bytes, None)
+}
+
+/// [`parse_deep`] for a `FORM DEEP` whose DGBL names TVDC compression (§1.5),
+/// with the 16-word signed delta table supplied by the caller.
+///
+/// §1.5 stores the table "with the file/companion data"; the canonical DEEP
+/// text names no chunk that carries it inside the FORM, so the chunk walk
+/// alone cannot decode a TVDC DBOD (a documented spec gap). This entry point
+/// closes the loop for callers who transport the table out of band: the FORM
+/// is walked exactly as [`parse_deep`] does and the first DBOD is decoded via
+/// [`assemble_deep_tvdc`] with `table`. NOCOMPRESSION / RUNLENGTH bodies also
+/// decode through this entry point (the table is simply unused), so a caller
+/// holding a table does not need to pre-inspect DGBL.
+pub fn parse_deep_with_tvdc_table(bytes: &[u8], table: &[i16; 16]) -> Result<DeepImage> {
+    parse_deep_inner(bytes, Some(table))
+}
+
+fn parse_deep_inner(bytes: &[u8], tvdc_table: Option<&[i16; 16]>) -> Result<DeepImage> {
     if bytes.len() < 12 || &bytes[0..4] != b"FORM" {
         return Err(Error::invalid("DEEP: missing FORM signature"));
     }
@@ -6614,7 +6710,7 @@ pub fn parse_deep(bytes: &[u8]) -> Result<DeepImage> {
         None => (dgbl.display_width, dgbl.display_height),
     };
 
-    let rgba = decode_deep_dbod(dgbl.compression, &dpel, width, height, dbod)?;
+    let rgba = decode_deep_dbod(dgbl.compression, &dpel, width, height, dbod, tvdc_table)?;
 
     Ok(DeepImage {
         dgbl,
@@ -6628,35 +6724,57 @@ pub fn parse_deep(bytes: &[u8]) -> Result<DeepImage> {
 
 /// Decode a single DEEP `DBOD` body into packed RGBA8888 per the DGBL
 /// compression method. The shared back-end of [`parse_deep`] and
-/// [`parse_deep_frames`].
+/// [`parse_deep_frames`] (and their `_with_tvdc_table` variants).
 ///
 /// NOCOMPRESSION (§1.4) and RUNLENGTH (§1.5b best-effort ByteRun1) decode in
-/// full. TVDC (§1.5) is rejected from a FORM because the 16-word delta table is
-/// stored with the file/companion data and the canonical DEEP text names no
-/// in-FORM chunk that carries it (a documented spec gap; use
-/// [`assemble_deep_tvdc`] with the caller-supplied table). HUFFMAN /
-/// DYNAMICHUFF / JPEG are rejected — no documented wire layout.
+/// full. TVDC (§1.5) decodes only when `tvdc_table` is supplied: the 16-word
+/// delta table is stored with the file/companion data and the canonical DEEP
+/// text names no in-FORM chunk that carries it (a documented spec gap; the
+/// `_with_tvdc_table` walkers and [`assemble_deep_tvdc`] are the
+/// caller-supplies-table escape hatch). HUFFMAN / DYNAMICHUFF are rejected
+/// per the §1.5b posture — no public source documents their tree
+/// representation / wire layout, so the file is refused with a diagnostic
+/// pending a fixture. A JPEG body (§1.5b: a complete JFIF stream) is not
+/// pixel-decoded here — this crate has no JPEG entropy decoder — and is
+/// instead surfaced whole via [`extract_deep_jpeg_frames`] / the `iff_deep`
+/// demuxer for a downstream JPEG decoder.
 fn decode_deep_dbod(
     compression: DeepCompression,
     dpel: &Dpel,
     width: u16,
     height: u16,
     dbod: &[u8],
+    tvdc_table: Option<&[i16; 16]>,
 ) -> Result<Vec<u8>> {
     match compression {
         DeepCompression::None => assemble_deep_chunky(dpel, width, height, dbod),
         DeepCompression::RunLength => decode_deep_runlength_body(dpel, width, height, dbod),
-        DeepCompression::Tvdc => Err(Error::invalid(
-            "DEEP: TVDC body cannot be decoded from the FORM alone — the §1.5 16-word \
-             delta table is stored with the file/companion data and the canonical DEEP \
-             text names no chunk that carries it in-FORM. Use assemble_deep_tvdc with \
-             the table supplied by the caller.",
+        DeepCompression::Tvdc => match tvdc_table {
+            Some(table) => assemble_deep_tvdc(dpel, width, height, table, dbod),
+            None => Err(Error::invalid(
+                "DEEP: TVDC body cannot be decoded from the FORM alone — the §1.5 16-word \
+                 delta table is stored with the file/companion data and the canonical DEEP \
+                 text names no chunk that carries it in-FORM. Use \
+                 parse_deep_with_tvdc_table / parse_deep_frames_with_tvdc_table (or \
+                 assemble_deep_tvdc) with the table supplied by the caller.",
+            )),
+        },
+        DeepCompression::Jpeg => Err(Error::invalid(
+            "DEEP: JPEG DBOD body (§1.5b: a complete JFIF stream, SOI FF D8 … EOI FF D9) \
+             is not pixel-decoded by this crate — extract the stream with \
+             extract_deep_jpeg_frames (or demux via iff_deep, codec id \"mjpeg\") and \
+             hand it to a JPEG decoder.",
         )),
-        other => Err(Error::invalid(format!(
-            "DEEP: DGBL Compression {} body coding is not decoded (wire layout \
-             undocumented in the staged spec)",
-            other.to_u16()
-        ))),
+        DeepCompression::Huffman => Err(Error::invalid(
+            "DEEP: DGBL Compression 2 (HUFFMAN) — no public source documents the Huffman \
+             tree representation, code-table location, or scan direction (§1.5b); \
+             rejected pending a fixture for behavioural-trace analysis",
+        )),
+        DeepCompression::DynamicHuffman => Err(Error::invalid(
+            "DEEP: DGBL Compression 3 (DYNAMICHUFF) — the adaptive-Huffman variant is \
+             unspecified in the staged spec (§1.5b); rejected pending a fixture for \
+             behavioural-trace analysis",
+        )),
     }
 }
 
@@ -6774,10 +6892,30 @@ impl DeepMovie {
 /// from the DLOC that immediately precedes it (§1.3) — a DLOC binds to the
 /// *next* DBOD and is consumed by it — else from the DGBL display size. Every
 /// DBOD is decoded per the DGBL compression method (NOCOMPRESSION and the
-/// §1.5b RUNLENGTH best-effort coding today; TVDC / HUFFMAN / DYNAMICHUFF /
-/// JPEG rejected, see [`decode_deep_dbod`]). A FORM with a single DBOD yields a
-/// one-frame movie whose frame equals [`parse_deep`]'s output.
+/// §1.5b RUNLENGTH best-effort coding here; TVDC needs the caller-supplied
+/// table — [`parse_deep_frames_with_tvdc_table`]; HUFFMAN / DYNAMICHUFF
+/// rejected and JPEG surfaced via [`extract_deep_jpeg_frames`], see
+/// [`decode_deep_dbod`]). A FORM with a single DBOD yields a one-frame movie
+/// whose frame equals [`parse_deep`]'s output.
 pub fn parse_deep_frames(bytes: &[u8]) -> Result<DeepMovie> {
+    parse_deep_frames_inner(bytes, None)
+}
+
+/// [`parse_deep_frames`] for a TVDC-compressed `FORM DEEP` (§1.5), with the
+/// 16-word signed delta table supplied by the caller.
+///
+/// The table applies to **every** DBOD in the FORM — §1.5 describes one
+/// per-stream dictionary stored with the file, and the DGBL compression
+/// method (which a DGBL fixes until another DGBL is seen) is likewise global.
+/// NOCOMPRESSION / RUNLENGTH bodies also decode through this entry point
+/// (the table is simply unused). The output of
+/// [`encode_deep_frames_with_tvdc_table`] round-trips through here
+/// pixel-exactly.
+pub fn parse_deep_frames_with_tvdc_table(bytes: &[u8], table: &[i16; 16]) -> Result<DeepMovie> {
+    parse_deep_frames_inner(bytes, Some(table))
+}
+
+fn parse_deep_frames_inner(bytes: &[u8], tvdc_table: Option<&[i16; 16]>) -> Result<DeepMovie> {
     if bytes.len() < 12 || &bytes[0..4] != b"FORM" {
         return Err(Error::invalid("DEEP: missing FORM signature"));
     }
@@ -6847,7 +6985,7 @@ pub fn parse_deep_frames(bytes: &[u8]) -> Result<DeepMovie> {
             Some(dl) => (dl.w, dl.h),
             None => (dgbl.display_width, dgbl.display_height),
         };
-        let rgba = decode_deep_dbod(dgbl.compression, &dpel, width, height, body)?;
+        let rgba = decode_deep_dbod(dgbl.compression, &dpel, width, height, body, tvdc_table)?;
         frames.push(DeepFrame {
             dloc,
             width,
@@ -7003,7 +7141,7 @@ pub fn parse_tvpp(bytes: &[u8]) -> Result<TvppImage> {
             Some(dl) => (dl.w, dl.h),
             None => (dgbl.display_width, dgbl.display_height),
         };
-        let rgba = decode_deep_dbod(dgbl.compression, &dpel, width, height, body)?;
+        let rgba = decode_deep_dbod(dgbl.compression, &dpel, width, height, body, None)?;
         layers.push(DeepFrame {
             dloc,
             width,
@@ -7074,16 +7212,278 @@ pub fn encode_deep_frames(
     Ok(wrap_form(b"DEEP", &chunks))
 }
 
+/// Encode packed RGBA8888 frames into a multi-image `FORM DEEP` whose DBODs
+/// are TVDC-compressed (§1.5), the multi-frame sibling of
+/// [`encode_deep`]-with-[`DeepCompression::Tvdc`].
+///
+/// `table` is the 16-word signed delta dictionary every DBOD line is coded
+/// against; §1.5 stores it "with the file/companion data", so the caller is
+/// responsible for transporting it to the decoding side (the FORM itself has
+/// no chunk for it — the documented gap). Emits DGBL (§1.1, Compression =
+/// 5), DPEL (§1.2), an optional DCHG (§1.6), and one DBOD per frame. Every
+/// frame must be `width × height × 4` bytes and every DPEL component 8 bits
+/// (TVDC emits one byte per component per pixel). The output round-trips
+/// pixel-exactly through [`parse_deep_frames_with_tvdc_table`] with the same
+/// table.
+pub fn encode_deep_frames_with_tvdc_table(
+    dpel: &Dpel,
+    width: u16,
+    height: u16,
+    table: &[i16; 16],
+    dchg: Option<Dchg>,
+    frames: &[&[u8]],
+) -> Result<Vec<u8>> {
+    if frames.is_empty() {
+        return Err(Error::invalid("DEEP encode: need at least one frame"));
+    }
+    let mut chunks = Vec::new();
+    let dgbl = Dgbl {
+        display_width: width,
+        display_height: height,
+        compression: DeepCompression::Tvdc,
+        x_aspect: 1,
+        y_aspect: 1,
+    };
+    push_chunk(&mut chunks, b"DGBL", &dgbl.write());
+    push_chunk(&mut chunks, b"DPEL", &dpel.write());
+    if let Some(d) = dchg {
+        push_chunk(&mut chunks, b"DCHG", &d.write());
+    }
+    for rgba in frames {
+        let body = encode_deep_tvdc_body(dpel, width, height, table, rgba)?;
+        push_chunk(&mut chunks, b"DBOD", &body);
+    }
+    Ok(wrap_form(b"DEEP", &chunks))
+}
+
+// ───────────────── FORM DEEP — JPEG (Compression = 4) DBOD surfacing ─────────────────
+//
+// §1.5b pins the JPEG body convention: the DBOD is a **complete JFIF stream**
+// (SOI marker FF D8 at byte 0 … EOI marker FF D9 at the end), demultiplexed by
+// checking SOI and handing the whole body to a stock JPEG decoder — the same
+// self-contained-JFIF convention as JPEG-in-TIFF (Compression 7) and the AVI
+// MJPG body. This crate is the container layer: it validates the SOI/EOI
+// framing and surfaces the stream whole; the entropy decode belongs to a
+// downstream JPEG decoder (per §1.5b the JPEG header is authoritative for its
+// own geometry, so the DGBL/DPEL-vs-SOF agreement check lives with whatever
+// decodes the stream — this crate cannot parse SOF without a JPEG spec).
+// Through the container registry the `iff_deep` demuxer emits the stream as
+// codec-id `"mjpeg"` packets so the standard codec-resolution path picks a
+// JPEG decoder.
+
+/// Reject a DBOD that is not a §1.5b self-contained JFIF stream: at least the
+/// two marker pairs, SOI (`FF D8`) at byte 0 and EOI (`FF D9`) at the end.
+fn check_deep_jfif(body: &[u8]) -> Result<()> {
+    if body.len() < 4 {
+        return Err(Error::invalid(
+            "DEEP JPEG: DBOD shorter than an SOI + EOI marker pair",
+        ));
+    }
+    if body[0..2] != [0xFF, 0xD8] {
+        return Err(Error::invalid(
+            "DEEP JPEG: DBOD does not start with the JFIF SOI marker FF D8 (§1.5b: the \
+             body is a complete JFIF stream)",
+        ));
+    }
+    if body[body.len() - 2..] != [0xFF, 0xD9] {
+        return Err(Error::invalid(
+            "DEEP JPEG: DBOD does not end with the JFIF EOI marker FF D9 (§1.5b: the \
+             body is a complete JFIF stream)",
+        ));
+    }
+    Ok(())
+}
+
+/// One JFIF stream extracted from a JPEG-compressed `FORM DEEP` (§1.5b).
+#[derive(Clone, Debug)]
+pub struct DeepJpegFrame {
+    /// The DLOC that preceded this frame's DBOD, if any (§1.3).
+    pub dloc: Option<Dloc>,
+    /// Container-declared frame width (DLOC if present, else DGBL display
+    /// width). §1.5b makes the JPEG SOF header authoritative for the decode
+    /// geometry; a downstream decoder should treat a disagreement as fatal.
+    pub width: u16,
+    /// Container-declared frame height (see [`DeepJpegFrame::width`]).
+    pub height: u16,
+    /// The complete JFIF stream (SOI `FF D8` … EOI `FF D9`), verbatim.
+    pub jfif: Vec<u8>,
+}
+
+/// A JPEG-compressed `FORM DEEP` broken into its JFIF streams (§1.5b), one
+/// per DBOD, plus the surrounding container state.
+#[derive(Clone, Debug)]
+pub struct DeepJpegMovie {
+    /// Parsed DGBL global header (§1.1); `compression` is always
+    /// [`DeepCompression::Jpeg`].
+    pub dgbl: Dgbl,
+    /// Parsed DPEL pixel-element layout (§1.2). Per §1.5b the common case is
+    /// 3-component RGB / 4-component RGBA, which a stock JPEG decode covers.
+    pub dpel: Dpel,
+    /// Parsed DCHG cel-anim frame timing, if the FORM carried one (§1.6).
+    pub dchg: Option<Dchg>,
+    /// One entry per DBOD, in document order.
+    pub frames: Vec<DeepJpegFrame>,
+}
+
+/// Walk a JPEG-compressed `FORM DEEP` (§1.5b) and surface every DBOD as a
+/// validated, self-contained JFIF stream for a downstream JPEG decoder.
+///
+/// The FORM must carry a DGBL naming [`DeepCompression::Jpeg`] (any other
+/// method is rejected — use [`parse_deep_frames`] /
+/// [`parse_deep_frames_with_tvdc_table`] for the pixel-decodable codings) and
+/// the mandatory DPEL. Each DBOD is checked for the §1.5b framing — SOI
+/// `FF D8` at byte 0, EOI `FF D9` at the end — and returned verbatim, bound
+/// to the DLOC that immediately precedes it (§1.3) for its container-declared
+/// dimensions. No pixel decode happens here: §1.5b hands the body to "a stock
+/// JPEG decoder" and makes the JPEG header authoritative for its own
+/// geometry, so SOF-vs-DGBL agreement is checked by whatever decodes the
+/// stream. The output of [`encode_deep_jpeg_frames`] round-trips through here
+/// byte-exactly.
+pub fn extract_deep_jpeg_frames(bytes: &[u8]) -> Result<DeepJpegMovie> {
+    if bytes.len() < 12 || &bytes[0..4] != b"FORM" {
+        return Err(Error::invalid("DEEP: missing FORM signature"));
+    }
+    if &bytes[8..12] != b"DEEP" {
+        return Err(Error::invalid(format!(
+            "DEEP: outer form type is {:?} (expected DEEP)",
+            std::str::from_utf8(&bytes[8..12]).unwrap_or("????")
+        )));
+    }
+    let total = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let body_end = (8 + total).min(bytes.len());
+
+    let mut dgbl: Option<Dgbl> = None;
+    let mut dpel: Option<Dpel> = None;
+    let mut dchg: Option<Dchg> = None;
+    let mut pending_dloc: Option<Dloc> = None;
+    let mut raw_frames: Vec<(Option<Dloc>, &[u8])> = Vec::new();
+
+    let mut cursor = 12usize;
+    while cursor + 8 <= body_end {
+        let id = [
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ];
+        let size = u32::from_be_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]) as usize;
+        let payload_start = cursor + 8;
+        let payload_end = payload_start + size;
+        if payload_end > body_end {
+            return Err(Error::invalid(format!(
+                "DEEP: chunk {:?} extends past FORM",
+                std::str::from_utf8(&id).unwrap_or("????")
+            )));
+        }
+        let payload = &bytes[payload_start..payload_end];
+        match &id {
+            b"DGBL" => dgbl = Some(Dgbl::parse(payload)?),
+            b"DPEL" => dpel = Some(Dpel::parse(payload)?),
+            b"DLOC" => pending_dloc = Some(Dloc::parse(payload)?),
+            b"DCHG" => dchg = Some(Dchg::parse(payload)?),
+            b"DBOD" => raw_frames.push((pending_dloc.take(), payload)),
+            _ => { /* unknown chunks skipped */ }
+        }
+        let padded = size + (size & 1);
+        cursor = payload_start + padded;
+    }
+
+    let dgbl = dgbl.ok_or_else(|| Error::invalid("DEEP: missing DGBL chunk"))?;
+    let dpel = dpel.ok_or_else(|| Error::invalid("DEEP: missing DPEL chunk"))?;
+    if dgbl.compression != DeepCompression::Jpeg {
+        return Err(Error::invalid(format!(
+            "DEEP JPEG: DGBL names Compression {} — extract_deep_jpeg_frames handles \
+             only Compression 4 (JPEG); use parse_deep_frames for the pixel-decodable \
+             codings",
+            dgbl.compression.to_u16()
+        )));
+    }
+    if raw_frames.is_empty() {
+        return Err(Error::invalid("DEEP: missing DBOD chunk"));
+    }
+
+    let mut frames = Vec::with_capacity(raw_frames.len());
+    for (dloc, body) in raw_frames {
+        check_deep_jfif(body)?;
+        let (width, height) = match dloc {
+            Some(dl) => (dl.w, dl.h),
+            None => (dgbl.display_width, dgbl.display_height),
+        };
+        frames.push(DeepJpegFrame {
+            dloc,
+            width,
+            height,
+            jfif: body.to_vec(),
+        });
+    }
+
+    Ok(DeepJpegMovie {
+        dgbl,
+        dpel,
+        dchg,
+        frames,
+    })
+}
+
+/// Wrap caller-supplied JFIF streams into a JPEG-compressed `FORM DEEP`
+/// (§1.5b), the inverse of [`extract_deep_jpeg_frames`].
+///
+/// Each entry of `jfif_frames` must be a complete, self-contained JFIF stream
+/// (SOI `FF D8` at byte 0, EOI `FF D9` at the end — validated here; the
+/// encoding itself comes from a JPEG encoder upstream of this call). Emits
+/// DGBL (§1.1, Compression = 4, display size `width × height`) + the
+/// caller's DPEL (§1.2 — per §1.5b it should agree with the JPEG streams'
+/// component count) + optional DCHG (§1.6) + one DBOD per stream, copied
+/// verbatim. The streams round-trip byte-exactly through
+/// [`extract_deep_jpeg_frames`].
+pub fn encode_deep_jpeg_frames(
+    dpel: &Dpel,
+    width: u16,
+    height: u16,
+    dchg: Option<Dchg>,
+    jfif_frames: &[&[u8]],
+) -> Result<Vec<u8>> {
+    if jfif_frames.is_empty() {
+        return Err(Error::invalid("DEEP encode: need at least one frame"));
+    }
+    for jfif in jfif_frames {
+        check_deep_jfif(jfif)?;
+    }
+    let mut chunks = Vec::new();
+    let dgbl = Dgbl {
+        display_width: width,
+        display_height: height,
+        compression: DeepCompression::Jpeg,
+        x_aspect: 1,
+        y_aspect: 1,
+    };
+    push_chunk(&mut chunks, b"DGBL", &dgbl.write());
+    push_chunk(&mut chunks, b"DPEL", &dpel.write());
+    if let Some(d) = dchg {
+        push_chunk(&mut chunks, b"DCHG", &d.write());
+    }
+    for jfif in jfif_frames {
+        push_chunk(&mut chunks, b"DBOD", jfif);
+    }
+    Ok(wrap_form(b"DEEP", &chunks))
+}
+
 // ───────────────── FORM DEEP — container registry wiring ─────────────────
 //
 // `iff_deep` demuxer: a `FORM DEEP` chunky deep-raster file decodes through
-// the standard `ContainerRegistry::open_*` path, surfacing **one** `rawvideo` /
-// `Rgba` keyframe per DBOD frame (§1.4) — a still DEEP is one packet, a cel-anim
-// DEEP plays every DBOD with per-frame PTS from the DCHG timing (§1.6). Only the
-// body codings `parse_deep_frames` decodes (NOCOMPRESSION + §1.5b RUNLENGTH)
-// succeed; TVDC and the other DGBL.Compression methods return the same
-// `Error::invalid` `parse_deep_frames` raises (see its doc for the §1.5
-// delta-table gap). Source: iff-truecolor-chunks.md §1.
+// the standard `ContainerRegistry::open_*` path, surfacing **one** keyframe per
+// DBOD frame (§1.4) — a still DEEP is one packet, a cel-anim DEEP plays every
+// DBOD with per-frame PTS from the DCHG timing (§1.6). NOCOMPRESSION + §1.5b
+// RUNLENGTH bodies are pixel-decoded to `rawvideo` / `Rgba` packets; a §1.5b
+// JPEG FORM is passed through as `"mjpeg"` packets (one validated JFIF stream
+// per DBOD) for a downstream JPEG decoder. TVDC (no in-FORM delta table — the
+// §1.5 gap) and HUFFMAN / DYNAMICHUFF return the same `Error::invalid`
+// `parse_deep_frames` raises. Source: iff-truecolor-chunks.md §1.
 
 fn probe_deep(p: &oxideav_core::ProbeData) -> u8 {
     if p.buf.len() >= 12 && &p.buf[0..4] == b"FORM" && &p.buf[8..12] == b"DEEP" {
@@ -7093,13 +7493,15 @@ fn probe_deep(p: &oxideav_core::ProbeData) -> u8 {
     }
 }
 
-/// `FORM DEEP` demuxer. Emits one `rawvideo` / `Rgba` keyframe per DBOD frame
-/// (§1.4): a still DEEP is a one-packet stream, a cel-anim DEEP plays every
-/// frame in document order with per-frame PTS derived from the DCHG timing
-/// (§1.6).
+/// `FORM DEEP` demuxer. Emits one keyframe per DBOD frame (§1.4): a still
+/// DEEP is a one-packet stream, a cel-anim DEEP plays every frame in document
+/// order with per-frame PTS derived from the DCHG timing (§1.6). Packets are
+/// decoded `rawvideo` / `Rgba` frames for the pixel-decodable codings, or
+/// verbatim JFIF streams under codec id `"mjpeg"` for a §1.5b JPEG FORM.
 struct DeepDemuxer {
     streams: Vec<StreamInfo>,
-    /// Decoded RGBA frames in document order, drained front-to-back.
+    /// Per-frame packet payloads in document order, drained front-to-back
+    /// (decoded RGBA, or verbatim JFIF for the JPEG passthrough path).
     frames: std::collections::VecDeque<Vec<u8>>,
     /// Next frame's presentation timestamp, in `time_base` units.
     next_pts: i64,
@@ -7157,14 +7559,8 @@ fn open_tvpp(
     let height = img.layers[0].height;
     let frame_count = img.layers.len() as i64;
 
-    let (time_base, frame_duration, duration_us) = match img.dchg.and_then(|d| d.delay_millis()) {
-        Some(ms) => {
-            let dur = i64::from(ms);
-            let total_us = dur.saturating_mul(frame_count).saturating_mul(1_000);
-            (TimeBase::new(1, 1000), dur, Some(total_us))
-        }
-        None => (TimeBase::new(1, 1), 1, None),
-    };
+    let (time_base, frame_duration, duration_us) =
+        deep_stream_timing(img.dchg.and_then(|d| d.delay_millis()), frame_count);
 
     let mut stream = true_color_stream(width, height);
     stream.time_base = time_base;
@@ -7182,27 +7578,113 @@ fn open_tvpp(
     }))
 }
 
-fn open_deep(
-    mut input: Box<dyn ReadSeek>,
-    _codecs: &dyn CodecResolver,
-) -> Result<Box<dyn Demuxer>> {
-    let full = read_true_color_form(&mut *input, "DEEP", b"DEEP")?;
-    let movie = parse_deep_frames(&full)?;
-    let width = movie.frames[0].width;
-    let height = movie.frames[0].height;
-    let frame_count = movie.frames.len() as i64;
-
-    // §1.6 DCHG FrameRate is a millisecond delay; build a 1/1000-s time base so
-    // each frame's duration is exactly the DCHG value. With no usable delay
-    // (still image, or a `0`/`-1` sentinel) fall back to the unit time base.
-    let (time_base, frame_duration, duration_us) = match movie.frame_delay_millis() {
+/// §1.6 DCHG FrameRate is a millisecond delay; build a 1/1000-s time base so
+/// each frame's duration is exactly the DCHG value. With no usable delay
+/// (still image, or a `0`/`-1` sentinel) fall back to the unit time base.
+/// Returns `(time_base, frame_duration, duration_us)`.
+fn deep_stream_timing(delay_millis: Option<u32>, frame_count: i64) -> (TimeBase, i64, Option<i64>) {
+    match delay_millis {
         Some(ms) => {
             let dur = i64::from(ms);
             let total_us = dur.saturating_mul(frame_count).saturating_mul(1_000);
             (TimeBase::new(1, 1000), dur, Some(total_us))
         }
         None => (TimeBase::new(1, 1), 1, None),
-    };
+    }
+}
+
+/// Locate the first DGBL chunk in an in-memory `FORM DEEP` and return its
+/// declared compression method, so the demuxer can pick the raw-RGBA or the
+/// JPEG-passthrough packet path before committing to a full decode. Errors
+/// (missing/short DGBL, unknown code) are left for the full parse to report.
+fn deep_form_compression(bytes: &[u8]) -> Option<DeepCompression> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    let total = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let body_end = (8 + total).min(bytes.len());
+    let mut cursor = 12usize;
+    while cursor + 8 <= body_end {
+        let id = &bytes[cursor..cursor + 4];
+        let size = u32::from_be_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]) as usize;
+        let payload_start = cursor + 8;
+        let payload_end = payload_start.checked_add(size)?;
+        if payload_end > body_end {
+            return None;
+        }
+        if id == b"DGBL" {
+            return Dgbl::parse(&bytes[payload_start..payload_end])
+                .ok()
+                .map(|d| d.compression);
+        }
+        cursor = payload_start + size + (size & 1);
+    }
+    None
+}
+
+/// Stream shape for the JPEG-in-DEEP passthrough path (§1.5b): the packets
+/// carry complete JFIF streams, so the codec id is `"mjpeg"` (the
+/// self-contained-JFIF-per-frame codec) and no raw pixel format is declared —
+/// the JPEG header is authoritative for the decoded geometry; the DGBL/DLOC
+/// dimensions are advertised as the container's declared size.
+fn deep_jpeg_stream(width: u16, height: u16) -> StreamInfo {
+    let mut params = CodecParameters::video(CodecId::new("mjpeg"));
+    params.media_type = MediaType::Video;
+    params.width = Some(u32::from(width));
+    params.height = Some(u32::from(height));
+    StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 1),
+        duration: Some(1),
+        start_time: Some(0),
+        params,
+    }
+}
+
+fn open_deep(
+    mut input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    let full = read_true_color_form(&mut *input, "DEEP", b"DEEP")?;
+
+    // §1.5b JPEG bodies are surfaced whole as `"mjpeg"` packets for a
+    // downstream JPEG decoder instead of being pixel-decoded here.
+    if deep_form_compression(&full) == Some(DeepCompression::Jpeg) {
+        let movie = extract_deep_jpeg_frames(&full)?;
+        let width = movie.frames[0].width;
+        let height = movie.frames[0].height;
+        let frame_count = movie.frames.len() as i64;
+        let delay = movie.dchg.and_then(|d| d.delay_millis());
+        let (time_base, frame_duration, duration_us) = deep_stream_timing(delay, frame_count);
+
+        let mut stream = deep_jpeg_stream(width, height);
+        stream.time_base = time_base;
+        stream.duration = Some(frame_duration.saturating_mul(frame_count));
+
+        let frames: std::collections::VecDeque<Vec<u8>> =
+            movie.frames.into_iter().map(|f| f.jfif).collect();
+
+        return Ok(Box::new(DeepDemuxer {
+            streams: vec![stream],
+            frames,
+            next_pts: 0,
+            frame_duration,
+            duration_us,
+        }));
+    }
+
+    let movie = parse_deep_frames(&full)?;
+    let width = movie.frames[0].width;
+    let height = movie.frames[0].height;
+    let frame_count = movie.frames.len() as i64;
+
+    let (time_base, frame_duration, duration_us) =
+        deep_stream_timing(movie.frame_delay_millis(), frame_count);
 
     let mut stream = true_color_stream(width, height);
     stream.time_base = time_base;
