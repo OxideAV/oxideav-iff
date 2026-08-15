@@ -332,6 +332,21 @@ Read + round-trip support for `FORM / ILBM`:
   (`format_bits`, `CAMG_FORMAT_MASK`) and the classic "bad CAMG"
   heuristic (`looks_bad_for_planes`).
 
+- **Dual-playfield** ([`CAMG_DUALPF`] / [`CAMG_PFBA`]): the flag pair is
+  fully surfaced — `is_dualpf` / `is_pfba` plus
+  [`ilbm::Camg::dual_playfield_priority`], which folds the two bits into
+  an `Option<`[`ilbm::PlayfieldPriority`]`>` (`None` outside DUALPF;
+  PFBA set = "playfield 2 has display priority over playfield 1", clear
+  = playfield 1 in front — the same distinction the `LORESDPF_KEY` /
+  `LORESDPF2_KEY` mode-key pair encodes). **Compositing a dual-playfield
+  ILBM is not implemented**: the staged references pin only the flag
+  meanings, not the display rules a compositor needs — which bitplanes
+  feed which playfield, where playfield 2's colors start in the CMAP,
+  and how the back playfield shows through the front one. Until those
+  rules are staged, a DUALPF image decodes as the flat indexed image its
+  BODY stores (all planes as one index), with the flags exposed so a
+  caller can detect the case.
+
 - Public API: [`ilbm::parse_ilbm`], [`ilbm::encode_ilbm`],
   [`ilbm::IlbmImage`], [`ilbm::Bmhd`], [`ilbm::Camg`],
   [`ilbm::Grab`], [`ilbm::Dest`] /
@@ -868,23 +883,40 @@ unpacked as a single ByteRun1 stream to `width × height × pixel_bytes`
 and then assembled exactly as a NOCOMPRESSION body. §1.5b leaves the
 per-line-vs-whole-DBOD framing to a fixture probe; this decoder uses
 whole-DBOD framing and rejects a length mismatch (the §1.5b
-"fall back … ask for a fixture" signal). HUFFMAN / DYNAMICHUFF / JPEG
-DEEP bodies are **not** yet decoded — the canonical DEEP text does not
-spell out their wire layout. Truncated TVDC sources, run overshoot,
+"fall back … ask for a fixture" signal). A **JPEG** DBOD
+(`Compression == 4`, §1.5b) is a complete self-contained JFIF stream
+(SOI `FF D8` at byte 0 … EOI `FF D9` at the end — the same convention
+as JPEG-in-TIFF and per-frame JFIF video bodies); this crate validates
+that framing and surfaces the stream whole (see below) rather than
+pixel-decoding it — the entropy decode belongs to a downstream JPEG
+decoder, which per §1.5b is also authoritative for the SOF-vs-DGBL
+geometry agreement. **HUFFMAN** (`2`) and **DYNAMICHUFF** (`3`) bodies
+are rejected with diagnostics naming the coding, per the §1.5b posture
+— no public source documents their tree representation or scan
+direction, so a fixture is needed before they can be decoded.
+Truncated TVDC sources, run overshoot,
 undersized DGBL/DPEL/DLOC chunks, unknown compression/cType codes, and
-short chunky bodies are each rejected with `Error::invalid`.
+short chunky bodies are each rejected with `Error::invalid`, and the
+RUNLENGTH / TVDC expanders bound their output allocation by the
+coding's maximum expansion ratio (64× / 15×) so a forged
+`65535 × 65535` header cannot demand an attacker-sized buffer.
 [`ilbm::parse_deep`] now wires these pieces into a top-level `FORM DEEP`
 walker: it locates DGBL (mandatory §1.1 global header), DPEL (mandatory
 §1.2 pixel layout), the optional DLOC placement, and the first DBOD, takes
 the DBOD dimensions from the DLOC if present else the DGBL display size
 (§1.3), and assembles a packed top-to-bottom RGBA8888 [`ilbm::DeepImage`].
-NOCOMPRESSION and RUNLENGTH (§1.5b ByteRun1) bodies decode in full; TVDC
-and the remaining codings are rejected here (see the TVDC table gap below). For TVDC,
-[`ilbm::assemble_deep_tvdc`] decodes a per-component-line body (§1.5: one
-TVDC line per DPEL component per row — a Red line, then a Green line, …)
-when the caller supplies the 16-word delta table, mapping RED/GREEN/BLUE →
-guns and ALPHA/OPACITY → alpha; a sub-8-bit DPEL component is rejected
-(TVDC emits one byte per pixel and §1.5 pins no byte→sub-8-bit mapping).
+NOCOMPRESSION and RUNLENGTH (§1.5b ByteRun1) bodies decode in full. A
+**TVDC FORM decodes end-to-end when the caller supplies the table**:
+[`ilbm::parse_deep_with_tvdc_table`] (and the frames variant below) walks
+the FORM exactly as `parse_deep` does and hands each DBOD to
+[`ilbm::assemble_deep_tvdc`], which decodes the per-component-line body
+(§1.5: one TVDC line per DPEL component per row — a Red line, then a
+Green line, …) against the caller's 16-word delta table, mapping
+RED/GREEN/BLUE → guns and ALPHA/OPACITY → alpha; a sub-8-bit DPEL
+component is rejected (TVDC emits one byte per pixel and §1.5 pins no
+byte→sub-8-bit mapping). The table-less `parse_deep` keeps reporting the
+documented gap for a TVDC FORM (§1.5 stores the table "with the
+file/companion data" and names no in-FORM chunk for it).
 DEEP **encode** completes the round-trip too: [`ilbm::encode_deep_chunky`]
 packs RGBA8888 into the raw chunky DBOD (inverse of `assemble_deep_chunky`),
 [`ilbm::encode_tvdc`] encodes one component line to a TVDC nibble stream
@@ -894,8 +926,18 @@ builds a full `FORM DEEP` (DGBL + DPEL + DBOD) for `None` (chunky) or
 `Tvdc` (per-component lines, table supplied out of band). Every DPEL
 component must be 8 bits for a lossless round-trip; [`ilbm::Dpel::write`]
 and [`ilbm::Dloc::write`] serialise their chunks. NOCOMPRESSION output
-round-trips through `parse_deep`, TVDC output through `assemble_deep_tvdc`
-with the matching table.
+round-trips through `parse_deep`; TVDC output round-trips through
+`parse_deep_with_tvdc_table` with the matching table, and
+[`ilbm::encode_deep_frames_with_tvdc_table`] emits the multi-frame
+TVDC FORM (DGBL + DPEL + optional DCHG + one DBOD per frame) that
+round-trips pixel-exactly through `parse_deep_frames_with_tvdc_table`.
+For JPEG, [`ilbm::extract_deep_jpeg_frames`] walks a `Compression == 4`
+FORM into an [`ilbm::DeepJpegMovie`] — every DBOD validated for the
+§1.5b SOI/EOI framing and surfaced verbatim as an
+[`ilbm::DeepJpegFrame`] (with its §1.3 DLOC-bound container dimensions)
+— and [`ilbm::encode_deep_jpeg_frames`] is the byte-exact inverse,
+wrapping caller-supplied JFIF streams into DGBL + DPEL + optional DCHG
++ one DBOD each.
 All three true-colour FORMs are now **wired into the container
 registry**: [`ilbm::register`] installs the `iff_rgb8` / `iff_rgbn` /
 `iff_deep` demuxers (each with a `FORM`-signature probe and a matching
@@ -908,9 +950,14 @@ keyframe and are EOF after one packet, and apply
 load-as-a-picture default); callers needing the Turbo-Silver
 zero-colour or brush-transparency genlock semantics use [`ilbm::parse_rgb8`]
 / [`ilbm::parse_rgbn`] directly. The DEEP demuxer decodes the
-NOCOMPRESSION and RUNLENGTH (§1.5b ByteRun1) body codings and surfaces the
-same `parse_deep` error for TVDC (no in-FORM delta table) and the other
-unsupported codings.
+NOCOMPRESSION and RUNLENGTH (§1.5b ByteRun1) body codings to `rawvideo` /
+`Rgba` keyframes, and **passes a §1.5b JPEG FORM through as codec-id
+`"mjpeg"` packets** — one validated JFIF stream per DBOD, DCHG timing
+honoured, no pixel format declared (the JPEG header is authoritative for
+the decoded geometry) — so the standard codec-resolution path hands the
+frames to a JPEG decoder. TVDC surfaces the same `parse_deep` error (no
+in-FORM delta table — the container API carries no side-band for one), as
+do the undocumented HUFFMAN / DYNAMICHUFF codings.
 
 A FORM DEEP may carry **several DBOD frames** — successive cels of a cel
 animation (§1.4 "several images are stored in one FORM") — with an optional
@@ -936,12 +983,19 @@ advertises a `1/1000`-second time base, per-frame PTS/duration, and a
 the unit time base. A single-DBOD FORM yields a one-frame movie whose frame
 equals [`ilbm::parse_deep`]'s output.
 
-Remaining true-colour frontier: TVDC decode **from a FORM** is blocked —
-§1.5 says the 16-word delta table is "stored with the file/companion
-data" but the canonical DEEP text names no in-FORM chunk that carries it
-(documented gap; `assemble_deep_tvdc` is the caller-supplies-table escape
-hatch). Also pending: DEEP's HUFFMAN/DYNAMICHUFF/JPEG body codings (wire
-layout undocumented). RUNLENGTH is decoded best-effort per §1.5b
+Remaining true-colour frontier: the TVDC **table-transport** gap — §1.5
+says the 16-word delta table is "stored with the file/companion data"
+but the canonical DEEP text names no in-FORM chunk that carries it, so
+fully-automatic TVDC decode (no caller-supplied table) stays blocked;
+`parse_deep_with_tvdc_table` / `parse_deep_frames_with_tvdc_table` /
+`encode_deep_frames_with_tvdc_table` are the complete
+caller-supplies-table path. DEEP's HUFFMAN / DYNAMICHUFF body codings
+remain undocumented (no public tree representation / scan direction —
+rejected with named diagnostics pending a fixture). JPEG bodies are
+surfaced whole per §1.5b (`extract_deep_jpeg_frames` +
+`encode_deep_jpeg_frames` + the demuxer's `"mjpeg"` passthrough); the
+pixel decode and the SOF-vs-DGBL geometry check belong to the
+downstream JPEG decoder. RUNLENGTH is decoded best-effort per §1.5b
 (whole-DBOD ByteRun1; a real per-line-framed fixture would let us pin the
 remaining framing ambiguity).
 
@@ -968,7 +1022,7 @@ than decoded here.
 ## Fuzzing
 
 A [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harness
-lives in [`fuzz/`](fuzz/) with three libFuzzer targets covering the
+lives in [`fuzz/`](fuzz/) with four libFuzzer targets covering the
 highest-risk parser surface of the crate:
 
 * `aiff_decode` — feeds arbitrary bytes to
@@ -995,6 +1049,16 @@ highest-risk parser surface of the crate:
   an optional ByteRun1 / SmallLineChanges compression mode, a
   per-line change mask, and small-or-big change-record variants
   that drive cumulative-state palette reconstruction.
+* `deep_decode` — feeds arbitrary bytes to the three `FORM DEEP`
+  whole-FORM walkers: `ilbm::parse_deep_frames` (NOCOMPRESSION +
+  §1.5b RUNLENGTH), `ilbm::parse_deep_frames_with_tvdc_table` (the
+  §1.5 TVDC nibble decoder against a fixed 16-word table), and
+  `ilbm::extract_deep_jpeg_frames` (the §1.5b JPEG surfacing walk
+  with its SOI/EOI framing check). Covers the DEEP chunk-size/pad
+  arithmetic, the DGBL/DPEL/DLOC struct parsers, and the per-coding
+  expansion bounds (ByteRun1 64×, TVDC 15×) that keep a forged
+  geometry from demanding an attacker-sized allocation. A bounded
+  local ASan campaign at introduction ran ~29.7M execs clean.
 
 The contract under test for every target is purely that the call
 *returns*: a malformed input yields `Err(oxideav_core::Error::…)`,
@@ -1009,7 +1073,7 @@ To run a target:
 cargo install cargo-fuzz
 cd crates/oxideav-iff
 cargo +nightly fuzz run aiff_decode
-# or anim_decode / pchg_parse
+# or anim_decode / pchg_parse / deep_decode
 ```
 
 The harness builds under nightly Rust (libFuzzer needs nightly's

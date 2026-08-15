@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(ilbm)* **TVDC `FORM DEEP` decode/encode end-to-end with a
+  caller-supplied table.** `parse_deep_with_tvdc_table` /
+  `parse_deep_frames_with_tvdc_table` walk a complete `FORM DEEP` whose
+  DGBL names TVDC compression (§1.5) and decode every DBOD against the
+  caller's 16-word signed delta table — closing the loop the spec gap
+  leaves open (§1.5 stores the table "with the file/companion data" and
+  names no in-FORM chunk for it, so the table-less walkers keep
+  reporting that gap). `encode_deep_frames_with_tvdc_table` is the
+  multi-frame inverse (DGBL + DPEL + optional DCHG + one TVDC DBOD per
+  frame); encode → decode round-trips pixel-exactly. NOCOMPRESSION /
+  RUNLENGTH bodies also decode through the table-supplied entry points,
+  so callers holding a table need not pre-inspect DGBL.
+- *(ilbm)* **JPEG-in-DEEP (`Compression == 4`) DBOD surfacing per
+  §1.5b.** The staged convention pins the DBOD as a complete
+  self-contained JFIF stream (SOI `FF D8` at byte 0 … EOI `FF D9` at
+  the end); `extract_deep_jpeg_frames` walks the FORM, validates that
+  framing per DBOD, and surfaces each stream verbatim as a
+  `DeepJpegFrame` (DLOC-bound container dimensions, DCHG timing, DGBL /
+  DPEL context in `DeepJpegMovie`); `encode_deep_jpeg_frames` is the
+  byte-exact inverse. The `iff_deep` demuxer now recognises a JPEG FORM
+  and passes it through as codec-id `"mjpeg"` packets — one JFIF stream
+  per DBOD with the DCHG-derived PTS/durations and no declared pixel
+  format — so the standard codec-resolution path hands the frames to a
+  JPEG decoder. No pixel decode happens in this crate: per §1.5b the
+  JPEG header is authoritative for its own geometry, so the SOF-vs-DGBL
+  agreement check belongs to the downstream decoder. `parse_deep` /
+  `parse_deep_frames` on a JPEG FORM now error with a pointer to the
+  surfacing path.
+- *(ilbm)* **HUFFMAN / DYNAMICHUFF DEEP bodies are rejected with named
+  diagnostics** per the §1.5b posture — no public source documents the
+  tree representation, code-table location, or scan direction for
+  either coding, so the error names the coding and asks for a fixture
+  for behavioural-trace analysis instead of a bare "not decoded".
+- *(ilbm)* **`Camg::dual_playfield_priority`** + `PlayfieldPriority`
+  fold the CAMG dual-playfield pair into a typed answer: `None` when
+  `DUALPF` is clear, else which playfield is in front per the `PFBA`
+  bit ("playfield 2 has display priority over playfield 1") — the same
+  distinction the `LORESDPF_KEY` / `LORESDPF2_KEY` mode-key pair
+  encodes. Dual-playfield *compositing* remains unimplemented: the
+  staged references pin only the flag meanings, not the
+  plane-to-playfield assignment, playfield-2 CMAP base, or
+  show-through rule a compositor needs (documented gap).
+- *(fuzz)* new `deep_decode` libFuzzer target feeding the three
+  `FORM DEEP` whole-FORM walkers (`parse_deep_frames`, the TVDC
+  table-supplied variant, `extract_deep_jpeg_frames`); ~29.7M-exec
+  bounded ASan campaign at introduction, zero findings.
+
 ### Changed
 
 - Marked clearly-internal plumbing `#[doc(hidden)]` so API-diff tooling
@@ -19,6 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(ilbm)* **DEEP allocation-order hardening.** The RUNLENGTH expander
+  reserved the full `width × height × pixel_bytes` output buffer before
+  relating it to the body size, and the TVDC assembler allocated the
+  RGBA canvas before decoding — so a forged `65535 × 65535` DGBL over a
+  tiny DBOD could demand a multi-gigabyte allocation. Both now bound the
+  requested output by the coding's maximum expansion ratio (ByteRun1
+  64×, TVDC 15× — a source byte can at most code 128 replicate bytes /
+  15 run emissions) and reject impossible geometries before allocating.
+  The true-colour demuxer FORM reader likewise clamps the declared FORM
+  size against the bytes the stream can actually supply before
+  reserving its buffer.
 - *(ilbm)* **`PCHG` wire layout is now spec-conformant.** The previous
   parser/encoder pair omitted the LineMask bitmap entirely and used
   incorrect change-record shapes. Per the PCHG spec staged in
