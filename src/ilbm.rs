@@ -77,15 +77,19 @@ pub fn register(reg: &mut ContainerRegistry) {
     // ILBM-like outer container but carry a Turbo-Silver genlock-RLE BODY
     // (`BMHD.compression == 4`). See `iff-truecolor-chunks.md` §3.
     reg.register_demuxer("iff_rgb8", open_rgb8);
+    reg.register_muxer("iff_rgb8", open_rgb8_muxer);
     reg.register_extension("rgb8", "iff_rgb8");
     reg.register_probe("iff_rgb8", probe_rgb8);
     reg.register_demuxer("iff_rgbn", open_rgbn);
+    reg.register_muxer("iff_rgbn", open_rgbn_muxer);
     reg.register_extension("rgbn", "iff_rgbn");
     reg.register_probe("iff_rgbn", probe_rgbn);
 
-    // Amiga Centre Scotland / TVPaint chunky deep-raster FORM (decode-only).
-    // NOCOMPRESSION bodies decode; other DGBL.Compression codings error.
+    // Amiga Centre Scotland / TVPaint chunky deep-raster FORM. Decode covers
+    // NOCOMPRESSION / RUNLENGTH pixel frames plus the §1.5b JPEG passthrough;
+    // the muxer emits NOCOMPRESSION / RUNLENGTH multi-frame FORMs.
     reg.register_demuxer("iff_deep", open_deep);
+    reg.register_muxer("iff_deep", open_deep_muxer);
     reg.register_extension("deep", "iff_deep");
     reg.register_probe("iff_deep", probe_deep);
 
@@ -7471,6 +7475,311 @@ pub fn encode_deep_jpeg_frames(
         push_chunk(&mut chunks, b"DBOD", jfif);
     }
     Ok(wrap_form(b"DEEP", &chunks))
+}
+
+// ───────────────── true-colour FORMs — container-level muxers ─────────────────
+//
+// Muxer parity for the three true-colour FORMs whose function-level encoders
+// already existed: `iff_deep` (multi-frame `FORM DEEP`, NOCOMPRESSION /
+// RUNLENGTH with an auto picker, DCHG timing from the packet durations),
+// and `iff_rgb8` / `iff_rgbn` (single-frame Turbo-Silver genlock-RLE FORMs).
+// All accept a single `rawvideo` / `Rgba` video stream, mirroring the
+// `IlbmMuxer` contract, and assemble the FORM at `write_trailer` time.
+
+/// Body-compression choice for [`DeepMuxer`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeepMuxerCompression {
+    /// Try both NOCOMPRESSION and RUNLENGTH across all frames and emit
+    /// whichever FORM is smaller (the DGBL compression method is global to
+    /// the FORM, so the choice is made over the total body size).
+    #[default]
+    Auto,
+    /// Raw chunky DBOD bodies (`DGBL.Compression = 0`).
+    None,
+    /// §1.5b whole-DBOD ByteRun1 bodies (`DGBL.Compression = 1`).
+    RunLength,
+}
+
+/// Container-level `FORM DEEP` muxer (`iff_deep`). Accepts a single
+/// `rawvideo` / `Rgba` video stream and one packet per DBOD frame (§1.4 —
+/// several images in one FORM are successive cels).
+///
+/// * **DPEL** is derived from the pixels at `write_trailer`: RGB 8:8:8 when
+///   every frame is fully opaque, RGBA 8:8:8:8 otherwise (§1.2 — the plain
+///   24-bit layout is DEEP's equivalent of "RGB8").
+/// * **Compression** follows [`DeepMuxerCompression`] (default `Auto`).
+/// * **DCHG** (§1.6): with more than one frame, the first packet's
+///   `duration` is converted through the stream `time_base` to the
+///   millisecond FrameRate; packets without a duration produce no DCHG.
+///
+/// The emitted FORM round-trips through [`parse_deep_frames`] and the
+/// `iff_deep` demuxer pixel-exactly.
+pub struct DeepMuxer {
+    output: Box<dyn WriteSeek>,
+    width: u16,
+    height: u16,
+    time_base: TimeBase,
+    compression: DeepMuxerCompression,
+    frames: Vec<Vec<u8>>,
+    first_duration: Option<i64>,
+    written: bool,
+}
+
+impl DeepMuxer {
+    pub fn new(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Self> {
+        let (width, height, time_base) = true_color_muxer_stream_shape("DEEP", streams)?;
+        Ok(Self {
+            output,
+            width,
+            height,
+            time_base,
+            compression: DeepMuxerCompression::default(),
+            frames: Vec::new(),
+            first_duration: None,
+            written: false,
+        })
+    }
+
+    /// Choose the DBOD body coding (default: [`DeepMuxerCompression::Auto`]).
+    pub fn with_compression(mut self, c: DeepMuxerCompression) -> Self {
+        self.compression = c;
+        self
+    }
+}
+
+/// Shared stream-shape validation for the true-colour muxers: exactly one
+/// `rawvideo`-style video stream, `PixelFormat::Rgba`, with dimensions that
+/// fit the 16-bit fields every IFF raster header uses.
+fn true_color_muxer_stream_shape(
+    label: &str,
+    streams: &[StreamInfo],
+) -> Result<(u16, u16, TimeBase)> {
+    if streams.len() != 1 {
+        return Err(Error::unsupported(format!(
+            "{label} muxer supports exactly one video stream"
+        )));
+    }
+    let s = &streams[0];
+    if s.params.media_type != MediaType::Video {
+        return Err(Error::invalid(format!("{label} stream must be video")));
+    }
+    if s.params.pixel_format != Some(PixelFormat::Rgba) {
+        return Err(Error::unsupported(format!(
+            "{label} muxer requires PixelFormat::Rgba"
+        )));
+    }
+    let width = s
+        .params
+        .width
+        .ok_or_else(|| Error::invalid(format!("{label} muxer: missing width")))?;
+    let height = s
+        .params
+        .height
+        .ok_or_else(|| Error::invalid(format!("{label} muxer: missing height")))?;
+    let width = u16::try_from(width)
+        .map_err(|_| Error::invalid(format!("{label} muxer: width {width} exceeds 65535")))?;
+    let height = u16::try_from(height)
+        .map_err(|_| Error::invalid(format!("{label} muxer: height {height} exceeds 65535")))?;
+    Ok((width, height, s.time_base))
+}
+
+impl Muxer for DeepMuxer {
+    fn format_name(&self) -> &str {
+        "iff_deep"
+    }
+    fn write_header(&mut self) -> Result<()> {
+        Ok(()) // the FORM is assembled at write_trailer time
+    }
+    fn write_packet(&mut self, packet: &Packet) -> Result<()> {
+        let expected = usize::from(self.width) * usize::from(self.height) * 4;
+        if packet.data.len() != expected {
+            return Err(Error::invalid(format!(
+                "DEEP muxer: packet size {} does not match width*height*4 = {expected}",
+                packet.data.len()
+            )));
+        }
+        if self.frames.is_empty() {
+            self.first_duration = packet.duration;
+        }
+        self.frames.push(packet.data.clone());
+        Ok(())
+    }
+    fn write_trailer(&mut self) -> Result<()> {
+        if self.written {
+            return Ok(());
+        }
+        if self.frames.is_empty() {
+            return Err(Error::invalid("DEEP muxer: no frames written"));
+        }
+
+        // §1.2: emit the minimal layout — plain 24-bit RGB when every pixel
+        // is fully opaque, RGBA 8:8:8:8 when any frame carries alpha.
+        let opaque = self
+            .frames
+            .iter()
+            .all(|f| f.chunks_exact(4).all(|px| px[3] == 0xFF));
+        let mut elements = vec![
+            DpelElement {
+                c_type: DeepCType::Red,
+                c_bit_depth: 8,
+            },
+            DpelElement {
+                c_type: DeepCType::Green,
+                c_bit_depth: 8,
+            },
+            DpelElement {
+                c_type: DeepCType::Blue,
+                c_bit_depth: 8,
+            },
+        ];
+        if !opaque {
+            elements.push(DpelElement {
+                c_type: DeepCType::Alpha,
+                c_bit_depth: 8,
+            });
+        }
+        let dpel = Dpel { elements };
+
+        // §1.6: DCHG only means something for a multi-frame FORM; derive the
+        // millisecond FrameRate from the first packet's duration.
+        let dchg = if self.frames.len() > 1 {
+            self.first_duration.and_then(|dur| {
+                let num = self.time_base.num().max(0);
+                let den = self.time_base.den().max(1);
+                let millis = dur.saturating_mul(1000).saturating_mul(num) / den;
+                i32::try_from(millis)
+                    .ok()
+                    .filter(|&ms| ms > 0)
+                    .map(|ms| Dchg { frame_rate: ms })
+            })
+        } else {
+            None
+        };
+
+        let frame_refs: Vec<&[u8]> = self.frames.iter().map(|f| f.as_slice()).collect();
+        let encode = |compression: DeepCompression| {
+            encode_deep_frames(
+                &dpel,
+                self.width,
+                self.height,
+                compression,
+                dchg,
+                &frame_refs,
+            )
+        };
+        let form = match self.compression {
+            DeepMuxerCompression::None => encode(DeepCompression::None)?,
+            DeepMuxerCompression::RunLength => encode(DeepCompression::RunLength)?,
+            DeepMuxerCompression::Auto => {
+                let raw = encode(DeepCompression::None)?;
+                let rle = encode(DeepCompression::RunLength)?;
+                if rle.len() < raw.len() {
+                    rle
+                } else {
+                    raw
+                }
+            }
+        };
+        self.output.write_all(&form)?;
+        self.output.flush()?;
+        self.written = true;
+        Ok(())
+    }
+}
+
+/// Container-level single-frame muxer for the Turbo-Silver `FORM RGB8` /
+/// `FORM RGBN` genlock-RLE FORMs (`iff_rgb8` / `iff_rgbn`). Accepts one
+/// `rawvideo` / `Rgba` packet and assembles the FORM via [`encode_rgb8`] /
+/// [`encode_rgbn`] at `write_trailer` — alpha 0 drives the §3.3 genlock bit
+/// (brush-transparency semantics), and RGBN quantises each gun to its top
+/// nibble (§3.1, 4 bits per gun).
+pub struct RgbTrueColorMuxer {
+    format_name: &'static str,
+    is_rgb8: bool,
+    output: Box<dyn WriteSeek>,
+    width: u16,
+    height: u16,
+    pending: Vec<u8>,
+    written: bool,
+}
+
+impl RgbTrueColorMuxer {
+    fn new(
+        format_name: &'static str,
+        is_rgb8: bool,
+        output: Box<dyn WriteSeek>,
+        streams: &[StreamInfo],
+    ) -> Result<Self> {
+        let label = if is_rgb8 { "RGB8" } else { "RGBN" };
+        let (width, height, _tb) = true_color_muxer_stream_shape(label, streams)?;
+        Ok(Self {
+            format_name,
+            is_rgb8,
+            output,
+            width,
+            height,
+            pending: Vec::new(),
+            written: false,
+        })
+    }
+}
+
+impl Muxer for RgbTrueColorMuxer {
+    fn format_name(&self) -> &str {
+        self.format_name
+    }
+    fn write_header(&mut self) -> Result<()> {
+        Ok(()) // the FORM is assembled at write_trailer time
+    }
+    fn write_packet(&mut self, packet: &Packet) -> Result<()> {
+        if !self.pending.is_empty() {
+            return Err(Error::unsupported(
+                "RGB8/RGBN muxer: the FORM stores one image (single packet)",
+            ));
+        }
+        let expected = usize::from(self.width) * usize::from(self.height) * 4;
+        if packet.data.len() != expected {
+            return Err(Error::invalid(format!(
+                "RGB8/RGBN muxer: packet size {} does not match width*height*4 = {expected}",
+                packet.data.len()
+            )));
+        }
+        self.pending.extend_from_slice(&packet.data);
+        Ok(())
+    }
+    fn write_trailer(&mut self) -> Result<()> {
+        if self.written {
+            return Ok(());
+        }
+        if self.pending.is_empty() {
+            return Err(Error::invalid("RGB8/RGBN muxer: no frame written"));
+        }
+        let form = if self.is_rgb8 {
+            encode_rgb8(self.width, self.height, &self.pending)?
+        } else {
+            encode_rgbn(self.width, self.height, &self.pending)?
+        };
+        self.output.write_all(&form)?;
+        self.output.flush()?;
+        self.written = true;
+        Ok(())
+    }
+}
+
+fn open_deep_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
+    Ok(Box::new(DeepMuxer::new(output, streams)?))
+}
+
+fn open_rgb8_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
+    Ok(Box::new(RgbTrueColorMuxer::new(
+        "iff_rgb8", true, output, streams,
+    )?))
+}
+
+fn open_rgbn_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
+    Ok(Box::new(RgbTrueColorMuxer::new(
+        "iff_rgbn", false, output, streams,
+    )?))
 }
 
 // ───────────────── FORM DEEP — container registry wiring ─────────────────

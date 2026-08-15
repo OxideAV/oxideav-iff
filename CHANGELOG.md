@@ -51,6 +51,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   staged references pin only the flag meanings, not the
   plane-to-playfield assignment, playfield-2 CMAP base, or
   show-through rule a compositor needs (documented gap).
+- *(ilbm)* **container-level muxers for the true-colour FORMs** —
+  muxer parity for `iff_deep` / `iff_rgb8` / `iff_rgbn`, whose
+  function-level encoders already existed. `DeepMuxer` accepts a
+  `rawvideo` / `Rgba` stream with one packet per DBOD cel: the DPEL
+  is derived from the pixels (RGB 8:8:8 when every frame is fully
+  opaque, RGBA 8:8:8:8 otherwise), `DeepMuxerCompression` selects the
+  body coding (default `Auto` — emits whichever of NOCOMPRESSION /
+  RUNLENGTH produces the smaller FORM), and a multi-frame FORM
+  derives its §1.6 DCHG millisecond FrameRate from the first packet's
+  `duration` through the stream time base — so demux → mux → demux
+  preserves cel timing pixel-exactly. The single-frame `iff_rgb8` /
+  `iff_rgbn` muxers wrap one packet via `encode_rgb8` /
+  `encode_rgbn`. Dimension bounds (16-bit raster headers), packet
+  size, pixel format, and single-frame limits are all validated.
 - *(fuzz)* new `deep_decode` libFuzzer target feeding the three
   `FORM DEEP` whole-FORM walkers (`parse_deep_frames`, the TVDC
   table-supplied variant, `extract_deep_jpeg_frames`); ~29.7M-exec

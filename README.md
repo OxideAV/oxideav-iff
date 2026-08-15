@@ -949,7 +949,18 @@ keyframe and are EOF after one packet, and apply
 [`GenlockPolicy::default`] ("ignore — use the coded RGB", the §3.3
 load-as-a-picture default); callers needing the Turbo-Silver
 zero-colour or brush-transparency genlock semantics use [`ilbm::parse_rgb8`]
-/ [`ilbm::parse_rgbn`] directly. The DEEP demuxer decodes the
+/ [`ilbm::parse_rgbn`] directly. All three ids also register
+**container-level muxers**: [`ilbm::DeepMuxer`] (`iff_deep`) accepts a
+`rawvideo` / `Rgba` stream with one packet per DBOD cel — the DPEL is
+derived from the pixels (RGB 8:8:8 when every frame is opaque, RGBA
+8:8:8:8 otherwise), [`ilbm::DeepMuxerCompression`] picks the body coding
+(default `Auto` — NOCOMPRESSION vs RUNLENGTH, whichever FORM is
+smaller), and a multi-frame FORM derives its §1.6 DCHG millisecond
+FrameRate from the first packet's `duration` through the stream time
+base, so a demux → mux → demux chain preserves the cel timing; the
+single-frame `iff_rgb8` / `iff_rgbn` muxers wrap one packet via
+[`ilbm::encode_rgb8`] / [`ilbm::encode_rgbn`] (alpha 0 drives the §3.3
+genlock bit, RGBN quantises each gun to its top nibble). The DEEP demuxer decodes the
 NOCOMPRESSION and RUNLENGTH (§1.5b ByteRun1) body codings to `rawvideo` /
 `Rgba` keyframes, and **passes a §1.5b JPEG FORM through as codec-id
 `"mjpeg"` packets** — one validated JFIF stream per DBOD, DCHG timing
