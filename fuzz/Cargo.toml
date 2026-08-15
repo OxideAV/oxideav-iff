@@ -7,7 +7,7 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
-# Three libFuzzer targets cover the highest-risk parser surface of
+# Four libFuzzer targets cover the highest-risk parser surface of
 # the crate:
 #
 #  * `aiff_decode` — feeds arbitrary bytes to `AiffDemuxer::from_bytes`,
@@ -32,6 +32,14 @@ cargo-fuzz = true
 #                    per-line mask/change run-length tables — the most
 #                    failure-mode-dense single chunk class the crate
 #                    parses.
+#  * `deep_decode` — feeds arbitrary bytes to the three `FORM DEEP`
+#                    whole-FORM walkers (`parse_deep_frames`, the
+#                    TVDC caller-supplied-table variant, and the
+#                    §1.5b JPEG surfacing walk). Covers the DEEP
+#                    chunk walk, the DGBL/DPEL/DLOC struct parsers,
+#                    the NOCOMPRESSION / RUNLENGTH / TVDC body
+#                    expansions with their allocation bounds, and
+#                    the JFIF SOI/EOI framing check.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -61,5 +69,11 @@ doc = false
 [[bin]]
 name = "pchg_parse"
 path = "fuzz_targets/pchg_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "deep_decode"
+path = "fuzz_targets/deep_decode.rs"
 test = false
 doc = false
