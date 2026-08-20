@@ -19,6 +19,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ctOctave` doubling series), `has_loop`, `volume_f32` (16.16 fixed,
   `UNITY_VOLUME = 0x10000`), `hi_cycle_frequency_hz`
   (samplesPerSec / samplesPerHiCycle), and `compression`.
+- *(svx)* **complete typed 8SVX voice-structure chunk surface** —
+  every optional chunk the staged reference documents is now parsed
+  and written: `CHAN` (`ChannelAssignment` — mono-left `2` /
+  mono-right `4` / stereo `6`), `PAN ` (`Pan` — signed `sposition`,
+  `0` right … `0x8000` center … `0x1_0000` left, with clamped
+  `left_weight` / `right_weight` gains), `ATAK` / `RLSE` volume
+  envelopes (`Envelope` of 6-byte `EgPoint`s — `u16` duration in ms +
+  `i32` 16.16 destination volume; multiple chunks of each are
+  preserved in document order per the "full ADSR" convention, and
+  `level_at_ms` evaluates the piecewise-linear ramp), `SEQN` waveform
+  sequencing (`Seqn` / `SeqnSegment` with `validate` enforcing the
+  documented 32-bit offset alignment, ordering, and
+  waveform bounds, plus `vhdr_convention_holds` for the
+  "`oneShotHiSamples` should be 0" rule), and `FADE` (`Fade`, read as
+  a segment index with `is_valid_for`).
+- *(svx)* **`parse_voice` / `encode_voice` structural surface.** The
+  new typed `Voice` carries the header, every voice-structure chunk,
+  the text metadata, and the decoded waveform split per channel and
+  per octave (`ChannelSamples`, highest octave first, doubling
+  lengths). `parse_voice` is strict about structure (missing
+  VHDR/BODY, duplicate single-instance chunks, chunk overruns, BODY
+  shorter than the announced octave series each reject);
+  `encode_voice` is the shape-validated inverse (canonical chunk
+  order, per-channel Fibonacci encoding, stereo as concatenated
+  halves). Raw voices round-trip losslessly, Fibonacci within the
+  codec's ±2 LSB tolerance.
 - *(svx)* the demuxer surfaces `("octaves", n)` metadata for a
   multi-octave voice and `("channel_assignment", "left"/"right")` for a
   mono voice a `CHAN` chunk routes to one speaker (`2` = left, `4` =

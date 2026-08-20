@@ -3,9 +3,24 @@
 //! Layout: `FORM` group chunk → 4-byte `8SVX` form type → children:
 //! - `VHDR` (20 bytes): voice header (one-shot/repeat sample counts,
 //!   samples per high-cycle, samples per second, octave count, compression
-//!   code, 16.16 volume).
-//! - optional `NAME`, `ANNO`, `AUTH`, `(c) `, `CHAN`, `ATAK`, `RLSE`.
-//! - `BODY`: raw signed 8-bit samples (or Fibonacci-delta compressed).
+//!   code, 16.16 volume) — typed as [`VoiceHeader`].
+//! - optional `CHAN` (mono left/right routing or stereo —
+//!   [`ChannelAssignment`]), `PAN` (mono stereo-position — [`Pan`]),
+//!   `ATAK` / `RLSE` volume envelopes ([`Envelope`] of [`EgPoint`]s;
+//!   multiple chunks of each build a full ADSR), `SEQN` waveform
+//!   segment sequencing ([`Seqn`]), `FADE` fade-out trigger ([`Fade`]),
+//!   and the `NAME` / `ANNO` / `AUTH` / `(c) ` / `CHRS` text chunks.
+//! - `BODY`: raw signed 8-bit samples (or Fibonacci-delta compressed),
+//!   `ctOctave` waveforms back to back (highest octave first, each
+//!   following octave twice as long as the previous one).
+//!
+//! Two read/write surfaces exist: the streaming container pair
+//! (demuxer + [`SvxMuxer`]) exposes the voice as a `pcm_s8` audio
+//! stream, and the structural pair [`parse_voice`] / [`encode_voice`]
+//! surfaces the complete typed chunk tree ([`Voice`]) with per-octave
+//! sample vectors for callers that need the instrument structure
+//! (octaves, loop split, envelopes, sequencing) rather than a flat
+//! playback stream.
 //!
 //! We expose an 8SVX file as a single audio stream with codec id
 //! `pcm_s8`. Two compression modes are supported:
@@ -406,6 +421,768 @@ impl VoiceHeader {
         }
         Some(self.samples_per_sec as f64 / self.samples_per_hi_cycle as f64)
     }
+}
+
+// --- CHAN — channel assignment --------------------------------------------
+
+/// The `CHAN` chunk payload — a 4-byte big-endian `sampleType` that
+/// either routes a mono voice to one speaker or declares the BODY
+/// stereo (two concatenated channel halves, LEFT first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelAssignment {
+    /// `2` — play the mono sample on the left speaker.
+    Left,
+    /// `4` — play the mono sample on the right speaker.
+    Right,
+    /// `6` (`LEFT | RIGHT`) — the BODY contains two channels, left
+    /// channel in full first, then the right channel in full.
+    Stereo,
+}
+
+impl ChannelAssignment {
+    /// Decode the wire value (`2` / `4` / `6`).
+    pub fn from_raw(v: u32) -> Result<Self> {
+        match v {
+            2 => Ok(ChannelAssignment::Left),
+            4 => Ok(ChannelAssignment::Right),
+            6 => Ok(ChannelAssignment::Stereo),
+            other => Err(Error::invalid(format!(
+                "8SVX CHAN: sampleType {} is not 2 (left), 4 (right) or 6 (stereo)",
+                other
+            ))),
+        }
+    }
+
+    /// Parse a `CHAN` chunk body (needs 4 bytes).
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 4 {
+            return Err(Error::invalid("8SVX CHAN: need 4 bytes"));
+        }
+        Self::from_raw(u32::from_be_bytes([body[0], body[1], body[2], body[3]]))
+    }
+
+    /// The wire value.
+    pub fn raw(self) -> u32 {
+        match self {
+            ChannelAssignment::Left => 2,
+            ChannelAssignment::Right => 4,
+            ChannelAssignment::Stereo => 6,
+        }
+    }
+
+    /// Serialise to the 4-byte chunk body.
+    pub fn write(self) -> [u8; 4] {
+        self.raw().to_be_bytes()
+    }
+
+    /// Number of sample channels the BODY carries (1 for the two mono
+    /// routings, 2 for stereo).
+    pub fn channel_count(self) -> u16 {
+        match self {
+            ChannelAssignment::Stereo => 2,
+            _ => 1,
+        }
+    }
+}
+
+// --- PAN — mono stereo position -------------------------------------------
+
+/// The `PAN` chunk — an optional stereo position for a **mono** sample:
+/// a 4-byte big-endian signed `sposition` where `0` = fully right,
+/// `0x8000` = center, `0x1_0000` = fully left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pan {
+    /// `sposition` — `0` right … `0x8000` center … `0x1_0000` left.
+    pub position: i32,
+}
+
+impl Pan {
+    /// `sposition` value for fully-right placement.
+    pub const RIGHT: i32 = 0;
+    /// `sposition` value for center placement.
+    pub const CENTER: i32 = 0x8000;
+    /// `sposition` value for fully-left placement.
+    pub const LEFT: i32 = 0x0001_0000;
+
+    /// Parse a `PAN` chunk body (needs 4 bytes).
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 4 {
+            return Err(Error::invalid("8SVX PAN: need 4 bytes"));
+        }
+        Ok(Pan {
+            position: i32::from_be_bytes([body[0], body[1], body[2], body[3]]),
+        })
+    }
+
+    /// Serialise to the 4-byte chunk body.
+    pub fn write(&self) -> [u8; 4] {
+        self.position.to_be_bytes()
+    }
+
+    /// Fraction of the signal sent to the **left** speaker, in
+    /// `0.0..=1.0` (the wire value clamped into the documented
+    /// `0..=0x1_0000` range and scaled).
+    pub fn left_weight(&self) -> f32 {
+        self.position.clamp(0, Self::LEFT) as f32 / Self::LEFT as f32
+    }
+
+    /// Fraction of the signal sent to the **right** speaker
+    /// (`1.0 - left_weight()`).
+    pub fn right_weight(&self) -> f32 {
+        1.0 - self.left_weight()
+    }
+}
+
+// --- ATAK / RLSE — volume envelopes ---------------------------------------
+
+/// One envelope-generator point: ramp the playback volume toward
+/// `dest` over `duration_ms` milliseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EgPoint {
+    /// Segment duration in milliseconds.
+    pub duration_ms: u16,
+    /// Destination volume, 16.16 fixed point: `0` = off,
+    /// [`UNITY_VOLUME`] (`0x1_0000`) = maximum.
+    pub dest: i32,
+}
+
+/// An `ATAK` (attack) or `RLSE` (release) volume envelope — a list of
+/// [`EgPoint`]s that gradually in- or decrease the `VHDR` volume.
+/// Multiple `ATAK` and `RLSE` chunks can appear in one FORM to build a
+/// full ADSR (attack / decay / sustain / release) envelope; the FORM
+/// walker preserves them in document order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Envelope {
+    /// The envelope points, in wire order.
+    pub points: Vec<EgPoint>,
+}
+
+impl Envelope {
+    /// Parse an `ATAK` / `RLSE` chunk body: a flat array of 6-byte
+    /// `EGPoint`s (`u16` duration in ms + `i32` destination volume,
+    /// both big-endian). A body that is not a whole number of points
+    /// is rejected.
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() % 6 != 0 {
+            return Err(Error::invalid(format!(
+                "8SVX envelope: body of {} bytes is not a whole number of 6-byte EGPoints",
+                body.len()
+            )));
+        }
+        let points = body
+            .chunks_exact(6)
+            .map(|c| EgPoint {
+                duration_ms: u16::from_be_bytes([c[0], c[1]]),
+                dest: i32::from_be_bytes([c[2], c[3], c[4], c[5]]),
+            })
+            .collect();
+        Ok(Envelope { points })
+    }
+
+    /// Serialise back to the chunk body (6 bytes per point).
+    pub fn write(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.points.len() * 6);
+        for p in &self.points {
+            out.extend_from_slice(&p.duration_ms.to_be_bytes());
+            out.extend_from_slice(&p.dest.to_be_bytes());
+        }
+        out
+    }
+
+    /// Sum of all segment durations in milliseconds.
+    pub fn total_duration_ms(&self) -> u64 {
+        self.points.iter().map(|p| p.duration_ms as u64).sum()
+    }
+
+    /// Evaluate the envelope `t_ms` milliseconds in, starting from
+    /// volume `start` (16.16 fixed point). Each point ramps linearly
+    /// from the running level to its `dest` over its `duration_ms`
+    /// (a zero-duration point is an immediate jump); past the final
+    /// point the level holds at the last `dest`. An empty envelope
+    /// returns `start`.
+    pub fn level_at_ms(&self, start: i32, t_ms: u64) -> i32 {
+        let mut level = start as i64;
+        let mut elapsed: u64 = 0;
+        for p in &self.points {
+            let d = p.duration_ms as u64;
+            if d == 0 || t_ms >= elapsed + d {
+                level = p.dest as i64;
+                elapsed += d;
+                continue;
+            }
+            // Mid-segment: linear interpolation.
+            let into = (t_ms - elapsed) as i64;
+            let dest = p.dest as i64;
+            level += (dest - level) * into / d as i64;
+            return level as i32;
+        }
+        level as i32
+    }
+}
+
+// --- SEQN / FADE — waveform sequencing ------------------------------------
+
+/// One `SEQN` segment: a `[start, end)` sample range within the
+/// highest-octave waveform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeqnSegment {
+    /// Segment start offset in samples, relative to the start of the
+    /// highest-octave voice. Must be 32-bit aligned (a multiple of 4).
+    pub start: u32,
+    /// Segment end offset in samples (same origin and alignment rule).
+    pub end: u32,
+}
+
+impl SeqnSegment {
+    /// Segment length in samples (`0` when `end <= start`).
+    pub fn len(&self) -> u32 {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// `true` when the segment covers no samples.
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
+}
+
+/// The `SEQN` chunk — a sequence of segments within the voice waveform
+/// that should be played in order, letting parts of the waveform play
+/// multiple times. When a `SEQN` is used, `VHDR.oneShotHiSamples`
+/// should be `0` and `VHDR.repeatHiSamples` should equal the waveform
+/// length (halved for a stereo voice, whose VHDR counts one channel).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Seqn {
+    /// The playback segments, in wire (= playback) order.
+    pub segments: Vec<SeqnSegment>,
+}
+
+impl Seqn {
+    /// Parse a `SEQN` chunk body: a flat array of 8-byte segments
+    /// (`u32` start + `u32` end, big-endian). A body that is not a
+    /// whole number of segments is rejected.
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() % 8 != 0 {
+            return Err(Error::invalid(format!(
+                "8SVX SEQN: body of {} bytes is not a whole number of 8-byte segments",
+                body.len()
+            )));
+        }
+        let segments = body
+            .chunks_exact(8)
+            .map(|c| SeqnSegment {
+                start: u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
+                end: u32::from_be_bytes([c[4], c[5], c[6], c[7]]),
+            })
+            .collect();
+        Ok(Seqn { segments })
+    }
+
+    /// Serialise back to the chunk body (8 bytes per segment).
+    pub fn write(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.segments.len() * 8);
+        for s in &self.segments {
+            out.extend_from_slice(&s.start.to_be_bytes());
+            out.extend_from_slice(&s.end.to_be_bytes());
+        }
+        out
+    }
+
+    /// Validate every segment against the documented constraints:
+    /// offsets 32-bit aligned (multiples of 4), `start <= end`, and
+    /// `end` within the highest-octave waveform the header describes
+    /// (`hi_octave_samples`). Returns the first violation.
+    pub fn validate(&self, header: &VoiceHeader) -> Result<()> {
+        let limit = header.hi_octave_samples();
+        for (i, s) in self.segments.iter().enumerate() {
+            if s.start % 4 != 0 || s.end % 4 != 0 {
+                return Err(Error::invalid(format!(
+                    "8SVX SEQN segment {}: offsets {}..{} are not 32-bit aligned",
+                    i, s.start, s.end
+                )));
+            }
+            if s.start > s.end {
+                return Err(Error::invalid(format!(
+                    "8SVX SEQN segment {}: start {} past end {}",
+                    i, s.start, s.end
+                )));
+            }
+            if (s.end as u64) > limit {
+                return Err(Error::invalid(format!(
+                    "8SVX SEQN segment {}: end {} past the {}-sample waveform",
+                    i, s.end, limit
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `true` when the VHDR follows the documented SEQN convention —
+    /// `oneShotHiSamples == 0` (the whole waveform is the loopable
+    /// repeat part the segments index into).
+    pub fn vhdr_convention_holds(&self, header: &VoiceHeader) -> bool {
+        header.one_shot_hi_samples == 0
+    }
+}
+
+/// The `FADE` chunk — "start fade-out at this segment": a single
+/// big-endian `u32` naming the [`Seqn`] segment at which the sound
+/// should begin slowly fading to silence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fade {
+    /// The wire value — read as an index into the `SEQN` segment list.
+    pub segment: u32,
+}
+
+impl Fade {
+    /// Parse a `FADE` chunk body (needs 4 bytes).
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 4 {
+            return Err(Error::invalid("8SVX FADE: need 4 bytes"));
+        }
+        Ok(Fade {
+            segment: u32::from_be_bytes([body[0], body[1], body[2], body[3]]),
+        })
+    }
+
+    /// Serialise to the 4-byte chunk body.
+    pub fn write(&self) -> [u8; 4] {
+        self.segment.to_be_bytes()
+    }
+
+    /// `true` when the value indexes an existing segment of `seqn`.
+    pub fn is_valid_for(&self, seqn: &Seqn) -> bool {
+        (self.segment as usize) < seqn.segments.len()
+    }
+}
+
+// --- Voice — the structural parse/encode surface --------------------------
+
+/// One channel's decoded waveform data, split per octave (octave 0 is
+/// the highest = shortest; each following octave is twice as long).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChannelSamples {
+    /// Per-octave signed 8-bit samples, highest octave first.
+    pub octaves: Vec<Vec<i8>>,
+}
+
+impl ChannelSamples {
+    /// The highest-octave waveform (octave 0).
+    pub fn hi(&self) -> &[i8] {
+        self.octaves.first().map(|o| o.as_slice()).unwrap_or(&[])
+    }
+
+    /// Total decoded samples across all octaves.
+    pub fn total_len(&self) -> usize {
+        self.octaves.iter().map(|o| o.len()).sum()
+    }
+
+    /// All octaves concatenated back into the stored BODY order.
+    pub fn flattened(&self) -> Vec<i8> {
+        let mut out = Vec::with_capacity(self.total_len());
+        for o in &self.octaves {
+            out.extend_from_slice(o);
+        }
+        out
+    }
+}
+
+/// A fully-parsed `FORM 8SVX` voice: the typed header, every optional
+/// voice-structure chunk, the text metadata, and the decoded waveform
+/// data per channel and per octave.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Voice {
+    /// The mandatory `VHDR` header.
+    pub header: VoiceHeader,
+    /// The `CHAN` assignment, when present (`None` = mono by default).
+    pub channel: Option<ChannelAssignment>,
+    /// The `PAN` stereo position, when present.
+    pub pan: Option<Pan>,
+    /// `ATAK` attack envelopes in document order.
+    pub attack: Vec<Envelope>,
+    /// `RLSE` release envelopes in document order.
+    pub release: Vec<Envelope>,
+    /// The `SEQN` segment sequence, when present.
+    pub seqn: Option<Seqn>,
+    /// The `FADE` fade-out trigger, when present.
+    pub fade: Option<Fade>,
+    /// Text chunks as `(key, value)` pairs in document order — the
+    /// same key mapping the demuxer uses (`NAME` → `title`, `AUTH` →
+    /// `artist`, `ANNO` → `comment`, `(c) ` → `copyright`, `CHRS` →
+    /// `characters`).
+    pub metadata: Vec<(String, String)>,
+    /// Decoded waveform data: one entry for mono, two (left, right)
+    /// for stereo.
+    pub channels: Vec<ChannelSamples>,
+}
+
+impl Default for VoiceHeader {
+    fn default() -> Self {
+        VoiceHeader {
+            one_shot_hi_samples: 0,
+            repeat_hi_samples: 0,
+            samples_per_hi_cycle: 0,
+            samples_per_sec: 0,
+            ct_octave: 1,
+            compression_byte: 0,
+            volume: UNITY_VOLUME,
+        }
+    }
+}
+
+impl Voice {
+    /// Number of sample channels (1 or 2).
+    pub fn channel_count(&self) -> u16 {
+        self.channels.len() as u16
+    }
+
+    /// Number of octave waveforms per channel.
+    pub fn octave_count(&self) -> usize {
+        self.channels.first().map(|c| c.octaves.len()).unwrap_or(0)
+    }
+}
+
+/// Map an 8SVX text-chunk FourCC to its metadata key (and back — see
+/// `metadata_fourcc`).
+fn text_key(id: &[u8; 4]) -> Option<&'static str> {
+    match id {
+        b"NAME" => Some("title"),
+        b"AUTH" => Some("artist"),
+        b"ANNO" => Some("comment"),
+        b"(c) " => Some("copyright"),
+        b"CHRS" => Some("characters"),
+        _ => None,
+    }
+}
+
+/// Parse an in-memory `FORM 8SVX` file into a typed [`Voice`]: the
+/// `VHDR` header, every documented voice-structure chunk (`CHAN`,
+/// `PAN`, `ATAK`/`RLSE`, `SEQN`, `FADE`, the text chunks), and the
+/// BODY decoded (Fibonacci-delta expanded when `sCompression = 1`)
+/// then split into per-channel, per-octave waveforms.
+///
+/// Structural strictness: a missing `VHDR` or `BODY`, a duplicate
+/// single-instance chunk (`VHDR` / `CHAN` / `PAN` / `SEQN` / `FADE`),
+/// a chunk running past the FORM, an unknown `CHAN` value, or a BODY
+/// too short for the header's octave doubling series are each
+/// rejected with `Error::invalid`. Unknown chunk IDs are skipped.
+/// When the header's waveform lengths are all zero the whole decoded
+/// channel is surfaced as a single octave (matching the demuxer's
+/// body-derived fallback).
+pub fn parse_voice(bytes: &[u8]) -> Result<Voice> {
+    if bytes.len() < 12 {
+        return Err(Error::invalid("8SVX: file shorter than FORM header"));
+    }
+    if &bytes[0..4] != b"FORM" {
+        return Err(Error::invalid("8SVX: missing FORM signature"));
+    }
+    if &bytes[8..12] != b"8SVX" {
+        return Err(Error::invalid(format!(
+            "IFF: not an 8SVX file (form type {:?})",
+            std::str::from_utf8(&bytes[8..12]).unwrap_or("????")
+        )));
+    }
+    let total = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let body_end = (8usize.saturating_add(total)).min(bytes.len());
+
+    let mut header: Option<VoiceHeader> = None;
+    let mut channel: Option<ChannelAssignment> = None;
+    let mut pan: Option<Pan> = None;
+    let mut attack: Vec<Envelope> = Vec::new();
+    let mut release: Vec<Envelope> = Vec::new();
+    let mut seqn: Option<Seqn> = None;
+    let mut fade: Option<Fade> = None;
+    let mut metadata: Vec<(String, String)> = Vec::new();
+    let mut body: Option<&[u8]> = None;
+
+    let mut cursor = 12usize;
+    while cursor + 8 <= body_end {
+        let id = [
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ];
+        let size = u32::from_be_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]) as usize;
+        let payload_start = cursor + 8;
+        let payload_end = payload_start.saturating_add(size);
+        if payload_end > body_end {
+            return Err(Error::invalid(format!(
+                "8SVX: chunk {:?} extends past FORM ({} > {})",
+                std::str::from_utf8(&id).unwrap_or("????"),
+                payload_end,
+                body_end
+            )));
+        }
+        let payload = &bytes[payload_start..payload_end];
+        let dup = |what: &str| Error::invalid(format!("8SVX: duplicate {} chunk", what));
+        match &id {
+            b"VHDR" => {
+                if header.is_some() {
+                    return Err(dup("VHDR"));
+                }
+                header = Some(VoiceHeader::parse(payload)?);
+            }
+            b"CHAN" => {
+                if channel.is_some() {
+                    return Err(dup("CHAN"));
+                }
+                channel = Some(ChannelAssignment::parse(payload)?);
+            }
+            b"PAN " => {
+                if pan.is_some() {
+                    return Err(dup("PAN"));
+                }
+                pan = Some(Pan::parse(payload)?);
+            }
+            b"ATAK" => attack.push(Envelope::parse(payload)?),
+            b"RLSE" => release.push(Envelope::parse(payload)?),
+            b"SEQN" => {
+                if seqn.is_some() {
+                    return Err(dup("SEQN"));
+                }
+                seqn = Some(Seqn::parse(payload)?);
+            }
+            b"FADE" => {
+                if fade.is_some() {
+                    return Err(dup("FADE"));
+                }
+                fade = Some(Fade::parse(payload)?);
+            }
+            b"BODY" => {
+                if body.is_some() {
+                    return Err(dup("BODY"));
+                }
+                body = Some(payload);
+            }
+            _ => {
+                if let Some(key) = text_key(&id) {
+                    let end = payload
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(payload.len());
+                    let value = String::from_utf8_lossy(&payload[..end]).trim().to_string();
+                    if !value.is_empty() {
+                        metadata.push((key.into(), value));
+                    }
+                }
+                // Unknown chunks are skipped.
+            }
+        }
+        let padded = size + (size & 1);
+        cursor = payload_start + padded;
+    }
+
+    let header = header.ok_or_else(|| Error::invalid("8SVX: missing VHDR chunk"))?;
+    let body = body.ok_or_else(|| Error::invalid("8SVX: missing BODY chunk"))?;
+    let compression = header.compression()?;
+    let ch_count = channel.map_or(1, |c| c.channel_count()) as usize;
+
+    // Split the BODY into channel streams (stereo = LEFT half in full
+    // then RIGHT half in full) and decode each.
+    let mut streams: Vec<Vec<i8>> = Vec::with_capacity(ch_count);
+    if ch_count == 2 {
+        if compression == Compression::Fibonacci && body.len() % 2 != 0 {
+            return Err(Error::invalid(
+                "8SVX Fibonacci stereo BODY: odd length can't split into equal halves",
+            ));
+        }
+        let half = body.len() / 2;
+        for raw in [&body[..half], &body[half..half * 2]] {
+            streams.push(decode_channel_stream(raw, compression)?);
+        }
+    } else {
+        streams.push(decode_channel_stream(body, compression)?);
+    }
+
+    // Split each channel into octave waveforms per the header's
+    // doubling series. A zeroed header means "whole stream, single
+    // octave"; otherwise the stream must supply the full series.
+    let expected = header
+        .total_samples_per_channel()
+        .ok_or_else(|| Error::invalid("8SVX VHDR: octave doubling series overflows"))?;
+    let mut channels_data: Vec<ChannelSamples> = Vec::with_capacity(ch_count);
+    for stream in streams {
+        if expected == 0 {
+            channels_data.push(ChannelSamples {
+                octaves: vec![stream],
+            });
+            continue;
+        }
+        if (stream.len() as u64) < expected {
+            return Err(Error::invalid(format!(
+                "8SVX BODY: channel supplies {} samples but VHDR's {} octave(s) need {}",
+                stream.len(),
+                header.ct_octave.max(1),
+                expected
+            )));
+        }
+        let mut octaves = Vec::with_capacity(header.ct_octave.max(1) as usize);
+        let mut at = 0usize;
+        let mut len = header.hi_octave_samples() as usize;
+        for _ in 0..header.ct_octave.max(1) {
+            octaves.push(stream[at..at + len].to_vec());
+            at += len;
+            len *= 2;
+        }
+        channels_data.push(ChannelSamples { octaves });
+    }
+
+    Ok(Voice {
+        header,
+        channel,
+        pan,
+        attack,
+        release,
+        seqn,
+        fade,
+        metadata,
+        channels: channels_data,
+    })
+}
+
+/// Decode one channel's raw BODY byte stream to signed samples.
+fn decode_channel_stream(raw: &[u8], compression: Compression) -> Result<Vec<i8>> {
+    match compression {
+        Compression::None => Ok(raw.iter().map(|&b| b as i8).collect()),
+        Compression::Fibonacci => fibonacci_decode_channel(raw),
+    }
+}
+
+/// Encode a typed [`Voice`] back into a complete `FORM 8SVX` byte
+/// stream — the inverse of [`parse_voice`].
+///
+/// The header is authoritative for `samplesPerSec`,
+/// `samplesPerHiCycle`, `volume`, `sCompression`, and the
+/// one-shot/repeat split; the waveform data must be shape-consistent
+/// with it: the channel count must match the `CHAN` assignment (none
+/// = mono), every channel must carry `ctOctave.max(1)` octaves whose
+/// lengths follow the doubling series, and octave 0 must be
+/// `oneShotHiSamples + repeatHiSamples` long (unless the header's
+/// waveform lengths are all zero, in which case a single octave of
+/// any length is accepted — the body-derived convention). Chunks are
+/// written in canonical order: `VHDR`, `CHAN`, `PAN`, `ATAK`s,
+/// `RLSE`s, `SEQN`, `FADE`, text chunks, `BODY`.
+///
+/// A raw voice round-trips losslessly through
+/// `parse_voice(encode_voice(v))`; a Fibonacci voice round-trips
+/// within the codec's ±2 LSB tolerance (and the first sample exactly).
+pub fn encode_voice(voice: &Voice) -> Result<Vec<u8>> {
+    let compression = voice.header.compression()?;
+    let ch_expected = voice.channel.map_or(1, |c| c.channel_count()) as usize;
+    if voice.channels.len() != ch_expected {
+        return Err(Error::invalid(format!(
+            "8SVX encode: {} channel(s) of data but the CHAN assignment implies {}",
+            voice.channels.len(),
+            ch_expected
+        )));
+    }
+
+    // Shape-check the octave series against the header.
+    let hi = voice.header.hi_octave_samples();
+    let ct = voice.header.ct_octave.max(1) as usize;
+    for (ci, ch) in voice.channels.iter().enumerate() {
+        if hi == 0 {
+            if ch.octaves.len() != 1 {
+                return Err(Error::invalid(format!(
+                    "8SVX encode: channel {} has {} octaves but the zeroed VHDR implies one",
+                    ci,
+                    ch.octaves.len()
+                )));
+            }
+            continue;
+        }
+        if ch.octaves.len() != ct {
+            return Err(Error::invalid(format!(
+                "8SVX encode: channel {} has {} octaves, VHDR.ctOctave says {}",
+                ci,
+                ch.octaves.len(),
+                ct
+            )));
+        }
+        let mut want = hi;
+        for (oi, o) in ch.octaves.iter().enumerate() {
+            if o.len() as u64 != want {
+                return Err(Error::invalid(format!(
+                    "8SVX encode: channel {} octave {} has {} samples, expected {}",
+                    ci,
+                    oi,
+                    o.len(),
+                    want
+                )));
+            }
+            want *= 2;
+        }
+    }
+    if ch_expected == 2 && voice.channels[0].total_len() != voice.channels[1].total_len() {
+        return Err(Error::invalid(
+            "8SVX encode: stereo channels differ in length",
+        ));
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"FORM");
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(b"8SVX");
+
+    let push_chunk = |out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]| {
+        out.extend_from_slice(id);
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+        if payload.len() % 2 == 1 {
+            out.push(0);
+        }
+    };
+
+    push_chunk(&mut out, b"VHDR", &voice.header.write());
+    if let Some(chan) = voice.channel {
+        push_chunk(&mut out, b"CHAN", &chan.write());
+    }
+    if let Some(pan) = voice.pan {
+        push_chunk(&mut out, b"PAN ", &pan.write());
+    }
+    for env in &voice.attack {
+        push_chunk(&mut out, b"ATAK", &env.write());
+    }
+    for env in &voice.release {
+        push_chunk(&mut out, b"RLSE", &env.write());
+    }
+    if let Some(seqn) = &voice.seqn {
+        push_chunk(&mut out, b"SEQN", &seqn.write());
+    }
+    if let Some(fade) = voice.fade {
+        push_chunk(&mut out, b"FADE", &fade.write());
+    }
+    for (k, v) in &voice.metadata {
+        let Some(fourcc) = metadata_fourcc(k) else {
+            continue;
+        };
+        let mut payload = Vec::with_capacity(v.len() + 1);
+        payload.extend_from_slice(v.as_bytes());
+        payload.push(0);
+        push_chunk(&mut out, fourcc, &payload);
+    }
+
+    // BODY: each channel's octaves concatenated (highest first), the
+    // channels back to back (LEFT in full then RIGHT in full), each
+    // channel Fibonacci-encoded independently when requested.
+    let mut body = Vec::new();
+    for ch in &voice.channels {
+        let flat = ch.flattened();
+        match compression {
+            Compression::None => body.extend(flat.iter().map(|&s| s as u8)),
+            Compression::Fibonacci => body.extend(fibonacci_encode_channel(&flat)),
+        }
+    }
+    push_chunk(&mut out, b"BODY", &body);
+
+    let total = out.len() as u32;
+    out[4..8].copy_from_slice(&(total - 8).to_be_bytes());
+    Ok(out)
 }
 
 // --- Demuxer --------------------------------------------------------------

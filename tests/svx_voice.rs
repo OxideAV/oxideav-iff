@@ -200,3 +200,363 @@ fn voice_header_hostile_inputs() {
     assert_eq!(h0.total_samples_per_channel(), Some(8));
     assert_eq!(h0.octave_samples(0), Some(8));
 }
+
+// ── parse_voice / encode_voice — the structural surface ──────────────
+
+use oxideav_iff::svx::{
+    encode_voice, parse_voice, ChannelAssignment, ChannelSamples, EgPoint, Envelope, Fade, Pan,
+    Seqn, SeqnSegment, Voice,
+};
+
+fn voice_of(header: VoiceHeader, channels: Vec<ChannelSamples>) -> Voice {
+    Voice {
+        header,
+        channels,
+        ..Voice::default()
+    }
+}
+
+fn octave_ramp(len: usize, base: i8) -> Vec<i8> {
+    (0..len)
+        .map(|i| base.wrapping_add((i % 100) as i8))
+        .collect()
+}
+
+/// Raw mono multi-octave voice: encode → parse is lossless, octave
+/// boundaries land on the doubling series.
+#[test]
+fn voice_roundtrip_mono_multi_octave_raw() {
+    let header = VoiceHeader {
+        one_shot_hi_samples: 4,
+        repeat_hi_samples: 4,
+        samples_per_hi_cycle: 8,
+        samples_per_sec: 8000,
+        ct_octave: 3,
+        compression_byte: 0,
+        volume: 0x8000,
+    };
+    let ch = ChannelSamples {
+        octaves: vec![octave_ramp(8, 0), octave_ramp(16, 10), octave_ramp(32, -50)],
+    };
+    let v = voice_of(header, vec![ch]);
+    let bytes = encode_voice(&v).unwrap();
+    let back = parse_voice(&bytes).unwrap();
+    assert_eq!(back, v);
+}
+
+/// Stereo voice with every optional chunk populated round-trips through
+/// encode → parse, chunk for chunk.
+#[test]
+fn voice_roundtrip_stereo_full_chunk_set() {
+    let header = VoiceHeader {
+        one_shot_hi_samples: 0,
+        repeat_hi_samples: 8,
+        samples_per_hi_cycle: 0,
+        samples_per_sec: 16000,
+        ct_octave: 1,
+        compression_byte: 0,
+        volume: 0x0001_0000,
+    };
+    let v = Voice {
+        header,
+        channel: Some(ChannelAssignment::Stereo),
+        pan: None, // PAN is for mono voices; exercised separately below
+        attack: vec![Envelope {
+            points: vec![
+                EgPoint {
+                    duration_ms: 10,
+                    dest: 0x8000,
+                },
+                EgPoint {
+                    duration_ms: 20,
+                    dest: 0x0001_0000,
+                },
+            ],
+        }],
+        release: vec![Envelope {
+            points: vec![EgPoint {
+                duration_ms: 50,
+                dest: 0,
+            }],
+        }],
+        seqn: Some(Seqn {
+            segments: vec![
+                SeqnSegment { start: 0, end: 4 },
+                SeqnSegment { start: 4, end: 8 },
+                SeqnSegment { start: 0, end: 8 },
+            ],
+        }),
+        fade: Some(Fade { segment: 2 }),
+        metadata: vec![
+            ("title".into(), "chord".into()),
+            ("comment".into(), "two segments then all".into()),
+        ],
+        channels: vec![
+            ChannelSamples {
+                octaves: vec![octave_ramp(8, 5)],
+            },
+            ChannelSamples {
+                octaves: vec![octave_ramp(8, -5)],
+            },
+        ],
+    };
+    let bytes = encode_voice(&v).unwrap();
+    let back = parse_voice(&bytes).unwrap();
+    assert_eq!(back, v);
+    // The SEQN validates against the header and follows the VHDR
+    // convention (oneShot == 0); the FADE names a real segment.
+    let seqn = back.seqn.as_ref().unwrap();
+    seqn.validate(&back.header).unwrap();
+    assert!(seqn.vhdr_convention_holds(&back.header));
+    assert!(back.fade.unwrap().is_valid_for(seqn));
+}
+
+/// Mono voice with PAN + CHAN(Right): typed accessors answer from the
+/// documented value space.
+#[test]
+fn voice_pan_and_right_routing() {
+    let header = VoiceHeader {
+        one_shot_hi_samples: 4,
+        samples_per_sec: 8000,
+        ..VoiceHeader::default()
+    };
+    let v = Voice {
+        header,
+        channel: Some(ChannelAssignment::Right),
+        pan: Some(Pan { position: 0x8000 }),
+        channels: vec![ChannelSamples {
+            octaves: vec![octave_ramp(4, 1)],
+        }],
+        ..Voice::default()
+    };
+    let back = parse_voice(&encode_voice(&v).unwrap()).unwrap();
+    assert_eq!(back, v);
+    let pan = back.pan.unwrap();
+    assert!((pan.left_weight() - 0.5).abs() < 1e-3);
+    assert!((pan.right_weight() - 0.5).abs() < 1e-3);
+    assert_eq!(
+        Pan {
+            position: Pan::LEFT
+        }
+        .left_weight(),
+        1.0
+    );
+    assert_eq!(
+        Pan {
+            position: Pan::RIGHT
+        }
+        .left_weight(),
+        0.0
+    );
+    // Out-of-range positions clamp instead of over/underflowing.
+    assert_eq!(Pan { position: i32::MAX }.left_weight(), 1.0);
+    assert_eq!(Pan { position: -55 }.left_weight(), 0.0);
+    assert_eq!(back.channel, Some(ChannelAssignment::Right));
+    assert_eq!(back.channel_count(), 1);
+}
+
+/// Fibonacci-compressed stereo voice: first sample exact, the rest
+/// within the codec's ±2 LSB tolerance, structure preserved exactly.
+#[test]
+fn voice_roundtrip_stereo_fibonacci() {
+    let header = VoiceHeader {
+        one_shot_hi_samples: 64,
+        samples_per_sec: 8000,
+        compression_byte: 1,
+        ..VoiceHeader::default()
+    };
+    let smooth: Vec<i8> = (0..64)
+        .map(|i| (60.0 * (i as f64 * 0.2).sin()) as i8)
+        .collect();
+    let v = Voice {
+        header,
+        channel: Some(ChannelAssignment::Stereo),
+        channels: vec![
+            ChannelSamples {
+                octaves: vec![smooth.clone()],
+            },
+            ChannelSamples {
+                octaves: vec![smooth.iter().map(|&s| -s).collect()],
+            },
+        ],
+        ..Voice::default()
+    };
+    let back = parse_voice(&encode_voice(&v).unwrap()).unwrap();
+    assert_eq!(back.channel_count(), 2);
+    assert_eq!(back.octave_count(), 1);
+    for (ch, orig) in back.channels.iter().zip(v.channels.iter()) {
+        assert_eq!(ch.octaves[0].len(), 64);
+        assert_eq!(ch.octaves[0][0], orig.octaves[0][0]);
+        for (a, b) in ch.octaves[0].iter().zip(orig.octaves[0].iter()) {
+            assert!((*a as i32 - *b as i32).abs() <= 2);
+        }
+    }
+}
+
+/// Envelope evaluation: linear ramps between points, hold past the end.
+#[test]
+fn envelope_level_evaluation() {
+    let env = Envelope {
+        points: vec![
+            EgPoint {
+                duration_ms: 100,
+                dest: 0x0001_0000,
+            },
+            EgPoint {
+                duration_ms: 100,
+                dest: 0x8000,
+            },
+        ],
+    };
+    assert_eq!(env.total_duration_ms(), 200);
+    assert_eq!(env.level_at_ms(0, 0), 0);
+    assert_eq!(env.level_at_ms(0, 50), 0x8000); // halfway up the attack
+    assert_eq!(env.level_at_ms(0, 100), 0x0001_0000); // peak
+    assert_eq!(env.level_at_ms(0, 150), 0xC000); // halfway down
+    assert_eq!(env.level_at_ms(0, 200), 0x8000); // settled
+    assert_eq!(env.level_at_ms(0, 10_000), 0x8000); // holds
+                                                    // Empty envelope: identity.
+    assert_eq!(Envelope::default().level_at_ms(1234, 42), 1234);
+    // Zero-duration point: immediate jump.
+    let jump = Envelope {
+        points: vec![EgPoint {
+            duration_ms: 0,
+            dest: 7,
+        }],
+    };
+    assert_eq!(jump.level_at_ms(0, 0), 7);
+}
+
+/// SEQN validation: misaligned offsets, inverted segments, and
+/// past-the-waveform ends are each rejected; a compliant list passes.
+#[test]
+fn seqn_validation_rules() {
+    let header = VoiceHeader {
+        repeat_hi_samples: 16,
+        ..VoiceHeader::default()
+    };
+    let ok = Seqn {
+        segments: vec![SeqnSegment { start: 4, end: 12 }],
+    };
+    ok.validate(&header).unwrap();
+    let misaligned = Seqn {
+        segments: vec![SeqnSegment { start: 2, end: 8 }],
+    };
+    assert!(misaligned.validate(&header).is_err());
+    let inverted = Seqn {
+        segments: vec![SeqnSegment { start: 12, end: 4 }],
+    };
+    assert!(inverted.validate(&header).is_err());
+    let past_end = Seqn {
+        segments: vec![SeqnSegment { start: 0, end: 20 }],
+    };
+    assert!(past_end.validate(&header).is_err());
+    // Segment helpers.
+    let s = SeqnSegment { start: 4, end: 12 };
+    assert_eq!(s.len(), 8);
+    assert!(!s.is_empty());
+    assert!(SeqnSegment { start: 4, end: 4 }.is_empty());
+}
+
+/// Hostile inputs to the typed chunk parsers: wrong sizes and unknown
+/// enum values are rejected, never panicking.
+#[test]
+fn typed_chunk_hostile_inputs() {
+    assert!(Envelope::parse(&[0u8; 7]).is_err()); // not a multiple of 6
+    assert!(Seqn::parse(&[0u8; 12]).is_err()); // not a multiple of 8
+    assert!(Pan::parse(&[0u8; 3]).is_err());
+    assert!(Fade::parse(&[0u8; 3]).is_err());
+    assert!(ChannelAssignment::parse(&[0u8; 2]).is_err());
+    assert!(ChannelAssignment::from_raw(5).is_err());
+    assert!(ChannelAssignment::from_raw(0).is_err());
+    // Empty bodies parse to empty lists (0 is a multiple of both).
+    assert_eq!(Envelope::parse(&[]).unwrap().points.len(), 0);
+    assert_eq!(Seqn::parse(&[]).unwrap().segments.len(), 0);
+}
+
+/// Hostile FORMs through parse_voice: duplicates of single-instance
+/// chunks, truncated bodies vs the octave series, and chunks running
+/// past the FORM are each rejected.
+#[test]
+fn parse_voice_hostile_forms() {
+    let h = vhdr(4, 0, 2); // needs 4 + 8 = 12 samples
+                           // BODY too short for the announced octave series.
+    let short = build_svx(&h, &[], &[0u8; 5]);
+    assert!(parse_voice(&short).is_err());
+    // Duplicate VHDR.
+    let dup_vhdr = build_svx(&vhdr(4, 0, 1), &[(b"VHDR", h.write().to_vec())], &[0u8; 4]);
+    assert!(parse_voice(&dup_vhdr).is_err());
+    // Duplicate CHAN.
+    let chan = 2u32.to_be_bytes().to_vec();
+    let dup_chan = build_svx(
+        &vhdr(4, 0, 1),
+        &[(b"CHAN", chan.clone()), (b"CHAN", chan)],
+        &[0u8; 4],
+    );
+    assert!(parse_voice(&dup_chan).is_err());
+    // Chunk running past the FORM end.
+    let mut overrun = build_svx(&vhdr(4, 0, 1), &[], &[0u8; 4]);
+    let len = overrun.len();
+    overrun[len - 8..len - 4].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    assert!(parse_voice(&overrun).is_err());
+    // Not a FORM / not 8SVX.
+    assert!(parse_voice(b"LIST....8SVX").is_err());
+    assert!(parse_voice(b"FORM\x00\x00\x00\x04ILBM").is_err());
+    assert!(parse_voice(&[]).is_err());
+}
+
+/// Shape mismatches through encode_voice are rejected: wrong octave
+/// count, wrong octave length, wrong channel count vs CHAN.
+#[test]
+fn encode_voice_shape_validation() {
+    let header = VoiceHeader {
+        one_shot_hi_samples: 4,
+        ct_octave: 2,
+        samples_per_sec: 8000,
+        ..VoiceHeader::default()
+    };
+    // Only one octave supplied where ctOctave says 2.
+    let missing_octave = voice_of(
+        header,
+        vec![ChannelSamples {
+            octaves: vec![octave_ramp(4, 0)],
+        }],
+    );
+    assert!(encode_voice(&missing_octave).is_err());
+    // Octave 1 has the wrong length (should be 8).
+    let bad_len = voice_of(
+        header,
+        vec![ChannelSamples {
+            octaves: vec![octave_ramp(4, 0), octave_ramp(9, 0)],
+        }],
+    );
+    assert!(encode_voice(&bad_len).is_err());
+    // Stereo CHAN but one channel of data.
+    let v = Voice {
+        header: VoiceHeader {
+            one_shot_hi_samples: 4,
+            samples_per_sec: 8000,
+            ..VoiceHeader::default()
+        },
+        channel: Some(ChannelAssignment::Stereo),
+        channels: vec![ChannelSamples {
+            octaves: vec![octave_ramp(4, 0)],
+        }],
+        ..Voice::default()
+    };
+    assert!(encode_voice(&v).is_err());
+}
+
+/// A voice whose VHDR waveform lengths are zeroed surfaces the whole
+/// decoded stream as one octave (the body-derived fallback), and
+/// encodes back byte-identically.
+#[test]
+fn parse_voice_zeroed_header_single_octave() {
+    let h = vhdr(0, 0, 1);
+    let body: Vec<u8> = (0u8..6).collect();
+    let file = build_svx(&h, &[], &body);
+    let v = parse_voice(&file).unwrap();
+    assert_eq!(v.octave_count(), 1);
+    assert_eq!(v.channels[0].octaves[0].len(), 6);
+    assert_eq!(encode_voice(&v).unwrap(), file);
+}
