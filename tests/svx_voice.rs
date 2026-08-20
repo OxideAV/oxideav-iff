@@ -560,3 +560,175 @@ fn parse_voice_zeroed_header_single_octave() {
     assert_eq!(v.channels[0].octaves[0].len(), 6);
     assert_eq!(encode_voice(&v).unwrap(), file);
 }
+
+// ── SvxMuxer voice-structure options ─────────────────────────────────
+
+use oxideav_core::{
+    CodecId, CodecParameters, MediaType, Muxer, Packet, SampleFormat, StreamInfo, TimeBase,
+    WriteSeek,
+};
+use oxideav_iff::svx::SvxMuxer;
+
+fn pcm_s8_stream(sr: u32, channels: u16) -> StreamInfo {
+    let mut params = CodecParameters::audio(CodecId::new("pcm_s8"));
+    params.media_type = MediaType::Audio;
+    params.channels = Some(channels);
+    params.sample_rate = Some(sr);
+    params.sample_format = Some(SampleFormat::S8);
+    params.bit_rate = Some(8 * channels as u64 * sr as u64);
+    StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, sr as i64),
+        duration: None,
+        start_time: Some(0),
+        params,
+    }
+}
+
+fn tmp_path(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let n = CTR.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "oxideav-iff-voice-{tag}-{}-{n}.8svx",
+        std::process::id()
+    ))
+}
+
+fn mux_with(
+    mux_build: impl FnOnce(SvxMuxer) -> SvxMuxer,
+    stream: &StreamInfo,
+    payload: &[u8],
+    tag: &str,
+) -> Vec<u8> {
+    let path = tmp_path(tag);
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = mux_build(SvxMuxer::new(ws, std::slice::from_ref(stream)).unwrap());
+        mux.write_header().unwrap();
+        let pkt = Packet::new(0, stream.time_base, payload.to_vec());
+        mux.write_packet(&pkt).unwrap();
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    bytes
+}
+
+/// The muxer's builder options land as real chunks: the file parses
+/// back with the loop split, volume, hi-cycle, PAN, envelopes, SEQN
+/// and FADE all present, and the demuxer's duration covers the loop.
+#[test]
+fn muxer_voice_structure_options_roundtrip() {
+    let stream = pcm_s8_stream(8000, 1);
+    let payload: Vec<u8> = (0..16u8).collect();
+    let atak = Envelope {
+        points: vec![EgPoint {
+            duration_ms: 25,
+            dest: 0x0001_0000,
+        }],
+    };
+    let rlse = Envelope {
+        points: vec![EgPoint {
+            duration_ms: 40,
+            dest: 0,
+        }],
+    };
+    let seqn = Seqn {
+        segments: vec![
+            SeqnSegment { start: 0, end: 8 },
+            SeqnSegment { start: 8, end: 16 },
+        ],
+    };
+    let bytes = mux_with(
+        |m| {
+            m.with_volume(0x8000)
+                .with_hi_cycle(8)
+                .with_repeat(6)
+                .with_mono_routing(ChannelAssignment::Left)
+                .with_pan(Pan {
+                    position: Pan::CENTER,
+                })
+                .with_attack(atak.clone())
+                .with_release(rlse.clone())
+                .with_seqn(seqn.clone())
+                .with_fade(Fade { segment: 1 })
+        },
+        &stream,
+        &payload,
+        "full-options",
+    );
+
+    let v = parse_voice(&bytes).unwrap();
+    assert_eq!(v.header.one_shot_hi_samples, 10);
+    assert_eq!(v.header.repeat_hi_samples, 6);
+    assert_eq!(v.header.samples_per_hi_cycle, 8);
+    assert_eq!(v.header.volume, 0x8000);
+    assert_eq!(v.channel, Some(ChannelAssignment::Left));
+    assert_eq!(
+        v.pan,
+        Some(Pan {
+            position: Pan::CENTER
+        })
+    );
+    assert_eq!(v.attack, vec![atak]);
+    assert_eq!(v.release, vec![rlse]);
+    assert_eq!(v.seqn, Some(seqn));
+    assert_eq!(v.fade, Some(Fade { segment: 1 }));
+    assert_eq!(v.channels[0].octaves[0].len(), 16);
+
+    // Demux still sees the full 16 frames (one-shot + repeat).
+    let mut dmx = open_demuxer(bytes);
+    assert_eq!(dmx.streams()[0].duration, Some(16));
+    assert_eq!(drain(&mut *dmx), payload);
+}
+
+/// with_repeat clamps to the frames actually written; the parts always
+/// sum to the frame count.
+#[test]
+fn muxer_repeat_clamps_to_written_frames() {
+    let stream = pcm_s8_stream(8000, 1);
+    let bytes = mux_with(
+        |m| m.with_repeat(1_000_000),
+        &stream,
+        &[1u8; 12],
+        "repeat-clamp",
+    );
+    let v = parse_voice(&bytes).unwrap();
+    assert_eq!(v.header.one_shot_hi_samples, 0);
+    assert_eq!(v.header.repeat_hi_samples, 12);
+    assert!(v.header.has_loop());
+}
+
+/// PAN / mono routing conflict with a stereo stream and are rejected
+/// at write_header time.
+#[test]
+fn muxer_rejects_pan_and_routing_on_stereo() {
+    let stream = pcm_s8_stream(8000, 2);
+    for build in [
+        (|m: SvxMuxer| {
+            m.with_pan(Pan {
+                position: Pan::LEFT,
+            })
+        }) as fn(SvxMuxer) -> SvxMuxer,
+        |m: SvxMuxer| m.with_mono_routing(ChannelAssignment::Right),
+    ] {
+        let path = tmp_path("stereo-conflict");
+        let f = std::fs::File::create(&path).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = build(SvxMuxer::new(ws, std::slice::from_ref(&stream)).unwrap());
+        assert!(mux.write_header().is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+    // Passing Stereo as a "mono routing" is likewise refused.
+    let mono = pcm_s8_stream(8000, 1);
+    let path = tmp_path("routing-stereo-arg");
+    let f = std::fs::File::create(&path).unwrap();
+    let ws: Box<dyn WriteSeek> = Box::new(f);
+    let mut mux = SvxMuxer::new(ws, std::slice::from_ref(&mono))
+        .unwrap()
+        .with_mono_routing(ChannelAssignment::Stereo);
+    assert!(mux.write_header().is_err());
+    let _ = std::fs::remove_file(&path);
+}

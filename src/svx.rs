@@ -1484,6 +1484,25 @@ pub struct SvxMuxer {
     /// `artist` → `AUTH`, `comment` → `ANNO`, `copyright` → `(c) `,
     /// `characters` → `CHRS`.
     metadata: Vec<(String, String)>,
+    /// VHDR playback volume (16.16 fixed; default [`UNITY_VOLUME`]).
+    volume: u32,
+    /// VHDR samplesPerHiCycle (default 0 = unknown).
+    samples_per_hi_cycle: u32,
+    /// When set, that many trailing frames are recorded as the looped
+    /// repeat part (`VHDR.repeatHiSamples`); clamped to the frame count.
+    repeat_frames: Option<u32>,
+    /// Mono speaker routing (`CHAN` 2/4). `None` = no CHAN for mono.
+    mono_routing: Option<ChannelAssignment>,
+    /// Optional `PAN ` chunk (mono voices only).
+    pan: Option<Pan>,
+    /// `ATAK` envelopes, written in order.
+    attacks: Vec<Envelope>,
+    /// `RLSE` envelopes, written in order.
+    releases: Vec<Envelope>,
+    /// Optional `SEQN` chunk.
+    seqn: Option<Seqn>,
+    /// Optional `FADE` chunk.
+    fade: Option<Fade>,
     form_size_offset: u64,
     body_size_offset: u64,
     /// Interleaved pcm_s8 bytes buffered from `write_packet`. We emit
@@ -1564,6 +1583,15 @@ impl SvxMuxer {
             compression: Compression::None,
             sample_rate,
             metadata: metadata.to_vec(),
+            volume: UNITY_VOLUME,
+            samples_per_hi_cycle: 0,
+            repeat_frames: None,
+            mono_routing: None,
+            pan: None,
+            attacks: Vec::new(),
+            releases: Vec::new(),
+            seqn: None,
+            fade: None,
             form_size_offset: 0,
             body_size_offset: 0,
             pending: Vec::new(),
@@ -1587,6 +1615,73 @@ impl SvxMuxer {
     /// Access the configured compression mode.
     pub fn compression(&self) -> Compression {
         self.compression
+    }
+
+    /// Set the `VHDR` playback volume (16.16 fixed; [`UNITY_VOLUME`]
+    /// is the default). Must be called before `write_header`.
+    pub fn with_volume(mut self, volume: u32) -> Self {
+        self.volume = volume;
+        self
+    }
+
+    /// Set `VHDR.samplesPerHiCycle` — the waveform period of the
+    /// highest octave in samples. Must be called before `write_header`.
+    pub fn with_hi_cycle(mut self, samples_per_hi_cycle: u32) -> Self {
+        self.samples_per_hi_cycle = samples_per_hi_cycle;
+        self
+    }
+
+    /// Mark the trailing `frames` per-channel frames as the looped
+    /// repeat part: `VHDR.repeatHiSamples = frames` and
+    /// `oneShotHiSamples = total - frames` are patched at
+    /// `write_trailer` time (clamped to the frames actually written).
+    pub fn with_repeat(mut self, frames: u32) -> Self {
+        self.repeat_frames = Some(frames);
+        self
+    }
+
+    /// Route a **mono** voice to one speaker by writing a `CHAN` chunk
+    /// (`ChannelAssignment::Left` or `Right`). Rejected at
+    /// `write_header` time for a stereo stream or a `Stereo` argument
+    /// (stereo streams get their `CHAN 6` automatically).
+    pub fn with_mono_routing(mut self, routing: ChannelAssignment) -> Self {
+        self.mono_routing = Some(routing);
+        self
+    }
+
+    /// Attach a `PAN ` chunk giving the mono voice a stereo position.
+    /// Rejected at `write_header` time for a stereo stream (the chunk
+    /// pans a mono sample).
+    pub fn with_pan(mut self, pan: Pan) -> Self {
+        self.pan = Some(pan);
+        self
+    }
+
+    /// Append an `ATAK` (attack) envelope chunk. May be called several
+    /// times; chunks are written in call order (the documented way to
+    /// build a full ADSR envelope together with `with_release`).
+    pub fn with_attack(mut self, envelope: Envelope) -> Self {
+        self.attacks.push(envelope);
+        self
+    }
+
+    /// Append an `RLSE` (release) envelope chunk. May be called
+    /// several times; chunks are written in call order.
+    pub fn with_release(mut self, envelope: Envelope) -> Self {
+        self.releases.push(envelope);
+        self
+    }
+
+    /// Attach a `SEQN` playback-segment sequence.
+    pub fn with_seqn(mut self, seqn: Seqn) -> Self {
+        self.seqn = Some(seqn);
+        self
+    }
+
+    /// Attach a `FADE` fade-out trigger.
+    pub fn with_fade(mut self, fade: Fade) -> Self {
+        self.fade = Some(fade);
+        self
     }
 }
 
@@ -1612,6 +1707,26 @@ impl Muxer for SvxMuxer {
         if self.header_written {
             return Err(Error::other("8SVX muxer: write_header called twice"));
         }
+        if self.channels == Channels::Stereo {
+            if self.pan.is_some() {
+                return Err(Error::invalid(
+                    "8SVX muxer: PAN gives a stereo position to a MONO sample; \
+                     a stereo stream cannot carry one",
+                ));
+            }
+            if self.mono_routing.is_some() {
+                return Err(Error::invalid(
+                    "8SVX muxer: mono routing (CHAN 2/4) conflicts with a stereo stream",
+                ));
+            }
+        }
+        if matches!(self.mono_routing, Some(ChannelAssignment::Stereo)) {
+            return Err(Error::invalid(
+                "8SVX muxer: with_mono_routing takes Left or Right; \
+                 stereo streams write CHAN 6 automatically",
+            ));
+        }
+
         // FORM group chunk header. Size is patched in write_trailer once
         // we know how much we wrote.
         self.output.write_all(b"FORM")?;
@@ -1619,30 +1734,64 @@ impl Muxer for SvxMuxer {
         self.output.write_all(&0u32.to_be_bytes())?; // placeholder
         self.output.write_all(b"8SVX")?;
 
-        // VHDR (20 bytes). We synthesise a one-shot voice with no
-        // sustain/loop and no upper octaves: oneShotHiSamples is the
-        // total frame count (or 0 when the stream duration is unknown —
-        // FORM sizes are patched at close anyway), repeatHiSamples = 0,
-        // samplesPerHiCycle = 0, volume = 1.0 (0x00010000, 16.16 fixed).
+        // VHDR (20 bytes). We synthesise a single-octave voice: the
+        // one-shot/repeat frame counts aren't known yet (patched in
+        // write_trailer per the optional `with_repeat` split),
+        // samplesPerHiCycle and volume come from the builder options.
         self.output.write_all(b"VHDR")?;
         self.output.write_all(&20u32.to_be_bytes())?;
-        // Frame count isn't known yet; patched in write_trailer.
+        // Frame counts aren't known yet; patched in write_trailer.
         self.output.write_all(&0u32.to_be_bytes())?; // oneShotHiSamples
         self.output.write_all(&0u32.to_be_bytes())?; // repeatHiSamples
-        self.output.write_all(&0u32.to_be_bytes())?; // samplesPerHiCycle
+        self.output
+            .write_all(&self.samples_per_hi_cycle.to_be_bytes())?;
         self.output
             .write_all(&(self.sample_rate as u16).to_be_bytes())?;
         self.output.write_all(&[1u8])?; // ctOctave
         self.output.write_all(&[self.compression.to_vhdr_byte()])?; // sCompression
-        self.output.write_all(&0x0001_0000u32.to_be_bytes())?; // volume 1.0
+        self.output.write_all(&self.volume.to_be_bytes())?;
 
-        // CHAN chunk for stereo (LEFT|RIGHT = 6). Mono is the default
-        // when CHAN is absent, so we skip it there.
-        if self.channels == Channels::Stereo {
+        // CHAN chunk: stereo always writes LEFT|RIGHT = 6; a mono
+        // stream writes CHAN 2/4 only when a routing was requested
+        // (mono is the default when CHAN is absent).
+        let chan_value = if self.channels == Channels::Stereo {
+            Some(self.channels.chan_value())
+        } else {
+            self.mono_routing.map(|r| r.raw())
+        };
+        if let Some(v) = chan_value {
             self.output.write_all(b"CHAN")?;
             self.output.write_all(&4u32.to_be_bytes())?;
+            self.output.write_all(&v.to_be_bytes())?;
+        }
+
+        // Voice-structure chunks, canonical order: PAN, ATAK*, RLSE*,
+        // SEQN, FADE (every payload here is even-sized, no pad byte).
+        if let Some(pan) = self.pan {
+            self.output.write_all(b"PAN ")?;
+            self.output.write_all(&4u32.to_be_bytes())?;
+            self.output.write_all(&pan.write())?;
+        }
+        for (id, envs) in [(b"ATAK", &self.attacks), (b"RLSE", &self.releases)] {
+            for env in envs {
+                let payload = env.write();
+                self.output.write_all(id)?;
+                self.output
+                    .write_all(&(payload.len() as u32).to_be_bytes())?;
+                self.output.write_all(&payload)?;
+            }
+        }
+        if let Some(seqn) = &self.seqn {
+            let payload = seqn.write();
+            self.output.write_all(b"SEQN")?;
             self.output
-                .write_all(&self.channels.chan_value().to_be_bytes())?;
+                .write_all(&(payload.len() as u32).to_be_bytes())?;
+            self.output.write_all(&payload)?;
+        }
+        if let Some(fade) = self.fade {
+            self.output.write_all(b"FADE")?;
+            self.output.write_all(&4u32.to_be_bytes())?;
+            self.output.write_all(&fade.write())?;
         }
 
         // Optional metadata chunks. Preserve caller-supplied order so
@@ -1750,18 +1899,26 @@ impl Muxer for SvxMuxer {
         self.output.seek(SeekFrom::Start(self.body_size_offset))?;
         self.output.write_all(&body_size_u32.to_be_bytes())?;
 
-        // Patch VHDR.oneShotHiSamples with the per-channel frame count.
-        // `form_size_offset` points at the FORM size field (4 bytes),
-        // then comes "8SVX" (4), "VHDR" (4), VHDR size (4) — so
-        // oneShotHiSamples lives at form_size_offset + 16. Writing this
-        // lets a decoder that inspects VHDR know the full length of the
-        // voice even before reaching BODY (and is especially useful for
-        // Fibonacci-compressed voices, where the sample count isn't
-        // trivially recoverable from BODY size).
-        let one_shot = frames_per_channel as u32;
+        // Patch VHDR.oneShotHiSamples / repeatHiSamples with the
+        // per-channel frame count. `form_size_offset` points at the
+        // FORM size field (4 bytes), then comes "8SVX" (4), "VHDR" (4),
+        // VHDR size (4) — so oneShotHiSamples lives at
+        // form_size_offset + 16 and repeatHiSamples right after it.
+        // Writing these lets a decoder that inspects VHDR know the full
+        // length of the voice even before reaching BODY (and is
+        // especially useful for Fibonacci-compressed voices, where the
+        // sample count isn't trivially recoverable from BODY size).
+        // A `with_repeat` request marks that many trailing frames as
+        // the looped repeat part, clamped to the frames actually
+        // written; the sum always equals the per-channel frame count.
+        let total = u32::try_from(frames_per_channel)
+            .map_err(|_| Error::other("8SVX VHDR sample counts exceed u32"))?;
+        let repeat = self.repeat_frames.unwrap_or(0).min(total);
+        let one_shot = total - repeat;
         self.output
             .seek(SeekFrom::Start(self.form_size_offset + 16))?;
         self.output.write_all(&one_shot.to_be_bytes())?;
+        self.output.write_all(&repeat.to_be_bytes())?;
 
         // Patch FORM size: everything after the 8-byte FORM header.
         let form_size_u32: u32 = (end - (self.form_size_offset + 4))

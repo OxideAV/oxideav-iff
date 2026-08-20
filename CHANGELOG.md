@@ -45,6 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order, per-channel Fibonacci encoding, stereo as concatenated
   halves). Raw voices round-trip losslessly, Fibonacci within the
   codec's ±2 LSB tolerance.
+- *(svx)* **`SvxMuxer` voice-structure write parity.** New builder
+  options emit every voice-structure chunk from the streaming muxer:
+  `with_volume` / `with_hi_cycle` (VHDR fields previously hard-coded),
+  `with_repeat` (marks the trailing N frames as the looped repeat
+  part — `oneShot`/`repeat` are patched at trailer time, clamped to
+  the frames written, always summing to the frame count),
+  `with_mono_routing` (CHAN 2/4 for a mono voice), `with_pan`,
+  `with_attack` / `with_release` (repeatable, document order),
+  `with_seqn`, and `with_fade`. A `PAN` or mono routing on a stereo
+  stream — and `Stereo` passed as a mono routing — are rejected at
+  `write_header` time.
 - *(svx)* the demuxer surfaces `("octaves", n)` metadata for a
   multi-octave voice and `("channel_assignment", "left"/"right")` for a
   mono voice a `CHAN` chunk routes to one speaker (`2` = left, `4` =
