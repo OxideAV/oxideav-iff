@@ -624,8 +624,21 @@ pub fn read_form_type<R: Read + ?Sized>(r: &mut R) -> Result<[u8; 4]> {
 
 /// Read the entire body of a chunk (excluding the pad byte).
 pub fn read_body<R: Read + ?Sized>(r: &mut R, header: &ChunkHeader) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; header.size as usize];
-    r.read_exact(&mut buf)?;
+    // Don't pre-allocate the declared size: a forged 32-bit ckSize over
+    // a tiny stream would demand an attacker-sized buffer before the
+    // read could fail. `take + read_to_end` grows the buffer only as
+    // bytes actually arrive, so the allocation is bounded by the real
+    // stream length; a short read is then rejected.
+    let mut buf = Vec::new();
+    (&mut *r).take(header.size as u64).read_to_end(&mut buf)?;
+    if buf.len() < header.size as usize {
+        return Err(Error::invalid(format!(
+            "IFF: chunk {} declares {} bytes but the stream ends after {}",
+            header.id_str(),
+            header.size,
+            buf.len()
+        )));
+    }
     Ok(buf)
 }
 

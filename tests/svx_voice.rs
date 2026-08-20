@@ -732,3 +732,35 @@ fn muxer_rejects_pan_and_routing_on_stereo() {
     assert!(mux.write_header().is_err());
     let _ = std::fs::remove_file(&path);
 }
+
+/// Fuzz regression: a chunk declaring a multi-gigabyte ckSize over a
+/// tiny stream must fail as a truncation error, not pre-allocate the
+/// declared size (the original OOM finding pre-allocated ~3.7 GiB for
+/// a forged VHDR size before the read could fail).
+#[test]
+fn demux_forged_chunk_size_is_truncation_not_allocation() {
+    let mut file = Vec::new();
+    file.extend_from_slice(b"FORM");
+    file.extend_from_slice(&0x4Cu32.to_be_bytes());
+    file.extend_from_slice(b"8SVX");
+    file.extend_from_slice(b"VHDR");
+    file.extend_from_slice(&0xDE00_0000u32.to_be_bytes()); // forged huge size
+    file.extend_from_slice(&[0u8; 20]);
+    let mut containers = oxideav_core::ContainerRegistry::new();
+    oxideav_iff::register_containers(&mut containers);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    assert!(containers
+        .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
+        .is_err());
+
+    // Same class through the whole-FORM demuxers: a BODY / FORM size
+    // past the stream end errors instead of allocating.
+    let h = vhdr(4, 0, 1);
+    let mut svx = build_svx(&h, &[], &[0u8; 4]);
+    let l = svx.len();
+    svx[l - 12..l - 8].copy_from_slice(&0x7FFF_FFF0u32.to_be_bytes()); // BODY size
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(svx));
+    assert!(containers
+        .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
+        .is_err());
+}

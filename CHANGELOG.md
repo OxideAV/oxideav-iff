@@ -63,6 +63,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Streaming-path allocation-order hardening (fuzz finding).** The
+  shared `chunk::read_body` helper and the whole-FORM buffering reads
+  of the 8SVX / ILBM / ACBM / ANIM demuxers pre-allocated the declared
+  32-bit chunk/FORM size before reading, so a forged multi-gigabyte
+  size field over a tiny stream demanded an attacker-sized buffer
+  (the `svx_decode` fuzzer OOM'd on a ~3.7 GiB forged VHDR ckSize).
+  All five paths now grow on read (`take` + `read_to_end`, bounded by
+  the real stream length) and reject the short read as a truncation
+  error — matching the guard the true-colour demuxer already had.
 - *(svx)* **the demuxer dropped the loop (repeat) part of a voice.**
   The per-channel frame count was taken from `oneShotHiSamples` alone,
   so a looping voice misreported its duration and truncated its
@@ -150,6 +159,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FORM DEEP` whole-FORM walkers (`parse_deep_frames`, the TVDC
   table-supplied variant, `extract_deep_jpeg_frames`); ~29.7M-exec
   bounded ASan campaign at introduction, zero findings.
+
+- *(fuzz)* new `svx_decode` libFuzzer target feeding `svx::parse_voice`
+  (the FORM 8SVX structural walker with its typed chunk parsers,
+  Fibonacci expansion, stereo half-split, and octave doubling series)
+  and the registered `iff_8svx` demuxer with a bounded packet drain.
+  The introduction campaign found one real OOM (below) and then ran
+  ~21.2M execs clean under ASan after the fix.
 
 ### Changed
 

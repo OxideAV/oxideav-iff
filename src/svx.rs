@@ -1310,10 +1310,20 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
 
     // Read the whole BODY into memory and decode once. 8SVX voices are
     // typically short (seconds, not hours) so this is fine in practice
-    // and keeps the streaming path trivial.
+    // and keeps the streaming path trivial. Grow-on-read (take +
+    // read_to_end) instead of pre-allocating the declared size, so a
+    // forged 32-bit BODY ckSize over a tiny stream can't demand an
+    // attacker-sized buffer; a short read is then rejected.
     input.seek(SeekFrom::Start(body_offset))?;
-    let mut raw_body = vec![0u8; body_size as usize];
-    input.read_exact(&mut raw_body)?;
+    let mut raw_body = Vec::new();
+    (&mut *input).take(body_size).read_to_end(&mut raw_body)?;
+    if (raw_body.len() as u64) < body_size {
+        return Err(Error::invalid(format!(
+            "8SVX BODY declares {} bytes but the stream ends after {}",
+            body_size,
+            raw_body.len()
+        )));
+    }
     let decoded = decode_body(
         &raw_body,
         compression,

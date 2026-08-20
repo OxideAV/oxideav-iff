@@ -4395,9 +4395,19 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     // Read the rest of the FORM into memory and let parse_ilbm walk it.
     // ILBM files are static images (kilobytes-to-megabytes), not
     // streams — buffering the whole FORM keeps the decode path simple.
+    // Grow-on-read (take + read_to_end) instead of pre-allocating the
+    // declared FORM size, so a forged 32-bit size over a tiny stream
+    // can't demand an attacker-sized buffer; a short read is rejected.
     let body_size = hdr.size as u64 - 4;
-    let mut form_body = vec![0u8; body_size as usize];
-    input.read_exact(&mut form_body)?;
+    let mut form_body = Vec::new();
+    (&mut *input).take(body_size).read_to_end(&mut form_body)?;
+    if (form_body.len() as u64) < body_size {
+        return Err(Error::invalid(format!(
+            "ILBM: FORM declares {} bytes but the stream ends after {}",
+            body_size,
+            form_body.len()
+        )));
+    }
 
     // Reconstruct a contiguous buffer with the FORM header so we can
     // hand it to parse_ilbm verbatim.
@@ -4447,9 +4457,17 @@ fn open_acbm(
             std::str::from_utf8(&form_type).unwrap_or("????")
         )));
     }
+    // Same grow-on-read allocation guard as the ILBM demuxer above.
     let body_size = hdr.size as u64 - 4;
-    let mut form_body = vec![0u8; body_size as usize];
-    input.read_exact(&mut form_body)?;
+    let mut form_body = Vec::new();
+    (&mut *input).take(body_size).read_to_end(&mut form_body)?;
+    if (form_body.len() as u64) < body_size {
+        return Err(Error::invalid(format!(
+            "ACBM: FORM declares {} bytes but the stream ends after {}",
+            body_size,
+            form_body.len()
+        )));
+    }
 
     let mut full = Vec::with_capacity(8 + 4 + form_body.len());
     full.extend_from_slice(b"FORM");
