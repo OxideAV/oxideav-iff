@@ -217,6 +217,12 @@ pub fn fibonacci_decode_channel(body: &[u8]) -> Result<Vec<i8>> {
 /// Decode a whole BODY: takes the compression mode, channel count, and
 /// expected per-channel frame count. Returns interleaved `pcm_s8` bytes
 /// (as produced by the demuxer: L0 R0 L1 R1 …).
+///
+/// A stereo BODY is concatenated halves — the LEFT channel **in full**
+/// (all of its octaves), then the RIGHT channel in full — so the split
+/// point is `body.len() / 2`, not the frame count: a voice whose header
+/// announces fewer frames than the body carries must still split the
+/// channels where the wire actually puts them.
 fn decode_body(
     body: &[u8],
     compression: Compression,
@@ -229,17 +235,14 @@ fn decode_body(
             // stereo we need to convert concatenated halves (L…L R…R)
             // into interleaved (L R L R …).
             if channels <= 1 {
-                return Ok(body.to_vec());
+                let take = frames_per_channel.min(body.len());
+                return Ok(body[..take].to_vec());
             }
-            if body.len() < 2 * frames_per_channel {
-                return Err(Error::invalid(
-                    "8SVX stereo BODY shorter than 2 * frames_per_channel",
-                ));
-            }
-            let (left, rest) = body.split_at(frames_per_channel);
-            let right = &rest[..frames_per_channel];
-            let mut out = Vec::with_capacity(2 * frames_per_channel);
-            for i in 0..frames_per_channel {
+            let half = body.len() / 2;
+            let take = frames_per_channel.min(half);
+            let (left, right) = body.split_at(half);
+            let mut out = Vec::with_capacity(2 * take);
+            for i in 0..take {
                 out.push(left[i]);
                 out.push(right[i]);
             }
@@ -272,33 +275,137 @@ fn decode_body(
     }
 }
 
-// --- VHDR parsing ---------------------------------------------------------
+// --- VHDR — Voice8Header ---------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // VHDR holds metadata that's informational for now
-struct Vhdr {
-    one_shot_hi_samples: u32,
-    repeat_hi_samples: u32,
-    samples_per_hi_cycle: u32,
-    samples_per_sec: u16,
-    ct_octave: u8,
-    compression: u8,
-    volume_fixed: u32,
+/// The 20-byte `VHDR` Voice8Header — the mandatory 8SVX voice header.
+///
+/// A voice holds waveform data for one or more octaves. The one-shot
+/// part is played once and the repeat part is looped; the sum of
+/// [`one_shot_hi_samples`](Self::one_shot_hi_samples) and
+/// [`repeat_hi_samples`](Self::repeat_hi_samples) is the full length of
+/// the **highest** octave waveform, and each following octave waveform
+/// is twice as long as the previous one (`ctOctave` octaves total,
+/// highest octave stored first in BODY).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VoiceHeader {
+    /// Length (in per-channel samples) of the highest-octave one-shot
+    /// part — played once.
+    pub one_shot_hi_samples: u32,
+    /// Length (in per-channel samples) of the highest-octave repeat
+    /// part — looped after the one-shot part.
+    pub repeat_hi_samples: u32,
+    /// Samples per cycle in the highest octave (the waveform period);
+    /// `0` when unknown / not applicable.
+    pub samples_per_hi_cycle: u32,
+    /// Playback sample rate in Hz.
+    pub samples_per_sec: u16,
+    /// Number of octave waveforms stored in BODY (highest first). `0`
+    /// is treated like `1` (a single octave) by the readers here.
+    pub ct_octave: u8,
+    /// `sCompression` byte: `0` = none, `1` = Fibonacci-delta. Decoded
+    /// via [`VoiceHeader::compression`].
+    pub compression_byte: u8,
+    /// Playback volume, 16.16 fixed point: `0` = silent, `0x1_0000` =
+    /// maximum.
+    pub volume: u32,
 }
 
-fn parse_vhdr(body: &[u8]) -> Result<Vhdr> {
-    if body.len() < 20 {
-        return Err(Error::invalid("8SVX VHDR: need 20 bytes"));
+/// Maximum-volume constant for the 16.16 fixed-point `VHDR.volume` /
+/// `EGPoint.dest` fields (`0x1_0000` = 1.0).
+pub const UNITY_VOLUME: u32 = 0x0001_0000;
+
+impl VoiceHeader {
+    /// Parse the 20-byte `VHDR` chunk body.
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.len() < 20 {
+            return Err(Error::invalid("8SVX VHDR: need 20 bytes"));
+        }
+        Ok(VoiceHeader {
+            one_shot_hi_samples: u32::from_be_bytes([body[0], body[1], body[2], body[3]]),
+            repeat_hi_samples: u32::from_be_bytes([body[4], body[5], body[6], body[7]]),
+            samples_per_hi_cycle: u32::from_be_bytes([body[8], body[9], body[10], body[11]]),
+            samples_per_sec: u16::from_be_bytes([body[12], body[13]]),
+            ct_octave: body[14],
+            compression_byte: body[15],
+            volume: u32::from_be_bytes([body[16], body[17], body[18], body[19]]),
+        })
     }
-    Ok(Vhdr {
-        one_shot_hi_samples: u32::from_be_bytes([body[0], body[1], body[2], body[3]]),
-        repeat_hi_samples: u32::from_be_bytes([body[4], body[5], body[6], body[7]]),
-        samples_per_hi_cycle: u32::from_be_bytes([body[8], body[9], body[10], body[11]]),
-        samples_per_sec: u16::from_be_bytes([body[12], body[13]]),
-        ct_octave: body[14],
-        compression: body[15],
-        volume_fixed: u32::from_be_bytes([body[16], body[17], body[18], body[19]]),
-    })
+
+    /// Serialise back to the 20-byte `VHDR` chunk body.
+    pub fn write(&self) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        out[0..4].copy_from_slice(&self.one_shot_hi_samples.to_be_bytes());
+        out[4..8].copy_from_slice(&self.repeat_hi_samples.to_be_bytes());
+        out[8..12].copy_from_slice(&self.samples_per_hi_cycle.to_be_bytes());
+        out[12..14].copy_from_slice(&self.samples_per_sec.to_be_bytes());
+        out[14] = self.ct_octave;
+        out[15] = self.compression_byte;
+        out[16..20].copy_from_slice(&self.volume.to_be_bytes());
+        out
+    }
+
+    /// The decoded [`Compression`] mode, or `Error::unsupported` for a
+    /// code other than 0 / 1.
+    pub fn compression(&self) -> Result<Compression> {
+        Compression::from_vhdr_byte(self.compression_byte)
+    }
+
+    /// Full length of the **highest**-octave waveform in per-channel
+    /// samples: `oneShotHiSamples + repeatHiSamples`.
+    pub fn hi_octave_samples(&self) -> u64 {
+        self.one_shot_hi_samples as u64 + self.repeat_hi_samples as u64
+    }
+
+    /// Length of octave `k` (0 = highest) in per-channel samples. Each
+    /// following octave waveform is twice as long as the previous one.
+    /// `None` on shift overflow or when `k >= ct_octave.max(1)`.
+    pub fn octave_samples(&self, k: u8) -> Option<u64> {
+        if k as u32 >= self.ct_octave.max(1) as u32 {
+            return None;
+        }
+        self.hi_octave_samples().checked_shl(k as u32)
+    }
+
+    /// Total per-channel samples across all `ct_octave` octaves:
+    /// `hi * (2^ct - 1)`. `ct_octave == 0` is treated as one octave.
+    /// Returns `None` when the doubling series overflows `u64` (a
+    /// forged header — no real BODY can back it).
+    pub fn total_samples_per_channel(&self) -> Option<u64> {
+        let ct = self.ct_octave.max(1) as u32;
+        let hi = self.hi_octave_samples();
+        if hi == 0 {
+            return Some(0);
+        }
+        // hi * (2^ct - 1) with overflow checks; ct can be up to 255 on
+        // a hostile header, so go through u128 and reject > u64::MAX.
+        if ct > 64 {
+            return None;
+        }
+        let factor: u128 = (1u128 << ct) - 1;
+        let total = hi as u128 * factor;
+        u64::try_from(total).ok()
+    }
+
+    /// `true` when the voice has a looped repeat part
+    /// (`repeatHiSamples > 0`).
+    pub fn has_loop(&self) -> bool {
+        self.repeat_hi_samples > 0
+    }
+
+    /// Playback volume as a float (`1.0` = maximum).
+    pub fn volume_f32(&self) -> f32 {
+        self.volume as f32 / UNITY_VOLUME as f32
+    }
+
+    /// Fundamental frequency of the highest octave in Hz —
+    /// `samplesPerSec / samplesPerHiCycle` — or `None` when either
+    /// field is zero.
+    pub fn hi_cycle_frequency_hz(&self) -> Option<f64> {
+        if self.samples_per_sec == 0 || self.samples_per_hi_cycle == 0 {
+            return None;
+        }
+        Some(self.samples_per_sec as f64 / self.samples_per_hi_cycle as f64)
+    }
 }
 
 // --- Demuxer --------------------------------------------------------------
@@ -322,7 +429,7 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     // hdr.size counts FORM-type + children bytes; body length = hdr.size - 4.
     let body_limit = input.stream_position()? + hdr.size as u64 - 4;
 
-    let mut vhdr: Option<Vhdr> = None;
+    let mut vhdr: Option<VoiceHeader> = None;
     let mut channels: u16 = 1;
     let mut body_offset: u64 = 0;
     let mut body_size: u64 = 0;
@@ -336,7 +443,7 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
         match &c.id {
             b"VHDR" => {
                 let body = read_body(&mut *input, &c)?;
-                vhdr = Some(parse_vhdr(&body)?);
+                vhdr = Some(VoiceHeader::parse(&body)?);
                 pad_after(&mut *input, &c)?;
             }
             b"CHAN" => {
@@ -345,6 +452,14 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
                 if body.len() >= 4 {
                     let v = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
                     channels = if v == 6 { 2 } else { 1 };
+                    // A mono voice routed to one specific speaker is
+                    // surfaced as metadata — the sample data itself is
+                    // plain mono either way.
+                    match v {
+                        2 => metadata.push(("channel_assignment".into(), "left".into())),
+                        4 => metadata.push(("channel_assignment".into(), "right".into())),
+                        _ => {}
+                    }
                 }
                 pad_after(&mut *input, &c)?;
             }
@@ -375,7 +490,7 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     }
 
     let vhdr = vhdr.ok_or_else(|| Error::invalid("8SVX: missing VHDR chunk"))?;
-    let compression = Compression::from_vhdr_byte(vhdr.compression)?;
+    let compression = vhdr.compression()?;
     if body_size == 0 {
         return Err(Error::invalid("8SVX: missing BODY chunk"));
     }
@@ -383,28 +498,38 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     let sample_rate = vhdr.samples_per_sec as u32;
     let time_base = TimeBase::new(1, sample_rate as i64);
 
-    // Work out the total frame count. VHDR.one_shot_hi_samples counts
-    // frames per channel when it's populated; fall back to deriving from
-    // BODY size (only valid for uncompressed).
-    let frames_per_channel: u64 = if vhdr.one_shot_hi_samples > 0 {
-        vhdr.one_shot_hi_samples as u64
-    } else {
-        match compression {
-            Compression::None => body_size / channels as u64,
-            Compression::Fibonacci => {
-                // (body_size / channels - 2) header bytes per channel,
-                // then 2 decoded samples per remaining byte, plus the
-                // stored initial sample.
-                let per_channel = body_size / channels as u64;
-                if per_channel < 2 {
-                    0
-                } else {
-                    1 + 2 * (per_channel - 2)
-                }
+    // Work out the total frame count per channel. When VHDR is
+    // populated this is the sum of the one-shot and repeat parts of
+    // the highest octave, doubled per additional octave (BODY stores
+    // ctOctave waveforms, highest first, each twice as long as the
+    // previous). Whatever the header claims is bounded by what the
+    // BODY can actually supply; a zeroed header falls back to the
+    // body-derived capacity outright.
+    let body_capacity: u64 = match compression {
+        Compression::None => body_size / channels as u64,
+        Compression::Fibonacci => {
+            // (body_size / channels - 2) header bytes per channel,
+            // then 2 decoded samples per remaining byte, plus the
+            // stored initial sample.
+            let per_channel = body_size / channels as u64;
+            if per_channel < 2 {
+                0
+            } else {
+                1 + 2 * (per_channel - 2)
             }
         }
     };
+    let header_total = vhdr.total_samples_per_channel().unwrap_or(0);
+    let frames_per_channel: u64 = if header_total > 0 {
+        header_total.min(body_capacity)
+    } else {
+        body_capacity
+    };
     let total_frames = frames_per_channel * channels as u64;
+
+    if vhdr.ct_octave > 1 {
+        metadata.push(("octaves".into(), vhdr.ct_octave.to_string()));
+    }
 
     // Read the whole BODY into memory and decode once. 8SVX voices are
     // typically short (seconds, not hours) so this is fine in practice

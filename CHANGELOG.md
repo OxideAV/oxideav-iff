@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(svx)* **public `VoiceHeader` (VHDR Voice8Header) surface.** The
+  20-byte voice header is now a typed public struct with `parse` /
+  `write` round-trip and derived accessors grounded in the staged field
+  semantics: `hi_octave_samples` (oneShot + repeat = full length of the
+  highest-octave waveform), `octave_samples(k)` / 
+  `total_samples_per_channel` (each following octave waveform is twice
+  as long as the previous one; overflow-checked against forged
+  `ctOctave` doubling series), `has_loop`, `volume_f32` (16.16 fixed,
+  `UNITY_VOLUME = 0x10000`), `hi_cycle_frequency_hz`
+  (samplesPerSec / samplesPerHiCycle), and `compression`.
+- *(svx)* the demuxer surfaces `("octaves", n)` metadata for a
+  multi-octave voice and `("channel_assignment", "left"/"right")` for a
+  mono voice a `CHAN` chunk routes to one speaker (`2` = left, `4` =
+  right — previously both silently folded to plain mono).
+
+### Fixed
+
+- *(svx)* **the demuxer dropped the loop (repeat) part of a voice.**
+  The per-channel frame count was taken from `oneShotHiSamples` alone,
+  so a looping voice misreported its duration and truncated its
+  emitted samples; a stereo raw BODY was additionally split at the
+  one-shot count instead of the channel midpoint, interleaving the
+  left channel's repeat part as right-channel data. Per the staged
+  layout the highest-octave waveform is `oneShot + repeat` samples,
+  BODY stores `ctOctave` waveforms back to back (each twice the
+  previous length), and a stereo BODY is LEFT in full then RIGHT in
+  full — the demuxer now derives the frame count from the full octave
+  series (clamped to what BODY actually supplies) and always splits
+  stereo halves at `body_len / 2`.
+
 - *(ilbm)* **TVDC `FORM DEEP` decode/encode end-to-end with a
   caller-supplied table.** `parse_deep_with_tvdc_table` /
   `parse_deep_frames_with_tvdc_table` walk a complete `FORM DEEP` whose
