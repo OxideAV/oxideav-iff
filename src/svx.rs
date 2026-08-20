@@ -381,6 +381,29 @@ impl VoiceHeader {
         self.hi_octave_samples().checked_shl(k as u32)
     }
 
+    /// Length of octave `k`'s **one-shot** part in per-channel
+    /// samples. The whole octave waveform doubles per octave, and its
+    /// one-shot and repeat constituents double with it (the only split
+    /// consistent with `one_shot + repeat` summing to the octave
+    /// length at every octave). Same bounds/overflow behaviour as
+    /// [`octave_samples`](Self::octave_samples).
+    pub fn one_shot_samples(&self, k: u8) -> Option<u64> {
+        if k as u32 >= self.ct_octave.max(1) as u32 {
+            return None;
+        }
+        (self.one_shot_hi_samples as u64).checked_shl(k as u32)
+    }
+
+    /// Length of octave `k`'s looped **repeat** part in per-channel
+    /// samples — the counterpart of
+    /// [`one_shot_samples`](Self::one_shot_samples).
+    pub fn repeat_samples(&self, k: u8) -> Option<u64> {
+        if k as u32 >= self.ct_octave.max(1) as u32 {
+            return None;
+        }
+        (self.repeat_hi_samples as u64).checked_shl(k as u32)
+    }
+
     /// Total per-channel samples across all `ct_octave` octaves:
     /// `hi * (2^ct - 1)`. `ct_octave == 0` is treated as one octave.
     /// Returns `None` when the doubling series overflows `u64` (a
@@ -783,6 +806,22 @@ impl ChannelSamples {
             out.extend_from_slice(o);
         }
         out
+    }
+
+    /// Split octave `k` into its `(one_shot, repeat)` parts per the
+    /// header's [`VoiceHeader::one_shot_samples`] /
+    /// [`VoiceHeader::repeat_samples`] doubling series — the one-shot
+    /// part is played once, the repeat part loops. `None` when octave
+    /// `k` is absent or its stored length doesn't match the header's
+    /// series (e.g. the single-octave fallback of a zeroed header).
+    pub fn loop_split(&self, header: &VoiceHeader, k: u8) -> Option<(&[i8], &[i8])> {
+        let octave = self.octaves.get(k as usize)?;
+        let one_shot = header.one_shot_samples(k)?;
+        let repeat = header.repeat_samples(k)?;
+        if one_shot.checked_add(repeat)? != octave.len() as u64 {
+            return None;
+        }
+        Some(octave.split_at(one_shot as usize))
     }
 }
 

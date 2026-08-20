@@ -764,3 +764,76 @@ fn demux_forged_chunk_size_is_truncation_not_allocation() {
         .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
         .is_err());
 }
+
+/// Loop-split accessors: octave k's one-shot/repeat parts follow the
+/// doubling series, and ChannelSamples::loop_split hands back the two
+/// sample slices.
+#[test]
+fn loop_split_scales_with_octaves() {
+    let header = VoiceHeader {
+        one_shot_hi_samples: 2,
+        repeat_hi_samples: 4,
+        ct_octave: 2,
+        samples_per_sec: 8000,
+        ..VoiceHeader::default()
+    };
+    assert_eq!(header.one_shot_samples(0), Some(2));
+    assert_eq!(header.repeat_samples(0), Some(4));
+    assert_eq!(header.one_shot_samples(1), Some(4));
+    assert_eq!(header.repeat_samples(1), Some(8));
+    assert_eq!(header.one_shot_samples(2), None); // only 2 octaves
+
+    let ch = ChannelSamples {
+        octaves: vec![octave_ramp(6, 0), octave_ramp(12, 20)],
+    };
+    let (one_shot, repeat) = ch.loop_split(&header, 1).unwrap();
+    assert_eq!(one_shot, &ch.octaves[1][..4]);
+    assert_eq!(repeat, &ch.octaves[1][4..]);
+    assert!(ch.loop_split(&header, 2).is_none());
+    // Length mismatch vs the header series → None, not a wrong split.
+    let bad = ChannelSamples {
+        octaves: vec![octave_ramp(7, 0)],
+    };
+    assert!(bad.loop_split(&header, 0).is_none());
+}
+
+/// Multi-octave Fibonacci voice: the compressed stream spans all
+/// octaves of a channel; the octave split happens on the decoded
+/// samples and survives the ±2 LSB codec tolerance.
+#[test]
+fn voice_roundtrip_multi_octave_fibonacci() {
+    let header = VoiceHeader {
+        one_shot_hi_samples: 16,
+        repeat_hi_samples: 16,
+        ct_octave: 2,
+        samples_per_sec: 8000,
+        compression_byte: 1,
+        ..VoiceHeader::default()
+    };
+    // One phase-continuous smooth signal split across the octave
+    // boundary — the channel is Fibonacci-coded as a single stream, so
+    // the ±2 LSB tolerance requires smoothness across the whole BODY,
+    // octave boundary included.
+    let smooth: Vec<i8> = (0..96)
+        .map(|i| (50.0 * (i as f64 * 0.15).sin()) as i8)
+        .collect();
+    let v = voice_of(
+        header,
+        vec![ChannelSamples {
+            octaves: vec![smooth[..32].to_vec(), smooth[32..].to_vec()],
+        }],
+    );
+    let back = parse_voice(&encode_voice(&v).unwrap()).unwrap();
+    assert_eq!(back.octave_count(), 2);
+    assert_eq!(back.channels[0].octaves[0].len(), 32);
+    assert_eq!(back.channels[0].octaves[1].len(), 64);
+    for (o_back, o_orig) in back.channels[0].octaves.iter().zip(&v.channels[0].octaves) {
+        for (a, b) in o_back.iter().zip(o_orig.iter()) {
+            assert!((*a as i32 - *b as i32).abs() <= 2);
+        }
+    }
+    // The loop split works on the round-tripped voice too.
+    let (one_shot, repeat) = back.channels[0].loop_split(&back.header, 0).unwrap();
+    assert_eq!(one_shot.len(), 16);
+    assert_eq!(repeat.len(), 16);
+}
