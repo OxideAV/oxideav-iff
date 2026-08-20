@@ -18,7 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as long as the previous one; overflow-checked against forged
   `ctOctave` doubling series), `has_loop`, `volume_f32` (16.16 fixed,
   `UNITY_VOLUME = 0x10000`), `hi_cycle_frequency_hz`
-  (samplesPerSec / samplesPerHiCycle), and `compression`.
+  (samplesPerSec / samplesPerHiCycle), `compression`, and the
+  per-octave loop-split accessors `one_shot_samples(k)` /
+  `repeat_samples(k)` (both constituents double with the octave
+  waveform), with `ChannelSamples::loop_split` handing back a decoded
+  octave's `(one_shot, repeat)` sample slices.
 - *(svx)* **complete typed 8SVX voice-structure chunk surface** —
   every optional chunk the staged reference documents is now parsed
   and written: `CHAN` (`ChannelAssignment` — mono-left `2` /
