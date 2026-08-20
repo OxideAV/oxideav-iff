@@ -6,7 +6,14 @@ Pure-Rust EA IFF 85 container support for oxideav — the chunk reader
 that underlies the entire `FORM / LIST / CAT` family. Today this
 crate ships:
 
-- **FORM/8SVX** — full read/write (Amiga 8-bit sampled voice).
+- **FORM/8SVX** — full read/write (Amiga 8-bit sampled voice),
+  including the complete voice-structure chunk set: typed `VHDR`
+  (`VoiceHeader` with the one-shot/repeat loop split and the
+  multi-octave doubling series), `CHAN` mono-routing / stereo,
+  `PAN` stereo position, `ATAK`/`RLSE` ADSR volume envelopes,
+  `SEQN`/`FADE` waveform sequencing, and the structural
+  [`svx::parse_voice`] / [`svx::encode_voice`] surface alongside the
+  streaming demuxer/muxer pair.
 - **FORM/ILBM** — read+round-trip (1..=8 indexed bitplanes **and
   24-bit literal-RGB true-colour**, ByteRun1 / Auto compression,
   EHB, HAM6, HAM8, HasMask, transparent-colour keying, GRAB hotspot,
@@ -191,17 +198,45 @@ Full read and write support for `FORM / 8SVX`:
 
 | Feature                                  | Read | Write |
 |------------------------------------------|:----:|:-----:|
-| `VHDR` voice header                      |  Y   |   Y   |
+| `VHDR` voice header (typed `VoiceHeader`) |  Y   |   Y   |
 | Raw PCM (`sCompression = 0`)             |  Y   |   Y   |
 | Fibonacci-delta (`sCompression = 1`)     |  Y   |   Y   |
 | Mono (no `CHAN` chunk, or `CHAN = 2`)    |  Y   |   Y   |
+| Mono-right routing (`CHAN = 4`)          |  Y   |   Y   |
 | Stereo (`CHAN = 6`, concatenated halves) |  Y   |   Y   |
+| One-shot + looped repeat split (`oneShot`/`repeatHiSamples`) | Y | Y |
+| Multi-octave BODY (`ctOctave` doubling series) | Y | Y |
+| `PAN ` mono stereo-position              |  Y   |   Y   |
+| `ATAK` / `RLSE` volume envelopes (ADSR)  |  Y   |   Y   |
+| `SEQN` segment sequencing / `FADE`       |  Y   |   Y   |
 | `NAME` / `AUTH` / `ANNO` / `(c) ` / `CHRS` tags | Y | Y |
 | Sample-exact seek (`Demuxer::seek_to`)    |  Y   |  —   |
 
 - The exposed codec id is `pcm_s8`; Fibonacci-delta compression is
   transparent — decoded on demux, encoded on mux when the caller picks
   `Compression::Fibonacci`.
+- **Two read/write surfaces.** The streaming pair (the `iff_8svx`
+  demuxer + [`svx::SvxMuxer`]) exposes the voice as a flat `pcm_s8`
+  stream: the demuxer derives the frame count from the full VHDR
+  octave series (`oneShot + repeat` doubled per additional octave,
+  clamped to what BODY supplies), emits the stored waveform sequence,
+  and surfaces `("octaves", n)` / `("channel_assignment",
+  "left"/"right")` metadata; the muxer's builder options
+  (`with_volume` / `with_hi_cycle` / `with_repeat` /
+  `with_mono_routing` / `with_pan` / `with_attack` / `with_release` /
+  `with_seqn` / `with_fade`) write every voice-structure chunk, with
+  the one-shot/repeat split patched at trailer time. The structural
+  pair [`svx::parse_voice`] / [`svx::encode_voice`] round-trips the
+  typed [`svx::Voice`] tree — [`svx::VoiceHeader`],
+  [`svx::ChannelAssignment`], [`svx::Pan`] (with `left_weight` /
+  `right_weight` gains), [`svx::Envelope`] of [`svx::EgPoint`]s
+  (with the piecewise-linear `level_at_ms` evaluator),
+  [`svx::Seqn`] (with `validate` enforcing the documented 32-bit
+  offset alignment / ordering / waveform bounds) and [`svx::Fade`] —
+  plus the decoded waveform split per channel and per octave
+  ([`svx::ChannelSamples`], highest octave first). Raw voices
+  round-trip losslessly; Fibonacci within the codec's ±2 LSB
+  tolerance.
 - `seek_to(0, pts)` is sample-exact: 8SVX is keyframe-only PCM and the
   whole BODY is expanded into a flat interleaved frame buffer on
   `open()`, so seek is a constant-time cursor reset. Out-of-range
@@ -1051,7 +1086,7 @@ than decoded here.
 ## Fuzzing
 
 A [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harness
-lives in [`fuzz/`](fuzz/) with four libFuzzer targets covering the
+lives in [`fuzz/`](fuzz/) with five libFuzzer targets covering the
 highest-risk parser surface of the crate:
 
 * `aiff_decode` — feeds arbitrary bytes to
@@ -1088,6 +1123,17 @@ highest-risk parser surface of the crate:
   expansion bounds (ByteRun1 64×, TVDC 15×) that keep a forged
   geometry from demanding an attacker-sized allocation. A bounded
   local ASan campaign at introduction ran ~29.7M execs clean.
+* `svx_decode` — feeds arbitrary bytes to `svx::parse_voice` (the
+  FORM 8SVX structural walker: the 20-byte VHDR decode, the
+  CHAN / PAN / ATAK / RLSE / SEQN / FADE typed chunk parsers with
+  their 6-byte EGPoint / 8-byte segment array strides, the
+  Fibonacci-delta expansion, the stereo concatenated-halves split,
+  and the overflow-checked octave doubling series) and to the
+  registered `iff_8svx` demuxer with a bounded packet drain. The
+  introduction campaign found a real allocation-order OOM (a forged
+  multi-gigabyte ckSize was pre-allocated before the read could
+  fail — fixed across every streaming read path in the crate) and
+  then ran ~21.2M execs clean under ASan.
 
 The contract under test for every target is purely that the call
 *returns*: a malformed input yields `Err(oxideav_core::Error::…)`,
@@ -1102,7 +1148,7 @@ To run a target:
 cargo install cargo-fuzz
 cd crates/oxideav-iff
 cargo +nightly fuzz run aiff_decode
-# or anim_decode / pchg_parse / deep_decode
+# or anim_decode / pchg_parse / deep_decode / svx_decode
 ```
 
 The harness builds under nightly Rust (libFuzzer needs nightly's
