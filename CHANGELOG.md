@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-iff/compare/v0.0.9...v0.0.10) - 2026-08-20
+
+### Other
+
+- record the loop-split accessors under the VoiceHeader entry
+- per-octave loop-split accessors + multi-octave Fibonacci coverage
+- document the 8SVX voice-structure completion
+- svx_decode fuzz target + streaming allocation-order hardening
+- SvxMuxer voice-structure write parity
+- typed voice-structure chunks + parse_voice/encode_voice
+- typed VoiceHeader surface + loop/octave demux fixes
+- *(anim)* container-level iff_anim muxer + encode_anim_op5_timed
+- *(truecolor)* container-level muxers for iff_deep / iff_rgb8 / iff_rgbn
+- document the DEEP TVDC/JPEG closure, §1.5b reject posture, dual-playfield gap, deep_decode fuzz target
+- *(fuzz)* deep_decode target over the three FORM DEEP whole-FORM walkers
+- *(deep)* TVDC-in-FORM walkers, JPEG DBOD surfacing, named §1.5b rejections, dual-playfield priority
+- mark internal plumbing #[doc(hidden)] to shrink semver-tracked surface
+- *(ilbm)* doc-accuracy sweep — CAMG module header + PCHG spec wording
+- *(ilbm)* PCHG robustness — deterministic in-test fuzz + randomised roundtrip property
+- scrub clippy 1.97 byte_char_slices drift (byte-char arrays → byte strs)
+- *(ilbm)* complete CAMG ViewMode/DisplayID bitfield decode
+- *(ilbm)* PCHG wire-layout conformance — LineMask bitmap, spec record shapes, Huffman codec
+- *(ilbm)* apply mskLasso seed-fill on the chunky PBM path too
+- *(ilbm)* implement mskLasso seed-fill transparency (BMHD masking == 3)
+- *(ilbm)* PCHG change-list encoder (Small + Big) closing the big-format write gap
+- add CI / crates.io / docs.rs / MIT-license badges
+- MuxerMode::Acbm — stream a FORM ACBM through IlbmMuxer
+- FORM ACBM / ABIT contiguous-bitmap read + round-trip
+- FORM TVPP (TVPaint project) best-effort decode + iff_tvpp demuxer
+- looping playback lookups for AnimPlayback
+- DEEP per-component channel extraction + Dpel layout queries
+- per-frame timing + AnimPlayback cumulative-timeline driver
+- refresh stale iff_deep module comment for per-DBOD keyframes
+- *(iff)* README — multi-image / cel-anim FORM DEEP
+- DeepMovie::composite_frame — §1.3 DLOC sub-rectangle placement
+- multi-image / cel-anim FORM DEEP decode + encode (§1.4/§1.3/§1.6)
+- FORM DEEP RUNLENGTH (§1.5b ByteRun1) body decode + encode
+- register iff_deep container demuxer + probe
+- register iff_rgb8 / iff_rgbn container demuxers + probes
+- encode→decode round-trip integration tests for RGB8 / RGBN / DEEP
+- FORM DEEP encode — chunky + TVDC deep-raster round-trip
+- FORM RGB8 / RGBN genlock-RLE encode — true-colour round-trip
+- integration tests for FORM RGB8 / RGBN / DEEP true-colour decode
+- top-level FORM DEEP decode + TVDC per-component-line assembler
+- top-level FORM RGB8 / RGBN true-colour decode
+- *(ilbm)* FORM DEEP chunky deep-raster — DGBL/DPEL/DLOC + TVDC + RGBA assembly
+- FORM RGB8 24-bit genlock-RLE BODY decoder (§3.2)
+- FORM RGBN 12-bit genlock-RLE BODY decoder (truecolor §3.1)
+- ANIM op-8 (Anim8 short/long vertical delta) decode + encode
+- honour ANHD interleave field (double-buffering) in delta decode
+- op-1 XOR decodes §2.1 mask plane-subset BODY (full-frame rect)
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - *(svx)* **public `VoiceHeader` (VHDR Voice8Header) surface.** The
