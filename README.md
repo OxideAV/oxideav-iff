@@ -354,7 +354,18 @@ Read + round-trip support for `FORM / ILBM`:
   builds a `Pchg` from scratch. `parse(encode(Big)).lines == lines`
   losslessly; `Small` is 4-bit-per-channel lossy and saturates
   registers above 31. When both `PCHG` and `SHAM` are present, PCHG
-  drives the per-line palette.
+  drives the per-line palette. A chunk that sets **neither**
+  record-format flag (spec-undefined) is resolved by strict
+  validation rather than a guess — Small attempted first, then Big,
+  each under the records-fully-present / registers-within-
+  `MinReg..=MaxReg` / LineData-consumed-exactly tests — and
+  [`ilbm::Pchg::parse_reader`] surfaces the reader policy (`Ok(None)`
+  = ignore the chunk, render from CMAP alone), which the ILBM/ACBM
+  walkers apply. PCHG line indices live in **frame space** (rows as
+  stored in `BODY`, no halving or field-parity adjustment on LACE
+  images — odd lines inherit via their clear LineMask bit);
+  [`ilbm::Pchg::changes_on_even_lines_only`] checks the interlace
+  storage convention.
 
 - `CAMG` surfaces the complete ViewMode / DisplayID bit space: every
   `ViewPort.Modes` flag accessor (`is_ham` / `is_ehb` / `is_lace` /
@@ -365,7 +376,17 @@ Read + round-trip support for `FORM / ILBM`:
   monitor-qualified mode-key constants), junk-bit stripping
   (`view_mode`, `CAMG_JUNK_MASK`), raster-format extraction
   (`format_bits`, `CAMG_FORMAT_MASK`) and the classic "bad CAMG"
-  heuristic (`looks_bad_for_planes`).
+  heuristic (`looks_bad_for_planes`). On top of the bit surface sits
+  the reader policy [`ilbm::Camg::resolve_planar_format`] /
+  [`ilbm::IlbmImage::format_resolution`]: a **missing or broken CAMG
+  on a 6-plane image is assumed HAM6** (the platform vendor's own
+  stated default — "assume HAM and you'll probably be right"); both
+  HAM and EHB set is treated as the garbage longword it is; and the
+  subordinate CMAP-count heuristic only *flags* an inferred 6-plane
+  HAM with > 16 CMAP entries as `ambiguous_ehb` so a caller can offer
+  an EHB override — it never silently overrides the vendor rule. The
+  shared ILBM/ACBM planar render applies this resolution;
+  [`ilbm::encode_ilbm`] stays explicit-only.
 
 - **Dual-playfield** ([`CAMG_DUALPF`] / [`CAMG_PFBA`]): the flag pair is
   fully surfaced — `is_dualpf` / `is_pfba` plus
@@ -467,23 +488,32 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
 | Op 7 — Short / Long Vertical Delta       |  Y   |   Y   |
 | Op 8 — Anim8 short / long Vertical Delta  |  Y   |   Y   |
 
-- Public API: [`anim::parse_anim`], [`anim::encode_anim_op0`],
-  [`anim::encode_anim_op1`], [`anim::encode_op1_body`],
-  [`anim::encode_anim_op2`], [`anim::encode_anim_op3`],
-  [`anim::encode_op23_body`],
-  [`anim::encode_anim_op4`], [`anim::encode_op4_body`],
-  [`anim::encode_anim_op5`], [`anim::encode_anim_op5_timed`],
-  [`anim::encode_op5_body`],
-  [`anim::encode_anim_op7`], [`anim::encode_op7_body`],
-  [`anim::encode_anim_op8`], [`anim::encode_op8_body`],
-  [`anim::AnimImage`], [`anim::Anhd`], [`anim::AnimMuxer`].
+- Public API: [`anim::parse_anim`], the per-op encoders
+  [`anim::encode_anim_op0`] / [`anim::encode_anim_op1`] /
+  [`anim::encode_anim_op2`] / [`anim::encode_anim_op3`] /
+  [`anim::encode_anim_op4`] / [`anim::encode_anim_op5`] /
+  [`anim::encode_anim_op7`] / [`anim::encode_anim_op8`] — **each with
+  an `encode_anim_op*_timed` twin** that authors explicit per-frame
+  §2.1 `abstime` / `reltime` jiffy values into the ANHD (one shared
+  contract: `timing` parallel to `frames`, seed entry accepted for
+  symmetry, length mismatches rejected) — the body-level
+  [`anim::encode_op1_body`] / [`anim::encode_op23_body`] /
+  [`anim::encode_op4_body`] / [`anim::encode_op5_body`] /
+  [`anim::encode_op7_body`] / [`anim::encode_op8_body`],
+  [`anim::AnimImage`], [`anim::Anhd`], [`anim::AnimMuxer`] +
+  [`anim::AnimMuxerOp`].
 - Container id: `"iff_anim"`, probes `FORM....ANIM` and matches
   `.anim` by extension. Multi-frame `rawvideo` / `Rgba` stream;
   every frame is emitted as a keyframe packet.
 - **Container-level muxer**: [`anim::AnimMuxer`] (registered under
   `"iff_anim"`) accepts a `rawvideo` / `Rgba` stream with one packet
-  per frame and emits an **op-5** animation — seed `FORM ILBM` plus
-  `ANHD` + Byte-Vertical-Delta bodies. One shared CMAP is greedy-built
+  per frame and emits an **op-5** animation by default — seed
+  `FORM ILBM` plus `ANHD` + Byte-Vertical-Delta bodies.
+  [`anim::AnimMuxer::with_operation`] selects any other
+  [`anim::AnimMuxerOp`] (op-0 literal, op-1 XOR, op-2/op-3 long/short
+  delta, op-4/op-7/op-8 with short/long data), all driven through the
+  timed encoders so the duration→`reltime` conversion below behaves
+  identically for every operation. One shared CMAP is greedy-built
   from the unique RGB triples of all frames (first-seen order, ≤ 256 —
   ANIM shares a single palette), so an animation with ≤ 256 unique
   colours round-trips pixel-exactly through the `iff_anim` demuxer.
@@ -600,7 +630,7 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
   rejects the XOR (bit 1) and horizontal (bit 4 clear) variants the
   spec gives no separate wire description for, plus any reserved high
   bit per §2.1 "Player code should check undefined bits … to assure
-  they are zero". Op-1 (XOR) and op-8 are open follow-ups.
+  they are zero".
 
 #### Read an ILBM picture
 
@@ -853,16 +883,24 @@ The chunk walker (`chunk.rs`) is format-agnostic; SMUS (music score)
 and MAUD are natural follow-ons that reuse the same FORM/LIST/CAT
 reader.
 
-ANIM coverage spans op-0 (literal), op-1 (XOR ILBM, full-frame),
-op-2/op-3 (Long/Short Delta), op-4 (Generalized short/long Delta),
-op-5 (Byte Vertical Delta), op-7 (Short/Long Vertical Delta), and
-op-8 (Anim8 short/long Vertical Delta) — decode + encode for each.
-Op-1 now decodes both the all-planes and the §2.1 `mask` plane-subset
-XOR BODY for the full-frame rectangle. Remaining ANIM gaps: the op-1
-genuine **sub-rectangle** variant (§2.1 `w` / `h` / `x` / `y`
+ANIM coverage spans op-0 (literal), op-1 (XOR ILBM, full-frame,
+all-planes and §2.1 `mask` plane-subset), op-2/op-3 (Long/Short
+Delta), op-4 (Generalized short/long Delta), op-5 (Byte Vertical
+Delta), op-7 (Short/Long Vertical Delta), and op-8 (Anim8 short/long
+Vertical Delta) — decode + encode for each, every encoder with a
+`_timed` twin authoring explicit §2.1 `abstime`/`reltime`, and every
+operation reachable from the container-level muxer via
+[`anim::AnimMuxer::with_operation`]. Remaining ANIM gaps, each pinned
+to a documentation hole rather than missing code: the op-1 genuine
+**sub-rectangle** variant (§2.1 `w` / `h` / `x` / `y`
 narrower-than-bitmap "XOR mode only" fields) needs a staged wire
 description of the narrower row stride + the rectangle `x` byte/bit
-alignment. The DEEP / TVPP / RGB8 / RGBN true-colour IFF FORMs have a
+alignment; op-4's XOR (`bits` bit 1) and horizontal (bit 4 clear)
+variants have no separate wire description in §2.2.2 and stay
+rejected; operation `74` (ASCII `'J'`, Eric Graham) is *reserved* by
+the 1988 spec with "details to be released later" and no staged
+reference pins its wire format; and no staged reference defines an
+"op-6" at all (the spec's operation enum jumps 5 → 7). The DEEP / TVPP / RGB8 / RGBN true-colour IFF FORMs have a
 staged spec at `docs/image/iff/iff-truecolor-chunks.md`. The
 **RGBN 12-bit genlock-RLE BODY** decoder
 ([`ilbm::decode_rgbn_body`]) decodes the §3.1 stream of 16-bit WORD units
@@ -1086,7 +1124,7 @@ than decoded here.
 ## Fuzzing
 
 A [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harness
-lives in [`fuzz/`](fuzz/) with five libFuzzer targets covering the
+lives in [`fuzz/`](fuzz/) with six libFuzzer targets covering the
 highest-risk parser surface of the crate:
 
 * `aiff_decode` — feeds arbitrary bytes to
@@ -1123,6 +1161,18 @@ highest-risk parser surface of the crate:
   expansion bounds (ByteRun1 64×, TVDC 15×) that keep a forged
   geometry from demanding an attacker-sized allocation. A bounded
   local ASan campaign at introduction ran ~29.7M execs clean.
+* `ilbm_decode` — feeds arbitrary bytes to the whole-FORM raster
+  walkers: `ilbm::parse_ilbm` / `ilbm::parse_acbm` (every ILBM/PBM
+  chunk parser, ByteRun1 row expansion, the planar/chunky/HAM/EHB
+  render passes — including the missing-CAMG HAM6 inference and the
+  PCHG flag-less strict-validation disambiguator — and ABIT plane
+  de-contiguation), `ilbm::parse_rgb8` / `ilbm::parse_rgbn` (the
+  Turbo Silver genlock-RLE count cascades and pixel-budget bounds),
+  `ilbm::parse_tvpp`, and — when the top-level envelope probes as
+  LIST/CAT — the EA IFF 85 §5 group-children grammar walker. The
+  introduction campaign ran ~51.0M execs clean under ASan, with the
+  `pchg_parse` / `anim_decode` targets re-run over the newly added
+  code paths (~49.3M / ~67.7M execs clean).
 * `svx_decode` — feeds arbitrary bytes to `svx::parse_voice` (the
   FORM 8SVX structural walker: the 20-byte VHDR decode, the
   CHAN / PAN / ATAK / RLSE / SEQN / FADE typed chunk parsers with
@@ -1148,7 +1198,7 @@ To run a target:
 cargo install cargo-fuzz
 cd crates/oxideav-iff
 cargo +nightly fuzz run aiff_decode
-# or anim_decode / pchg_parse / deep_decode / svx_decode
+# or anim_decode / pchg_parse / deep_decode / svx_decode / ilbm_decode
 ```
 
 The harness builds under nightly Rust (libFuzzer needs nightly's
