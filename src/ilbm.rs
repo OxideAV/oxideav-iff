@@ -947,9 +947,11 @@ pub struct PchgLine {
 ///   note the on-disk component order is A, R, B, G.
 ///
 /// The two bits are mutually exclusive — both being set is a malformed
-/// PCHG and rejected by [`Pchg::parse`]. When neither bit is set we
-/// default to [`PchgKind::Small`] so callers can rely on a non-`Option`
-/// accessor.
+/// PCHG and rejected by [`Pchg::parse`]. When neither bit is set the
+/// layout is spec-undefined and [`Pchg::parse`] resolves it by
+/// validation (try Small strictly, then Big, else reject — see
+/// [`Pchg::parse_reader`]); [`PchgHeader::kind`] reflects only the
+/// flag word and reports `Small` for such a chunk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PchgKind {
     /// 12-bit channel encoding — packed RGB444 words with a split
@@ -1016,13 +1018,13 @@ pub struct PchgHeader {
 impl PchgHeader {
     /// Decode the [`PchgKind`] from [`Self::flags`].
     ///
-    /// Returns `Big` when flag bit 1 is set, otherwise `Small` (our
-    /// default when no flag bits are set — the spec leaves that
-    /// case undefined — and the
+    /// Returns `Big` when flag bit 1 is set, otherwise `Small` (the
     /// only valid choice when bit 0 is set). [`Pchg::parse`] rejects
-    /// the both-bits-set case before this struct is constructed, so
-    /// the choice here is unambiguous on any header produced by the
-    /// parser.
+    /// the both-bits-set case before this struct is constructed. For
+    /// a flag-less chunk — spec-undefined — this accessor reflects
+    /// only the flag word (`Small`); the record layout the parser
+    /// actually decoded was resolved by strict validation (see
+    /// [`Pchg::parse_reader`]) and may have been `Big`.
     pub fn kind(&self) -> PchgKind {
         if self.flags & 2 != 0 {
             PchgKind::Big
@@ -1068,6 +1070,43 @@ pub struct Pchg {
 
 impl Pchg {
     pub fn parse(body: &[u8]) -> Result<Self> {
+        match Self::parse_reader(body)? {
+            Some(pchg) => Ok(pchg),
+            None => Err(Error::invalid(
+                "ILBM PCHG: neither PCHGF_12BIT nor PCHGF_32BIT is set and \
+                 neither record layout validates against the LineData",
+            )),
+        }
+    }
+
+    /// [`Pchg::parse`] with the staged reader policy for the
+    /// flag-less chunk: `Ok(None)` means "this PCHG is unusable —
+    /// ignore it and render from CMAP alone".
+    ///
+    /// The PCHG spec defines exactly two record layouts, selected by
+    /// [`PCHGF_12BIT`] / [`PCHGF_32BIT`], and no default for a chunk
+    /// that sets neither bit — that case is undefined, the same
+    /// category as the change-count violations the spec calls
+    /// "syntactically incorrect". Rather than guessing (a wrong guess
+    /// mis-parses every record and produces garbage colours for the
+    /// whole image), the staged edge-case reference resolves it by
+    /// **validation**, exploiting that both layouts are self-checking
+    /// against fields the header already carries:
+    ///
+    /// 1. attempt the Small/12-bit parse — consistent only when every
+    ///    changed line's records are fully present, every register
+    ///    lies within `[MinReg, MaxReg]`, and the records consume the
+    ///    LineData exactly to its end;
+    /// 2. otherwise attempt the Big/32-bit parse under the same three
+    ///    tests;
+    /// 3. if neither validates, the chunk is ignored (`Ok(None)`) —
+    ///    a static CMAP palette beats a garbage one.
+    ///
+    /// Small is preferred when both somehow validate: it is the form
+    /// the era's writers overwhelmingly emitted. Chunks with an
+    /// explicit format flag skip the strict gauntlet entirely and
+    /// keep the historical decode tolerance.
+    pub fn parse_reader(body: &[u8]) -> Result<Option<Self>> {
         // Header layout per the PCHG spec:
         // u16 Compression; u16 Flags; i16 StartLine; u16 LineCount;
         // u16 ChangedLines; u16 MinReg; u16 MaxReg; u16 MaxChanges;
@@ -1083,8 +1122,12 @@ impl Pchg {
         let start_line = i16::from_be_bytes([body[4], body[5]]);
         let line_count = u16::from_be_bytes([body[6], body[7]]) as usize;
         // Bytes 8..20 are the ChangedLines / MinReg / MaxReg /
-        // MaxChanges / TotalChanges hints — decode-tolerant, see
-        // `header_matches_payload` for the validation surface.
+        // MaxChanges / TotalChanges hints — decode-tolerant for
+        // flagged chunks (see `header_matches_payload` for the
+        // validation surface), but MinReg/MaxReg become load-bearing
+        // bounds when a flag-less chunk is disambiguated below.
+        let min_reg = u16::from_be_bytes([body[10], body[11]]);
+        let max_reg = u16::from_be_bytes([body[12], body[13]]);
 
         let big = flags & PCHGF_32BIT != 0;
         let small = flags & PCHGF_12BIT != 0;
@@ -1095,15 +1138,14 @@ impl Pchg {
         }
         // The Alpha byte of a BigPaletteChange is only meaningful when
         // the header opts in; otherwise it's declared junk.
-        let use_alpha = big && flags & PCHGF_USE_ALPHA != 0;
+        let use_alpha = flags & PCHGF_USE_ALPHA != 0;
 
-        let lines = match comp {
-            PCHG_COMP_NONE => {
-                decode_pchg_line_data(&body[20..], big, use_alpha, start_line, line_count)?
-            }
+        let expanded;
+        let line_data: &[u8] = match comp {
+            PCHG_COMP_NONE => &body[20..],
             PCHG_COMP_HUFFMAN => {
-                let expanded = pchg_huffman_expand(&body[20..])?;
-                decode_pchg_line_data(&expanded, big, use_alpha, start_line, line_count)?
+                expanded = pchg_huffman_expand(&body[20..])?;
+                &expanded
             }
             other => {
                 return Err(Error::unsupported(format!(
@@ -1112,10 +1154,46 @@ impl Pchg {
             }
         };
 
-        Ok(Self {
+        let lines = if big || small {
+            decode_pchg_line_data(line_data, big, big && use_alpha, start_line, line_count)?
+        } else if let Some(lines) = decode_pchg_line_data_strict(
+            line_data, false, false, start_line, line_count, min_reg, max_reg,
+        ) {
+            lines
+        } else if let Some(lines) = decode_pchg_line_data_strict(
+            line_data, true, use_alpha, start_line, line_count, min_reg, max_reg,
+        ) {
+            lines
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some(Self {
             raw: body.to_vec(),
             lines,
-        })
+        }))
+    }
+
+    /// True when every decoded change record sits on an
+    /// **even-numbered frame line** — the interlace (LACE) storage
+    /// convention.
+    ///
+    /// PCHG line indices live in *frame space*: `StartLine` and the
+    /// LineMask index rows of the image exactly as they appear in
+    /// `BODY` (both fields interleaved), never rows of a single field
+    /// — the spec's own worked example counts a 400-line laced
+    /// picture as lines 0, 2, 4, … So a reader applies a change at
+    /// frame line `n` to frame line `n` directly, with no halving,
+    /// doubling, or field-parity adjustment (odd lines inherit the
+    /// running palette via their clear LineMask bit). On a laced
+    /// display the hardware copper can only be reprogrammed on even
+    /// lines, so writers conventionally emit changes there; odd-line
+    /// changes are legal to *store* but most era viewers will not
+    /// display them. This predicate lets a LACE-aware caller check
+    /// the convention; [`Pchg::parse`] deliberately does not enforce
+    /// it.
+    pub fn changes_on_even_lines_only(&self) -> bool {
+        self.lines.iter().all(|l| l.line % 2 == 0)
     }
 
     /// Return the cumulative palette state at the start of scanline
@@ -1593,6 +1671,107 @@ fn decode_pchg_line_data(
         }
     }
     Ok(out)
+}
+
+/// Strict, validating twin of [`decode_pchg_line_data`] used to
+/// disambiguate a PCHG chunk that sets **neither** record-format flag
+/// (see [`Pchg::parse_reader`]). Returns `None` — "this layout does
+/// not fit" — instead of tolerating damage, under three tests:
+///
+/// * every set LineMask bit's record is fully present (a truncated
+///   count or record fails instead of silently stopping);
+/// * every decoded register index lies within the header's
+///   `[MinReg, MaxReg]` bounds (they exist precisely so a reader can
+///   bound register numbers);
+/// * the records consume the LineData **exactly** to its end — the
+///   strong test, since the two layouts' differing record sizes make
+///   an exact-terminating byte run under one interpretation almost
+///   never exact under the other.
+#[allow(clippy::too_many_arguments)]
+fn decode_pchg_line_data_strict(
+    data: &[u8],
+    big: bool,
+    use_alpha: bool,
+    start_line: i16,
+    line_count: usize,
+    min_reg: u16,
+    max_reg: u16,
+) -> Option<Vec<PchgLine>> {
+    let mask_bytes = line_count.div_ceil(32) * 4;
+    if data.len() < mask_bytes {
+        return None;
+    }
+    let mut cur = mask_bytes;
+    let mut out: Vec<PchgLine> = Vec::new();
+    for li in 0..line_count {
+        if (data[li >> 3] >> (7 - (li & 7))) & 1 == 0 {
+            continue;
+        }
+        let line = (start_line as i32 + li as i32).max(0) as u32;
+        if cur + 2 > data.len() {
+            return None;
+        }
+        let mut entries: Vec<PchgChange> = Vec::new();
+        if big {
+            let cc = u16::from_be_bytes([data[cur], data[cur + 1]]) as usize;
+            cur += 2;
+            for _ in 0..cc {
+                if cur + 6 > data.len() {
+                    return None;
+                }
+                let reg = u16::from_be_bytes([data[cur], data[cur + 1]]);
+                if reg < min_reg || reg > max_reg {
+                    return None;
+                }
+                let a = data[cur + 2];
+                let r = data[cur + 3];
+                let b = data[cur + 4];
+                let g = data[cur + 5];
+                cur += 6;
+                entries.push(PchgChange {
+                    index: reg,
+                    rgb: [r, g, b],
+                    alpha: use_alpha.then_some(a),
+                });
+            }
+        } else {
+            let cc16 = data[cur] as usize;
+            let cc32 = data[cur + 1] as usize;
+            cur += 2;
+            for i in 0..cc16 + cc32 {
+                if cur + 2 > data.len() {
+                    return None;
+                }
+                let word = u16::from_be_bytes([data[cur], data[cur + 1]]);
+                cur += 2;
+                let mut reg = (word >> 12) & 0x0F;
+                if i >= cc16 {
+                    reg += 16;
+                }
+                if reg < min_reg || reg > max_reg {
+                    return None;
+                }
+                let r4 = ((word >> 8) & 0x0F) as u8;
+                let g4 = ((word >> 4) & 0x0F) as u8;
+                let b4 = (word & 0x0F) as u8;
+                entries.push(PchgChange {
+                    index: reg,
+                    rgb: [r4 * 0x11, g4 * 0x11, b4 * 0x11],
+                    alpha: None,
+                });
+            }
+        }
+        if !entries.is_empty() {
+            out.push(PchgLine {
+                line,
+                changes: entries,
+            });
+        }
+    }
+    if cur != data.len() {
+        return None;
+    }
+    Some(out)
 }
 
 /// Expand a Huffman-compressed PCHG payload (`Compression == 1`): an
@@ -2928,7 +3107,9 @@ pub fn parse_ilbm(bytes: &[u8]) -> Result<IlbmImage> {
             b"DEST" => dest = Some(Dest::parse(payload)?),
             b"SPRT" => sprt = Some(Sprt::parse(payload)?),
             b"SHAM" => sham_raw = Some(payload.to_vec()),
-            b"PCHG" => pchg = Some(Pchg::parse(payload)?),
+            // Reader policy for the flag-less chunk: an unvalidatable
+            // PCHG is ignored (render from CMAP alone), not fatal.
+            b"PCHG" => pchg = Pchg::parse_reader(payload)?,
             b"CRNG" => crngs.push(Crng::parse(payload)?),
             b"CCRT" => ccrts.push(Ccrt::parse(payload)?),
             b"DRNG" => drngs.push(Drng::parse(payload)?),
@@ -3539,7 +3720,9 @@ pub fn parse_acbm(bytes: &[u8]) -> Result<IlbmImage> {
             b"DEST" => dest = Some(Dest::parse(payload)?),
             b"SPRT" => sprt = Some(Sprt::parse(payload)?),
             b"SHAM" => sham_raw = Some(payload.to_vec()),
-            b"PCHG" => pchg = Some(Pchg::parse(payload)?),
+            // Reader policy for the flag-less chunk: an unvalidatable
+            // PCHG is ignored (render from CMAP alone), not fatal.
+            b"PCHG" => pchg = Pchg::parse_reader(payload)?,
             b"CRNG" => crngs.push(Crng::parse(payload)?),
             b"CCRT" => ccrts.push(Ccrt::parse(payload)?),
             b"DRNG" => drngs.push(Drng::parse(payload)?),

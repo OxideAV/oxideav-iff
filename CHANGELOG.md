@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* **PCHG flag-less chunk: validate, don't default.** A PCHG
+  that sets neither `PCHGF_12BIT` nor `PCHGF_32BIT` is spec-undefined;
+  instead of guessing Small, `Pchg::parse` now disambiguates by strict
+  validation (records fully present, registers within the header's
+  `MinReg`/`MaxReg` bounds, LineData consumed exactly — Small attempted
+  first, then Big) and the new `Pchg::parse_reader` surfaces the reader
+  policy: `Ok(None)` when neither layout validates, which `parse_ilbm`
+  / `parse_acbm` now treat as "ignore the chunk, render from CMAP
+  alone" rather than failing the whole image. Flagged chunks keep the
+  historical decode tolerance. Also pins the interlace rule — PCHG
+  line indices live in *frame space* (rows as stored in BODY, no
+  halving or field-parity adjustment; odd lines inherit via their
+  clear LineMask bit) — with a round-trip test, and adds
+  `Pchg::changes_on_even_lines_only` for the LACE storage convention.
 - *(svx)* **public `VoiceHeader` (VHDR Voice8Header) surface.** The
   20-byte voice header is now a typed public struct with `parse` /
   `write` round-trip and derived accessors grounded in the staged field
