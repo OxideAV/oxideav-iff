@@ -410,6 +410,40 @@ pub enum PlayfieldPriority {
     Playfield2InFront,
 }
 
+/// Which planar pixel interpretation a decoder should use for an
+/// indexed ILBM/ACBM BODY — the output of
+/// [`Camg::resolve_planar_format`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InferredFormat {
+    /// Plain indexed palette lookup.
+    Indexed,
+    /// Hold-And-Modify (HAM6 at 6 planes, HAM8 at 8).
+    Ham,
+    /// Extra-Half-Brite (32 CMAP entries mirrored at half intensity).
+    Ehb,
+}
+
+/// How the planar pixel format was decided — from a usable `CAMG`, or
+/// inferred from the plane depth when the chunk is absent or broken.
+/// See [`Camg::resolve_planar_format`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormatResolution {
+    /// The interpretation the decode applies.
+    pub format: InferredFormat,
+    /// `true` when the format came from the depth default rather than
+    /// a usable CAMG value (chunk absent, both HAM and EHB set, or
+    /// only non-format "junk" bits set).
+    pub inferred: bool,
+    /// Only ever `true` on an inferred 6-plane HAM: the CMAP holds
+    /// more than 16 entries, which is weak evidence for EHB. The
+    /// vendor default (HAM) still applies — a wrong HAM guess on an
+    /// EHB image produces recognisably smeared colour runs, while a
+    /// wrong EHB guess yields a plausible-looking but wrong picture —
+    /// but this flag lets a caller offer an EHB override instead of
+    /// silently overriding the vendor rule.
+    pub ambiguous_ehb: bool,
+}
+
 /// A parsed `CAMG` viewport mode. `raw` retains every flag bit so a
 /// round-trip preserves the original word.
 #[derive(Clone, Copy, Debug, Default)]
@@ -571,6 +605,64 @@ impl Camg {
         let junk_only = self.raw != 0 && self.raw & !CAMG_JUNK_MASK == 0;
         let zero_deep = self.raw == 0 && n_planes > 5;
         junk_only || zero_deep
+    }
+
+    /// Resolve which planar pixel interpretation a decoder should
+    /// apply, per the vendor's own ViewMode addendum: "If no CAMG
+    /// chunk is present, and image is 6 planes deep, assume HAM and
+    /// you'll probably be right."
+    ///
+    /// Only the old ViewMode bits [`CAMG_HAM`] / [`CAMG_EHB`] are
+    /// considered for the pixel interpretation (the monitor/modeid
+    /// part selects timing, which does not affect pixel
+    /// reconstruction):
+    ///
+    /// 1. exactly one of HAM / EHB set on a usable value — honour it;
+    /// 2. **both** set (not a legal display mode — the signature of a
+    ///    garbage longword), only junk bits set
+    ///    ([`Self::looks_bad_for_planes`]), or the chunk absent
+    ///    (`raw == 0`) — treat the CAMG as unusable and fall to the
+    ///    depth default;
+    /// 3. depth default: 6 planes → HAM6; any other depth → plain
+    ///    indexed (5 or fewer is an ordinary palette image, 7/8 is a
+    ///    deep planar image, not a modified mode).
+    ///
+    /// `cmap_entries` feeds the subordinate CMAP-count heuristic: on
+    /// an inferred 6-plane HAM with more than 16 CMAP entries the
+    /// result is flagged [`FormatResolution::ambiguous_ehb`] so a
+    /// caller can offer an EHB override — writers routinely padded
+    /// CMAP, so the count never *overrides* the vendor default here.
+    pub fn resolve_planar_format(self, n_planes: u8, cmap_entries: usize) -> FormatResolution {
+        let ham = self.raw & CAMG_HAM != 0;
+        let ehb = self.raw & CAMG_EHB != 0;
+        let unusable = (ham && ehb) || self.raw == 0 || self.looks_bad_for_planes(n_planes);
+        if !unusable {
+            let format = if ham {
+                InferredFormat::Ham
+            } else if ehb {
+                InferredFormat::Ehb
+            } else {
+                InferredFormat::Indexed
+            };
+            return FormatResolution {
+                format,
+                inferred: false,
+                ambiguous_ehb: false,
+            };
+        }
+        if n_planes == 6 {
+            FormatResolution {
+                format: InferredFormat::Ham,
+                inferred: true,
+                ambiguous_ehb: cmap_entries > 16,
+            }
+        } else {
+            FormatResolution {
+                format: InferredFormat::Indexed,
+                inferred: true,
+                ambiguous_ehb: false,
+            }
+        }
     }
 
     pub fn to_be_bytes(self) -> [u8; 4] {
@@ -3028,6 +3120,23 @@ impl Default for IlbmImage {
     }
 }
 
+impl IlbmImage {
+    /// The [`FormatResolution`] the indexed-planar decode applied —
+    /// [`Camg::resolve_planar_format`] over this image's CAMG, plane
+    /// depth, and CMAP length. On a file with a usable CAMG this just
+    /// restates the flags; on a 6-plane file with the chunk absent or
+    /// broken it reports the assumed-HAM6 inference (and whether the
+    /// CMAP length makes EHB plausible). Advisory only for the PBM
+    /// (chunky) and 24-bit literal-RGB forms, whose pixel layout is
+    /// not CAMG-driven. Note [`encode_ilbm`] remains explicit-only: a
+    /// caller re-encoding an inferred-HAM image faithfully should set
+    /// [`CAMG_HAM`] on the image first.
+    pub fn format_resolution(&self) -> FormatResolution {
+        self.camg
+            .resolve_planar_format(self.bmhd.n_planes, self.palette.len())
+    }
+}
+
 // ───────────────────── parse_ilbm ─────────────────────
 
 /// Parse an in-memory ILBM file: the outer FORM/ILBM envelope plus
@@ -3463,7 +3572,15 @@ fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<IlbmImage> {
     // map so, like the transparent-colour path, lasso is disabled there.
     // We retain every scanline's palette index to run the fill after the
     // rows are laid out.
-    let do_lasso = bmhd.masking == Masking::Lasso && !camg.is_ham() && !has_mask_plane;
+    //
+    // HAM/EHB are resolved through the staged reader policy rather
+    // than the raw CAMG bits: a missing or broken CAMG on a 6-plane
+    // image is assumed HAM6 (the platform vendor's stated default),
+    // and a CAMG with both HAM and EHB set is treated as garbage.
+    let resolution = camg.resolve_planar_format(bmhd.n_planes, palette.len());
+    let fmt_ham = resolution.format == InferredFormat::Ham;
+    let fmt_ehb = resolution.format == InferredFormat::Ehb;
+    let do_lasso = bmhd.masking == Masking::Lasso && !fmt_ham && !has_mask_plane;
     let mut lasso_indices: Vec<u8> = if do_lasso {
         Vec::with_capacity((width as usize) * (height as usize))
     } else {
@@ -3471,7 +3588,7 @@ fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<IlbmImage> {
     };
 
     // Decide effective default palette (EHB-expanded if requested).
-    let default_palette: Vec<[u8; 3]> = if camg.is_ehb() && palette.len() <= 32 {
+    let default_palette: Vec<[u8; 3]> = if fmt_ehb && palette.len() <= 32 {
         expand_ehb_palette(&palette)
     } else {
         palette.clone()
@@ -3533,7 +3650,7 @@ fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<IlbmImage> {
         } else {
             &default_palette
         };
-        let rgb_row: Vec<[u8; 3]> = if camg.is_ham() {
+        let rgb_row: Vec<[u8; 3]> = if fmt_ham {
             let bits = match n_planes {
                 6 => 4u8, // HAM6
                 8 => 6u8, // HAM8
@@ -3580,7 +3697,7 @@ fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<IlbmImage> {
                     0x00
                 }
             } else if bmhd.masking == Masking::HasTransparentColor
-                && !camg.is_ham()
+                && !fmt_ham
                 && (indices[x] as u16) == bmhd.transparent_color
             {
                 0x00

@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(ilbm)* **HAM6 inference for a missing or broken CAMG.** Per the
+  platform vendor's own ViewMode addendum ("If no CAMG chunk is
+  present, and image is 6 planes deep, assume HAM and you'll probably
+  be right"), the indexed-planar decode now resolves HAM/EHB through
+  `Camg::resolve_planar_format`: exactly one of HAM/EHB set on a
+  usable value is honoured; both set (not a legal display mode),
+  junk-only values, or an absent chunk fall to the depth default —
+  6 planes → HAM6, any other depth → plain indexed. The subordinate
+  CMAP-count heuristic never overrides the default, but an inferred
+  6-plane HAM with more than 16 CMAP entries is flagged
+  `ambiguous_ehb` so callers can offer an EHB override.
+  `IlbmImage::format_resolution` reports what the decode applied
+  (`InferredFormat` + `inferred` + `ambiguous_ehb`). Applies to ILBM
+  and ACBM planar rendering; PBM and 24-bit literal-RGB are
+  unaffected, and `encode_ilbm` stays explicit-only.
 - *(ilbm)* **PCHG flag-less chunk: validate, don't default.** A PCHG
   that sets neither `PCHGF_12BIT` nor `PCHGF_32BIT` is spec-undefined;
   instead of guessing Small, `Pchg::parse` now disambiguates by strict

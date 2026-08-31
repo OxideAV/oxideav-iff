@@ -115,7 +115,17 @@ fn acbm_all_plane_counts_roundtrip() {
         let palette: Vec<[u8; 3]> = (0..entries)
             .map(|i| [(i * 3) as u8, (i * 5) as u8, (i * 7) as u8])
             .collect();
-        let img = indexed_image(11, 7, n_planes, palette);
+        let mut img = indexed_image(11, 7, n_planes, palette);
+        if n_planes == 6 {
+            // A 6-plane file with *no* CAMG is assumed HAM6 by the
+            // reader (the platform vendor's stated default — genuine
+            // 6-plane images are HAM or EHB on OCS/ECS hardware), so a
+            // plain-indexed 6-plane image must self-describe with a
+            // usable, non-HAM/EHB CAMG to round-trip as indexed.
+            img.camg = oxideav_iff::ilbm::Camg {
+                raw: oxideav_iff::ilbm::CAMG_HIRES,
+            };
+        }
         let bytes = encode_acbm(&img).unwrap();
         let dec = parse_acbm(&bytes).unwrap();
         assert_eq!(
