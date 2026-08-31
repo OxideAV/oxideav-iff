@@ -40,6 +40,16 @@ cargo-fuzz = true
 #                    the NOCOMPRESSION / RUNLENGTH / TVDC body
 #                    expansions with their allocation bounds, and
 #                    the JFIF SOI/EOI framing check.
+#  * `ilbm_decode` — feeds arbitrary bytes to the whole-FORM raster
+#                    walkers `parse_ilbm` / `parse_acbm` / `parse_rgb8`
+#                    / `parse_rgbn` / `parse_tvpp` and the EA IFF 85 §5
+#                    LIST/CAT group-children grammar walker. Covers the
+#                    ILBM/PBM chunk parsers, ByteRun1 expansion, the
+#                    planar/chunky/HAM/EHB render passes (with the
+#                    missing-CAMG HAM6 inference), the PCHG flag-less
+#                    strict-validation disambiguator, ABIT
+#                    de-contiguation, and the Turbo Silver genlock-RLE
+#                    decoders.
 #  * `svx_decode`  — feeds arbitrary bytes to `svx::parse_voice` (the
 #                    FORM 8SVX structural walker: VHDR Voice8Header,
 #                    CHAN / PAN / ATAK / RLSE / SEQN / FADE typed
@@ -91,5 +101,11 @@ doc = false
 [[bin]]
 name = "svx_decode"
 path = "fuzz_targets/svx_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ilbm_decode"
+path = "fuzz_targets/ilbm_decode.rs"
 test = false
 doc = false

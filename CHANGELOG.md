@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(fuzz)* **`ilbm_decode` libFuzzer target.** Sixth target covering
+  the whole-FORM raster walkers the harness previously missed:
+  `parse_ilbm` / `parse_acbm` (chunk parsers, ByteRun1 expansion, the
+  planar/chunky/HAM/EHB render passes with the missing-CAMG HAM6
+  inference, the PCHG flag-less strict-validation disambiguator, ABIT
+  de-contiguation), `parse_rgb8` / `parse_rgbn` (Turbo Silver
+  genlock-RLE), `parse_tvpp`, and the EA IFF 85 §5 LIST/CAT
+  group-children grammar walker. Introduction campaign: ~51.0M execs
+  clean under ASan; the `pchg_parse` and `anim_decode` targets were
+  re-run over this round's new code paths (~49.3M / ~67.7M execs
+  clean).
 - *(anim)* **`AnimMuxer::with_operation`.** The container-level
   `iff_anim` muxer can now emit any delta operation the crate encodes
   — `AnimMuxerOp::{Op0, Op1, Op2, Op3, Op4, Op5, Op7, Op8}` (op-4/7/8
