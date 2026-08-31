@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(anim)* **timed-encoder parity across the whole delta family.**
+  `encode_anim_op1_timed`, `encode_anim_op2_timed`,
+  `encode_anim_op3_timed`, `encode_anim_op4_timed`,
+  `encode_anim_op7_timed`, and `encode_anim_op8_timed` join the
+  existing op-0/op-5 pair: every delta operation can now author
+  explicit per-frame §2.1 `abstime` / `reltime` jiffy values into its
+  ANHD, round-tripping through `parse_anim` into the same
+  `frame_timing` / `AnimPlayback` timeline. The untimed wrappers keep
+  the default 1-jiffy pace; timing-length mismatches are rejected
+  uniformly.
 - *(ilbm)* **HAM6 inference for a missing or broken CAMG.** Per the
   platform vendor's own ViewMode addendum ("If no CAMG chunk is
   present, and image is 6 planes deep, assume HAM and you'll probably

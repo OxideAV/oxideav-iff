@@ -2380,6 +2380,31 @@ fn encode_op5_column(
 ///
 /// Compatible with the in-tree [`parse_anim`] op-5 decoder; tested via
 /// `tests/anim_op5.rs`.
+/// `frames.len()` entries of the default 1-jiffy [`FrameTiming`] used
+/// by the untimed `encode_anim_op*` wrappers.
+fn default_timing(n: usize) -> Vec<FrameTiming> {
+    vec![
+        FrameTiming {
+            rel_time: 1,
+            abs_time: 0,
+        };
+        n
+    ]
+}
+
+/// Shared timing-length validation for the `encode_anim_op*_timed`
+/// family: `timing` must be parallel to `frames` (the seed's entry is
+/// accepted for caller symmetry even though the seed carries no ANHD).
+fn check_timing_len(op: &str, frames: usize, timing: &[FrameTiming]) -> Result<()> {
+    if timing.len() != frames {
+        return Err(Error::invalid(format!(
+            "ANIM {op} timed encode: timing has {} entries, expected {frames} (one per frame)",
+            timing.len()
+        )));
+    }
+    Ok(())
+}
+
 pub fn encode_anim_op5(frames: &[IlbmImage]) -> Result<Vec<u8>> {
     let timing = vec![
         FrameTiming {
@@ -2538,11 +2563,28 @@ pub fn encode_op1_body(
 /// fields. Compatible with the in-tree [`parse_anim`] op-1 decoder;
 /// tested via `tests/anim_op1.rs`.
 pub fn encode_anim_op1(frames: &[IlbmImage]) -> Result<Vec<u8>> {
+    encode_anim_op1_timed(frames, &default_timing(frames.len()))
+}
+
+/// [`encode_anim_op1`] with explicit per-frame [`FrameTiming`] written
+/// into each delta frame's `ANHD` (§2.1 `abstime` / `reltime`, jiffies
+/// of 1/60 s).
+///
+/// `timing` is parallel to `frames`; `timing[0]` describes the seed
+/// (always displayed at t = 0, carries no `ANHD` here) and is accepted
+/// for caller symmetry, while `timing[i]` for `i >= 1` supplies delta
+/// frame `i`'s `rel_time` / `abs_time` — frame `i-1` stays on screen
+/// for `timing[i].rel_time` jiffies before frame `i` replaces it.
+/// Round-trips through [`parse_anim`] into the same
+/// [`AnimImage::frame_timing`] and the derived [`AnimPlayback`]
+/// timeline.
+pub fn encode_anim_op1_timed(frames: &[IlbmImage], timing: &[FrameTiming]) -> Result<Vec<u8>> {
     if frames.is_empty() {
         return Err(Error::invalid(
             "ANIM op 1 encode: at least one frame required",
         ));
     }
+    check_timing_len("op 1", frames.len(), timing)?;
     let leading = crate::ilbm::encode_ilbm(&frames[0])?;
     let mut out = Vec::new();
     out.extend_from_slice(b"FORM");
@@ -2555,7 +2597,7 @@ pub fn encode_anim_op1(frames: &[IlbmImage]) -> Result<Vec<u8>> {
 
     let mut prev_planar = rgba_to_planar(&frames[0]);
 
-    for frame in &frames[1..] {
+    for (frame, t) in frames[1..].iter().zip(timing[1..].iter()) {
         let cur_planar = rgba_to_planar(frame);
         let body = encode_op1_body(&prev_planar, &cur_planar, &frame.bmhd)?;
         let n_planes = frame.bmhd.n_planes as usize;
@@ -2568,8 +2610,8 @@ pub fn encode_anim_op1(frames: &[IlbmImage]) -> Result<Vec<u8>> {
             h: frame.bmhd.height,
             x: 0,
             y: 0,
-            abs_time: 0,
-            rel_time: 1,
+            abs_time: t.abs_time,
+            rel_time: t.rel_time,
             // Delta computed against the immediately-previous frame:
             // tag `interleave = 1` so the decoder applies it one frame
             // back (not the §2.1 `0` double-buffer default of two).
@@ -2899,6 +2941,26 @@ pub fn encode_op7_body(
 /// Compatible with the in-tree [`parse_anim`] op-7 decoder; tested
 /// via `tests/anim_op7_encode.rs`.
 pub fn encode_anim_op7(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>> {
+    encode_anim_op7_timed(frames, long_data, &default_timing(frames.len()))
+}
+
+/// [`encode_anim_op7`] with explicit per-frame [`FrameTiming`] written
+/// into each delta frame's `ANHD` (§2.1 `abstime` / `reltime`, jiffies
+/// of 1/60 s).
+///
+/// `timing` is parallel to `frames`; `timing[0]` describes the seed
+/// (always displayed at t = 0, carries no `ANHD` here) and is accepted
+/// for caller symmetry, while `timing[i]` for `i >= 1` supplies delta
+/// frame `i`'s `rel_time` / `abs_time` — frame `i-1` stays on screen
+/// for `timing[i].rel_time` jiffies before frame `i` replaces it.
+/// Round-trips through [`parse_anim`] into the same
+/// [`AnimImage::frame_timing`] and the derived [`AnimPlayback`]
+/// timeline.
+pub fn encode_anim_op7_timed(
+    frames: &[IlbmImage],
+    long_data: bool,
+    timing: &[FrameTiming],
+) -> Result<Vec<u8>> {
     if frames.is_empty() {
         return Err(Error::invalid(
             "ANIM op 7 encode: at least one frame required",
@@ -2910,6 +2972,7 @@ pub fn encode_anim_op7(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
             frames[0].bmhd.n_planes
         )));
     }
+    check_timing_len("op 7", frames.len(), timing)?;
     let leading = crate::ilbm::encode_ilbm(&frames[0])?;
     let mut out = Vec::new();
     out.extend_from_slice(b"FORM");
@@ -2922,7 +2985,7 @@ pub fn encode_anim_op7(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
 
     let mut prev_planar = rgba_to_planar(&frames[0]);
 
-    for frame in &frames[1..] {
+    for (frame, t) in frames[1..].iter().zip(timing[1..].iter()) {
         let cur_planar = rgba_to_planar(frame);
         let dlta = encode_op7_body(&prev_planar, &cur_planar, &frame.bmhd, long_data)?;
         let anhd = Anhd {
@@ -2932,8 +2995,8 @@ pub fn encode_anim_op7(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
             h: frame.bmhd.height,
             x: frame.bmhd.x_origin,
             y: frame.bmhd.y_origin,
-            abs_time: 0,
-            rel_time: 1,
+            abs_time: t.abs_time,
+            rel_time: t.rel_time,
             // Delta against the immediately-previous frame ⇒ one frame
             // back (§2.1 `interleave`), not the `0` two-back default.
             interleave: 1,
@@ -3193,6 +3256,26 @@ pub fn encode_op8_body(
 /// Compatible with the in-tree [`parse_anim`] op-8 decoder; tested via
 /// `tests/anim_op8_encode.rs`.
 pub fn encode_anim_op8(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>> {
+    encode_anim_op8_timed(frames, long_data, &default_timing(frames.len()))
+}
+
+/// [`encode_anim_op8`] with explicit per-frame [`FrameTiming`] written
+/// into each delta frame's `ANHD` (§2.1 `abstime` / `reltime`, jiffies
+/// of 1/60 s).
+///
+/// `timing` is parallel to `frames`; `timing[0]` describes the seed
+/// (always displayed at t = 0, carries no `ANHD` here) and is accepted
+/// for caller symmetry, while `timing[i]` for `i >= 1` supplies delta
+/// frame `i`'s `rel_time` / `abs_time` — frame `i-1` stays on screen
+/// for `timing[i].rel_time` jiffies before frame `i` replaces it.
+/// Round-trips through [`parse_anim`] into the same
+/// [`AnimImage::frame_timing`] and the derived [`AnimPlayback`]
+/// timeline.
+pub fn encode_anim_op8_timed(
+    frames: &[IlbmImage],
+    long_data: bool,
+    timing: &[FrameTiming],
+) -> Result<Vec<u8>> {
     if frames.is_empty() {
         return Err(Error::invalid(
             "ANIM op 8 encode: at least one frame required",
@@ -3204,6 +3287,7 @@ pub fn encode_anim_op8(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
             frames[0].bmhd.n_planes
         )));
     }
+    check_timing_len("op 8", frames.len(), timing)?;
     let leading = crate::ilbm::encode_ilbm(&frames[0])?;
     let mut out = Vec::new();
     out.extend_from_slice(b"FORM");
@@ -3216,7 +3300,7 @@ pub fn encode_anim_op8(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
 
     let mut prev_planar = rgba_to_planar(&frames[0]);
 
-    for frame in &frames[1..] {
+    for (frame, t) in frames[1..].iter().zip(timing[1..].iter()) {
         let cur_planar = rgba_to_planar(frame);
         let dlta = encode_op8_body(&prev_planar, &cur_planar, &frame.bmhd, long_data)?;
         let anhd = Anhd {
@@ -3226,8 +3310,8 @@ pub fn encode_anim_op8(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
             h: frame.bmhd.height,
             x: frame.bmhd.x_origin,
             y: frame.bmhd.y_origin,
-            abs_time: 0,
-            rel_time: 1,
+            abs_time: t.abs_time,
+            rel_time: t.rel_time,
             // Delta against the immediately-previous frame ⇒ one frame
             // back (§2.1 `interleave`), not the `0` two-back default.
             interleave: 1,
@@ -3486,6 +3570,26 @@ pub fn encode_op4_body(
 /// Compatible with the in-tree [`parse_anim`] op-4 decoder; tested via
 /// `tests/anim_op4.rs`.
 pub fn encode_anim_op4(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>> {
+    encode_anim_op4_timed(frames, long_data, &default_timing(frames.len()))
+}
+
+/// [`encode_anim_op4`] with explicit per-frame [`FrameTiming`] written
+/// into each delta frame's `ANHD` (§2.1 `abstime` / `reltime`, jiffies
+/// of 1/60 s).
+///
+/// `timing` is parallel to `frames`; `timing[0]` describes the seed
+/// (always displayed at t = 0, carries no `ANHD` here) and is accepted
+/// for caller symmetry, while `timing[i]` for `i >= 1` supplies delta
+/// frame `i`'s `rel_time` / `abs_time` — frame `i-1` stays on screen
+/// for `timing[i].rel_time` jiffies before frame `i` replaces it.
+/// Round-trips through [`parse_anim`] into the same
+/// [`AnimImage::frame_timing`] and the derived [`AnimPlayback`]
+/// timeline.
+pub fn encode_anim_op4_timed(
+    frames: &[IlbmImage],
+    long_data: bool,
+    timing: &[FrameTiming],
+) -> Result<Vec<u8>> {
     if frames.is_empty() {
         return Err(Error::invalid(
             "ANIM op 4 encode: at least one frame required",
@@ -3497,6 +3601,7 @@ pub fn encode_anim_op4(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
             frames[0].bmhd.n_planes
         )));
     }
+    check_timing_len("op 4", frames.len(), timing)?;
     let leading = crate::ilbm::encode_ilbm(&frames[0])?;
     let mut out = Vec::new();
     out.extend_from_slice(b"FORM");
@@ -3509,7 +3614,7 @@ pub fn encode_anim_op4(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
 
     let mut prev_planar = rgba_to_planar(&frames[0]);
 
-    for frame in &frames[1..] {
+    for (frame, t) in frames[1..].iter().zip(timing[1..].iter()) {
         let cur_planar = rgba_to_planar(frame);
         let dlta = encode_op4_body(&prev_planar, &cur_planar, &frame.bmhd, long_data)?;
         let anhd = Anhd {
@@ -3519,8 +3624,8 @@ pub fn encode_anim_op4(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>>
             h: frame.bmhd.height,
             x: frame.bmhd.x_origin,
             y: frame.bmhd.y_origin,
-            abs_time: 0,
-            rel_time: 1,
+            abs_time: t.abs_time,
+            rel_time: t.rel_time,
             // Delta against the immediately-previous frame ⇒ one frame
             // back (§2.1 `interleave`), not the `0` two-back default.
             interleave: 1,
@@ -3723,7 +3828,29 @@ pub fn encode_anim_op3(frames: &[IlbmImage]) -> Result<Vec<u8>> {
 /// op-5 / op-7 encoders' shape. `ANHD.bits` stays 0 — the spec
 /// defines option bits for methods 4 and 5 only and recommends zero
 /// elsewhere.
+/// [`encode_anim_op2`] (Long Delta) with explicit per-frame
+/// [`FrameTiming`] — see [`encode_anim_op1_timed`] for the timing
+/// contract shared by the whole `_timed` family.
+pub fn encode_anim_op2_timed(frames: &[IlbmImage], timing: &[FrameTiming]) -> Result<Vec<u8>> {
+    encode_anim_op23_timed(frames, true, timing)
+}
+
+/// [`encode_anim_op3`] (Short Delta) with explicit per-frame
+/// [`FrameTiming`] — see [`encode_anim_op1_timed`] for the timing
+/// contract shared by the whole `_timed` family.
+pub fn encode_anim_op3_timed(frames: &[IlbmImage], timing: &[FrameTiming]) -> Result<Vec<u8>> {
+    encode_anim_op23_timed(frames, false, timing)
+}
+
 fn encode_anim_op23(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>> {
+    encode_anim_op23_timed(frames, long_data, &default_timing(frames.len()))
+}
+
+fn encode_anim_op23_timed(
+    frames: &[IlbmImage],
+    long_data: bool,
+    timing: &[FrameTiming],
+) -> Result<Vec<u8>> {
     let operation = if long_data { 2 } else { 3 };
     if frames.is_empty() {
         return Err(Error::invalid(format!(
@@ -3736,6 +3863,7 @@ fn encode_anim_op23(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>> {
             frames[0].bmhd.n_planes
         )));
     }
+    check_timing_len("op 2/3", frames.len(), timing)?;
     let leading = crate::ilbm::encode_ilbm(&frames[0])?;
     let mut out = Vec::new();
     out.extend_from_slice(b"FORM");
@@ -3748,7 +3876,7 @@ fn encode_anim_op23(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>> {
 
     let mut prev_planar = rgba_to_planar(&frames[0]);
 
-    for frame in &frames[1..] {
+    for (frame, t) in frames[1..].iter().zip(timing[1..].iter()) {
         let cur_planar = rgba_to_planar(frame);
         let dlta = encode_op23_body(&prev_planar, &cur_planar, &frame.bmhd, long_data)?;
         let anhd = Anhd {
@@ -3758,8 +3886,8 @@ fn encode_anim_op23(frames: &[IlbmImage], long_data: bool) -> Result<Vec<u8>> {
             h: frame.bmhd.height,
             x: frame.bmhd.x_origin,
             y: frame.bmhd.y_origin,
-            abs_time: 0,
-            rel_time: 1,
+            abs_time: t.abs_time,
+            rel_time: t.rel_time,
             // Delta against the immediately-previous frame ⇒ one frame
             // back (§2.1 `interleave`), not the `0` two-back default.
             interleave: 1,
