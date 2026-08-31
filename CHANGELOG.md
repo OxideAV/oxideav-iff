@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(anim)* **`AnimMuxer::with_operation`.** The container-level
+  `iff_anim` muxer can now emit any delta operation the crate encodes
+  — `AnimMuxerOp::{Op0, Op1, Op2, Op3, Op4, Op5, Op7, Op8}` (op-4/7/8
+  with short/long data selection) — instead of op-5 only; the default
+  is unchanged. In support, the op-0 encoder's full-BODY builder now
+  honours `BMHD.compression` (§2.1: the delta BODY "may be any other
+  legal compression mode as indicated by the BMHD") — previously a
+  ByteRun1-flagged frame set produced literal BODYs that decoded as
+  garbage — and rejects the encoder-only `Auto` meta value since every
+  delta BODY must match the seed's written BMHD.
 - *(anim)* **timed-encoder parity across the whole delta family.**
   `encode_anim_op1_timed`, `encode_anim_op2_timed`,
   `encode_anim_op3_timed`, `encode_anim_op4_timed`,

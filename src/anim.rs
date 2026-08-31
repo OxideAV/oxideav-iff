@@ -206,11 +206,50 @@ impl Demuxer for AnimDemuxer {
 
 // ───────────────────── container-level ANIM muxer ─────────────────────
 
+/// Which §2.1 delta operation [`AnimMuxer`] writes for frames 1..N.
+///
+/// Every variant shares the muxer's model: seed `FORM ILBM` + one
+/// delta frame per following packet, one greedy-built CMAP for the
+/// whole animation, packet durations converted to jiffy `reltime`s.
+/// The long-data variants of op-4 and op-7 require `row_bytes` to be
+/// a multiple of 4 (the 4-byte item width); op-8 instead word-splits
+/// an odd-long plane per its §3.2 trailing-WORD-column rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnimMuxerOp {
+    /// Op-0 — full literal BODY per frame (the universal fallback).
+    Op0,
+    /// Op-1 — XOR ILBM mode (full-frame rectangle, all planes).
+    Op1,
+    /// Op-2 — Long Delta mode.
+    Op2,
+    /// Op-3 — Short Delta mode.
+    Op3,
+    /// Op-4 — Generalized short/long Delta.
+    Op4 {
+        /// 4-byte data items when set (`ANHD.bits` bit 0).
+        long_data: bool,
+    },
+    /// Op-5 — Byte Vertical Delta (the DPaint III workhorse). Default.
+    #[default]
+    Op5,
+    /// Op-7 — Short/Long Vertical Delta.
+    Op7 {
+        /// 4-byte data items when set (`ANHD.bits` bit 0).
+        long_data: bool,
+    },
+    /// Op-8 — Anim8 short/long vertical delta.
+    Op8 {
+        /// 4-byte data items when set (`ANHD.bits` bit 0).
+        long_data: bool,
+    },
+}
+
 /// Container-level `FORM ANIM` muxer (`iff_anim`). Accepts a single
 /// `rawvideo` / `Rgba` video stream and one packet per frame, and emits an
-/// op-5 (Byte Vertical Delta — the DeluxePaint workhorse) animation: the
-/// seed frame is a full `FORM ILBM`, every later frame an `ANHD` + delta
-/// `BODY` against the previous frame.
+/// animation using the [`AnimMuxerOp`] selected by
+/// [`AnimMuxer::with_operation`] (default op-5, Byte Vertical Delta — the
+/// DeluxePaint workhorse): the seed frame is a full `FORM ILBM`, every
+/// later frame an `ANHD` + delta chunk against the previous frame.
 ///
 /// * **Palette**: one shared CMAP is greedy-built from the unique RGB
 ///   triples of *all* frames (first-seen order, capped at 256 — ANIM
@@ -232,6 +271,7 @@ pub struct AnimMuxer {
     width: u16,
     height: u16,
     time_base: TimeBase,
+    op: AnimMuxerOp,
     frames: Vec<Vec<u8>>,
     durations: Vec<Option<i64>>,
     written: bool,
@@ -246,10 +286,19 @@ impl AnimMuxer {
             width,
             height,
             time_base,
+            op: AnimMuxerOp::default(),
             frames: Vec::new(),
             durations: Vec::new(),
             written: false,
         })
+    }
+
+    /// Select which delta operation the trailer writes (default
+    /// [`AnimMuxerOp::Op5`]). Builder-style; call before
+    /// `write_trailer`.
+    pub fn with_operation(mut self, op: AnimMuxerOp) -> Self {
+        self.op = op;
+        self
     }
 
     /// Convert a packet duration (stream time-base ticks) to §2.1 jiffies
@@ -362,7 +411,16 @@ impl Muxer for AnimMuxer {
             });
         }
 
-        let form = encode_anim_op5_timed(&images, &timing)?;
+        let form = match self.op {
+            AnimMuxerOp::Op0 => encode_anim_op0_timed(&images, &timing)?,
+            AnimMuxerOp::Op1 => encode_anim_op1_timed(&images, &timing)?,
+            AnimMuxerOp::Op2 => encode_anim_op2_timed(&images, &timing)?,
+            AnimMuxerOp::Op3 => encode_anim_op3_timed(&images, &timing)?,
+            AnimMuxerOp::Op4 { long_data } => encode_anim_op4_timed(&images, long_data, &timing)?,
+            AnimMuxerOp::Op5 => encode_anim_op5_timed(&images, &timing)?,
+            AnimMuxerOp::Op7 { long_data } => encode_anim_op7_timed(&images, long_data, &timing)?,
+            AnimMuxerOp::Op8 { long_data } => encode_anim_op8_timed(&images, long_data, &timing)?,
+        };
         self.output.write_all(&form)?;
         self.output.flush()?;
         self.written = true;
@@ -4059,10 +4117,23 @@ pub fn encode_anim_op0_timed(frames: &[IlbmImage], timing: &[FrameTiming]) -> Re
     Ok(out)
 }
 
-/// Build a single uncompressed planar BODY for `image` (no ByteRun1).
-/// Used only by the op-0 encoder.
+/// Build a full planar BODY for `image`, packed per `BMHD.compression`
+/// (§2.1: an op-0 delta "BODY will normally be a standard
+/// run-length-encoded data chunk (but may be any other legal
+/// compression mode as indicated by the BMHD)"). `Auto` is an
+/// encoder-only meta value that a caller must resolve before an ANIM
+/// encode — the seed's written BMHD governs every delta BODY, so a
+/// per-frame coin toss would desynchronise them. Used only by the
+/// op-0 encoder.
 fn encode_full_body(image: &IlbmImage) -> Result<Vec<u8>> {
     let bmhd = image.bmhd;
+    if bmhd.compression == crate::ilbm::Compression::Auto {
+        return Err(Error::invalid(
+            "ANIM op 0 encode: resolve BMHD compression to None or ByteRun1 first \
+             (Auto is an encoder-only meta value and delta BODYs must match the seed's BMHD)",
+        ));
+    }
+    let pack = bmhd.compression == crate::ilbm::Compression::ByteRun1;
     let n_planes = bmhd.n_planes as usize;
     let row_bytes = bmhd.row_bytes();
     let has_mask = bmhd.masking == Masking::HasMask;
@@ -4103,10 +4174,18 @@ fn encode_full_body(image: &IlbmImage) -> Result<Vec<u8>> {
         }
         let plane_rows = indices_to_planar_row(&indices, bmhd.n_planes, row_bytes);
         for pr in plane_rows {
-            out.extend_from_slice(&pr);
+            if pack {
+                out.extend_from_slice(&crate::ilbm::byterun1_encode_row(&pr));
+            } else {
+                out.extend_from_slice(&pr);
+            }
         }
         if has_mask {
-            out.extend_from_slice(&mask);
+            if pack {
+                out.extend_from_slice(&crate::ilbm::byterun1_encode_row(&mask));
+            } else {
+                out.extend_from_slice(&mask);
+            }
         }
     }
     Ok(out)
