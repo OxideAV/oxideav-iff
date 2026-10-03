@@ -160,6 +160,7 @@ pub mod precedence;
 pub mod saxel;
 pub mod text;
 
+#[cfg(feature = "registry")]
 pub mod demuxer;
 
 pub use aesd::{parse_aesd_chunk, write_aesd_chunk, AesdChunk, Emphasis};
@@ -184,6 +185,7 @@ pub use precedence::ChunkClass;
 pub use saxel::{parse_saxel_chunk, write_saxel_chunk, Saxel, SaxelChunk};
 pub use text::{parse_text_chunk, write_text_chunk, TextChunk, TextKind};
 
+#[cfg(feature = "registry")]
 pub use demuxer::{make_demuxer, register, AiffDemuxer, FORMAT_NAME};
 
 /// Codec id string under which the demuxer factory installs itself

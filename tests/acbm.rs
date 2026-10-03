@@ -436,7 +436,7 @@ fn acbm_rejects_compressed_abit() {
     // BMHD layout: width(2) height(2) x(2) y(2) nplanes(1) masking(1) compression(1)
     tampered[bmhd_off + 8 + 10] = 1;
     let err = parse_acbm(&tampered).unwrap_err();
-    assert!(matches!(err, Error::Unsupported(_)));
+    assert!(matches!(err, oxideav_iff::IffError::Unsupported(_)));
 }
 
 #[test]
@@ -444,7 +444,7 @@ fn acbm_rejects_24bit() {
     let mut img = indexed_image(8, 2, 1, pal16());
     img.bmhd.n_planes = 24;
     let err = encode_acbm(&img).unwrap_err();
-    assert!(matches!(err, Error::InvalidData(_)));
+    assert!(matches!(err, oxideav_iff::IffError::InvalidData(_)));
 }
 
 #[test]
@@ -452,7 +452,7 @@ fn acbm_encode_rejects_pbm() {
     let mut img = indexed_image(8, 2, 8, pal16());
     img.form_type = *b"PBM ";
     let err = encode_acbm(&img).unwrap_err();
-    assert!(matches!(err, Error::InvalidData(_)));
+    assert!(matches!(err, oxideav_iff::IffError::InvalidData(_)));
 }
 
 #[test]
@@ -460,7 +460,7 @@ fn acbm_parse_rejects_wrong_form_type() {
     let bytes = encode_ilbm(&indexed_image(8, 2, 2, pal16())).unwrap();
     // This is a FORM ILBM, not ACBM.
     let err = parse_acbm(&bytes).unwrap_err();
-    assert!(matches!(err, Error::InvalidData(_)));
+    assert!(matches!(err, oxideav_iff::IffError::InvalidData(_)));
 }
 
 #[test]
@@ -476,7 +476,7 @@ fn acbm_parse_rejects_missing_abit() {
     file.extend_from_slice(&(form.len() as u32).to_be_bytes());
     file.extend_from_slice(&form);
     let err = parse_acbm(&file).unwrap_err();
-    assert!(matches!(err, Error::InvalidData(_)));
+    assert!(matches!(err, oxideav_iff::IffError::InvalidData(_)));
 }
 
 #[test]
@@ -499,7 +499,7 @@ fn acbm_parse_rejects_truncated_abit() {
     file.extend_from_slice(&(form.len() as u32).to_be_bytes());
     file.extend_from_slice(&form);
     let err = parse_acbm(&file).unwrap_err();
-    assert!(matches!(err, Error::InvalidData(_)));
+    assert!(matches!(err, oxideav_iff::IffError::InvalidData(_)));
     let _ = bytes;
 }
 

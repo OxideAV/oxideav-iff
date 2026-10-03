@@ -7,7 +7,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use oxideav_core::{Error, Result};
+use crate::error::{IffError as Error, Result};
 
 /// FourCC constants for the three group chunk types.
 pub const GROUP_FORM: [u8; 4] = *b"FORM";

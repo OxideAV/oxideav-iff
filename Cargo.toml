@@ -12,6 +12,87 @@ readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-iff"
 keywords = ["multimedia", "iff", "aiff", "container", "pure-rust"]
 categories = ["multimedia", "parser-implementations"]
+# crates.io caps a package at 10 MiB; the fixture-heavy test suite and
+# the fuzz sub-crate stay in git only.
+exclude = ["/tests", "/fuzz"]
 
 [dependencies]
-oxideav-core = "0.1"
+# `oxideav-core` is gated behind the default-on `registry` feature so
+# image-library consumers can depend on `oxideav-iff` with
+# `default-features = false` and avoid the framework dependency tree
+# entirely. Without `registry` the crate exposes the whole standalone
+# IMAGE_CRATE_API surface (`probe` / `info` / `decode*` / `encode*`,
+# `IffImage`, `IffError`, …), the ILBM / ACBM / DEEP / RGB8 / RGBN /
+# ANIM document models and the AIFF chunk parsers, and never references
+# `oxideav-core`.
+oxideav-core = { version = "0.1", optional = true }
+
+[features]
+default = ["registry"]
+
+# Wires up the `ilbm` image codec (`make_decoder` / `make_encoder`), the
+# container demuxers + muxers for every IFF form (ILBM / ACBM / RGB8 /
+# RGBN / DEEP / TVPP / ANIM / 8SVX / AIFF) and `register(&mut
+# RuntimeContext)` against `oxideav-core`. Default-on; turn off for
+# image-library use-cases that just want the standalone API.
+registry = ["dep:oxideav-core"]
+
+# Integration tests that drive the framework demuxers / muxers need
+# `oxideav-core`; the standalone CI job (`--no-default-features`) skips
+# them and runs every other test.
+[[test]]
+name = "acbm"
+required-features = ["registry"]
+
+[[test]]
+name = "anim_muxer"
+required-features = ["registry"]
+
+[[test]]
+name = "anim_muxer_ops"
+required-features = ["registry"]
+
+[[test]]
+name = "deep_jpeg_tvdc"
+required-features = ["registry"]
+
+[[test]]
+name = "iff_deep_demuxer"
+required-features = ["registry"]
+
+[[test]]
+name = "iff_truecolor_demuxer"
+required-features = ["registry"]
+
+[[test]]
+name = "ilbm_round3"
+required-features = ["registry"]
+
+[[test]]
+name = "ilbm_round4"
+required-features = ["registry"]
+
+[[test]]
+name = "mux_roundtrip"
+required-features = ["registry"]
+
+[[test]]
+name = "ilbm_truecolor24"
+required-features = ["registry"]
+
+[[test]]
+name = "seek"
+required-features = ["registry"]
+
+[[test]]
+name = "truecolor_muxers"
+required-features = ["registry"]
+
+[[test]]
+name = "tvpp"
+required-features = ["registry"]
+
+[[test]]
+name = "svx_voice"
+required-features = ["registry"]
+

@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The OxideAV image-crate contract (`IMAGE_CRATE_API`) at the crate
+  root: `probe`, `info -> ImageInfo`, `decode -> IffImage`,
+  `decode_with(&DecodeOptions)`, `decode_rgb8` / `decode_rgba8`,
+  `decode_all` / `decode_all_with` (ANIM frames with display durations,
+  multi-`DBOD` DEEP, `CAT ` / `LIST` children), `decode_from`,
+  `encode(&IffImage, &EncodeOptions)`, `encode_rgb8` / `encode_rgba8`,
+  `encode_to`, `encode_all` (ANIM via any op 0–8, multi-frame DEEP);
+  types `IffImage` (native `Pal8` + `Palette` / `Rgb24` / `Rgba` with
+  the IFF extras `form`, `n_planes`, `viewmode`, `aspect`),
+  `IffPixelFormat` (= `PixelFormat`), `IffForm`, `Plane`, `ColorInfo` /
+  `ColorRange`, `Metadata`, `Palette`, `RgbImage` / `RgbaImage`,
+  `ImageInfo`, `Frame`, `DecodeOptions` (limits enforced before
+  allocation, `strict`, `genlock`, `tvdc_table`), `EncodeOptions`
+  (`form`, `compression`, `indexed`, `n_planes`, `viewmode`, `masking`,
+  `drop_alpha`, `deep_rgb_only`, `anim_op`, `aspect`), `AnimOp`,
+  `IffError` (= `Error`: `InvalidData` / `Unsupported` / `LimitExceeded`
+  / `Io(std::io::Error)`).
+- `registry` feature (default-on) and the `ilbm` image codec:
+  `make_decoder` / `make_encoder` (`CODEC_ID_STR`), `register_codecs`,
+  `register_registries`, `From<IffImage> for VideoFrame`,
+  `IffImage::from_video_frame` + `TryFrom<(&VideoFrame,
+  &CodecParameters)>`, `From<IffError> for oxideav_core::Error`.
+- `contract_api` fuzz target; `ci-standalone` CI job
+  (`--no-default-features` build + tests + clippy).
+
+### Changed
+
+- `oxideav-core` is optional behind the default-on `registry` feature;
+  with `default-features = false` the picture / animation / AIFF chunk
+  parsers build without the framework. The container demuxers and
+  muxers (`ilbm::IlbmMuxer`, `ilbm::DeepMuxer`, `ilbm::RgbTrueColorMuxer`,
+  `ilbm::MuxerMode`, `ilbm::DeepMuxerCompression`, `anim::AnimMuxer`,
+  `anim::AnimMuxerOp`, `ilbm::register`, `anim::register`), the whole
+  `svx` module and `aiff::demuxer` are compiled only with `registry`.
+- Every framework-free function (`chunk`, `ilbm`, `anim`) returns the
+  crate-local `IffError` instead of `oxideav_core::Error`; the registry
+  adapters convert. Integration tests that matched
+  `oxideav_core::Error::InvalidData` on `parse_acbm` now match
+  `oxideav_iff::IffError::InvalidData`.
+- `anim::parse_anim` re-packs a plain indexed seed frame from its decoded
+  indices (exact) instead of a nearest-colour fit against the palette,
+  so a `CMAP` with duplicate colours no longer corrupts the deltas
+  applied to it.
+- `Cargo.toml` excludes `/tests` and `/fuzz` from the published package.
+
+### Fixed
+
+- DEEP: a `DPEL` with zero components defeated the TVDC expansion guard
+  and sized the RGBA canvas from the `DGBL` dimensions alone (a 5 GiB
+  allocation on a 78-byte input); rejected before allocating.
+- DEEP: a component deeper than 16 bits overflowed the shift in the
+  8-bit scaler (debug panic); deeper components contribute their top
+  16 bits.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-iff/compare/v0.0.9...v0.0.10) - 2026-08-31
 
 ### Other

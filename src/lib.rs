@@ -1,81 +1,92 @@
-//! Pure-Rust reader for the Electronic Arts / Commodore IFF 85 container
-//! family ("FORM / LIST / CAT" chunked format).
+//! Pure-Rust reader and writer for the Electronic Arts / Commodore
+//! **IFF 85** container family ("FORM / LIST / CAT" chunked format) and
+//! the picture, animation and sound FORMs that live in it.
 //!
 //! IFF files are big-endian chunk trees. The top-level chunk is always a
-//! group chunk — `FORM`, `LIST`, or `CAT ` — whose first 4 bytes of payload
-//! are a 4-character "form type" such as `8SVX` (Amiga 8-bit sampled voice),
-//! `ILBM` (Amiga picture), `AIFF` (Apple audio), `SMUS` (music score),
-//! and so on.
+//! group chunk — `FORM`, `LIST`, or `CAT ` — whose first 4 bytes of
+//! payload are a 4-character "form type" such as `ILBM` (Amiga picture),
+//! `ANIM` (cel animation), `DEEP` / `RGB8` / `RGBN` (true-colour
+//! pictures), `8SVX` (Amiga 8-bit sampled voice) or `AIFF` (Apple audio).
 //!
-//! Today this crate handles **8SVX audio** end-to-end (identifies the
-//! stream, exposes its PCM-S8 samples as packets), **ILBM**
-//! (InterLeaved BitMap, the Amiga IFF picture form) for indexed,
-//! EHB and HAM6/HAM8 images including ByteRun1 (PackBits)
-//! decompression, **ANIM** animations (op-5 and op-7 vertical-delta
-//! decode), and Apple **AIFF / AIFF-C (AIFC)** audio (FORM/COMM/SSND
-//! walker, 80-bit IEEE extended sample-rate decode, NONE/twos/sowt/
-//! raw/fl32/fl64 PCM compression-type readers).
+//! # Standalone use (the image-crate contract)
+//!
+//! The crate root implements the OxideAV `IMAGE_CRATE_API`: the still
+//! pictures (`ILBM` / `PBM ` / `ACBM` / `DEEP` / `RGB8` / `RGBN`), the
+//! `ANIM` frame sequence and `CAT ` / `LIST` groups decode and encode
+//! through [`probe`], [`info`], [`decode`] / [`decode_with`] /
+//! [`decode_rgb8`] / [`decode_rgba8`] / [`decode_all`] / [`decode_from`]
+//! and [`encode`] / [`encode_rgb8`] / [`encode_rgba8`] / [`encode_to`] /
+//! [`encode_all`], returning plain `Vec<u8>` pixels in an [`IffImage`].
+//! All of it builds with `default-features = false` and no `oxideav-core`.
+//!
+//! ```
+//! # fn main() -> Result<(), oxideav_iff::Error> {
+//! // A 2×1 two-colour picture, written as a planar FORM ILBM and read back.
+//! let palette = oxideav_iff::Palette::from_rgb_triples(&[[0, 0, 0], [255, 255, 255]]);
+//! let img = oxideav_iff::IffImage::new_indexed(2, 1, vec![0, 1], palette)?;
+//! let bytes = oxideav_iff::encode(&img, &oxideav_iff::EncodeOptions::default())?;
+//!
+//! assert!(oxideav_iff::probe(&bytes));
+//! let info = oxideav_iff::info(&bytes)?;
+//! assert_eq!((info.width, info.height, info.n_planes), (2, 1, 1));
+//! let back = oxideav_iff::decode(&bytes)?;
+//! assert_eq!(back.format, oxideav_iff::PixelFormat::Pal8);
+//! assert_eq!(back.to_rgba8(), vec![0, 0, 0, 255, 255, 255, 255, 255]);
+//! # Ok(()) }
+//! ```
+//!
+//! # Depth below the contract
+//!
+//! The document models stay available under their own names:
+//! [`ilbm::parse_ilbm`] / [`ilbm::encode_ilbm`] ([`ilbm::IlbmImage`] with
+//! every property chunk — `GRAB`, `DEST`, `SPRT`, `SHAM`, `PCHG`, `CRNG`,
+//! `CCRT`, `DRNG`), [`ilbm::parse_acbm`], [`ilbm::parse_deep_frames`],
+//! [`ilbm::parse_rgb8`] / [`ilbm::parse_rgbn`], [`ilbm::parse_tvpp`],
+//! [`anim::parse_anim`] and the per-operation ANIM encoders, the `8SVX`
+//! voice model in [`svx`] (framework-only) and the AIFF chunk parsers in
+//! [`aiff`].
+//!
+//! # Framework use
+//!
+//! With the default-on `registry` feature the crate plugs into
+//! `oxideav-core`: [`register`] installs the `ilbm` image codec
+//! ([`make_decoder`] / [`make_encoder`], one whole FORM per packet, native
+//! layout out) and every IFF-family container demuxer and muxer
+//! (`iff_ilbm`, `iff_acbm`, `iff_rgb8`, `iff_rgbn`, `iff_deep`,
+//! `iff_tvpp`, `iff_anim`, `iff_8svx`, `aiff`); `From<IffImage> for
+//! VideoFrame` and [`IffImage::from_video_frame`] bridge the two layers.
 
 pub mod aiff;
 pub mod anim;
+pub mod api;
 pub mod chunk;
+pub mod error;
 pub mod ilbm;
+pub mod image;
+pub mod options;
+#[cfg(feature = "registry")]
+pub mod registry;
+#[cfg(feature = "registry")]
 pub mod svx;
 
-use oxideav_core::ContainerRegistry;
+// ---- The image-crate contract (IMAGE_CRATE_API) ----
+pub use api::{
+    decode, decode_all, decode_all_with, decode_from, decode_rgb8, decode_rgba8, decode_with,
+    encode, encode_all, encode_rgb8, encode_rgba8, encode_to, info, probe,
+};
+pub use error::{Error, IffError, Result};
+pub use image::{
+    ColorInfo, ColorRange, Frame, IffForm, IffImage, IffPixelFormat, ImageInfo, Metadata, Palette,
+    PixelFormat, Plane, RgbImage, RgbaImage,
+};
+pub use options::{AnimOp, DecodeOptions, EncodeOptions};
 
-/// Register all IFF-family demuxers with the container registry.
-pub fn register_containers(reg: &mut ContainerRegistry) {
-    svx::register(reg);
-    ilbm::register(reg);
-    anim::register(reg);
-    // aiff's sibling-form helper is `register_containers` (the
-    // public `aiff::register` takes a full `RuntimeContext` because
-    // it was the standalone-crate entry point; here we want only the
-    // container half).
-    aiff::demuxer::register_containers(reg);
-}
-
-/// Install every IFF-family container into a
-/// [`oxideav_core::RuntimeContext`].
-///
-/// Convenience wrapper around [`register_containers`] that matches the
-/// uniform `register(&mut RuntimeContext)` entry point every sibling
-/// crate exposes. The nested `svx::register` / `ilbm::register` helpers
-/// remain `&mut ContainerRegistry`-shaped because they are internal
-/// per-form installers and not part of the framework-facing surface.
-///
-/// Also wired into [`oxideav_meta::register_all`] via the
-/// [`oxideav_core::register!`] macro below.
-pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
-    register_containers(&mut ctx.containers);
-}
-
-oxideav_core::register!("iff", register);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn register_via_runtime_context_installs_container() {
-        let mut ctx = oxideav_core::RuntimeContext::new();
-        register(&mut ctx);
-        // 8SVX (Amiga audio) extension is registered by svx::register,
-        // ILBM (Amiga picture) by ilbm::register, and AIFF / AIFC
-        // (Apple audio) by aiff::register; all should be wired through
-        // the unified entry point.
-        assert_eq!(
-            ctx.containers.container_for_extension("8svx"),
-            Some("iff_8svx")
-        );
-        assert_eq!(
-            ctx.containers.container_for_extension("ilbm"),
-            Some("iff_ilbm")
-        );
-        // The aiff sub-module installs itself under FORMAT_NAME =
-        // "aiff" and claims `.aif` / `.aiff` / `.aifc` extensions.
-        assert_eq!(ctx.containers.container_for_extension("aiff"), Some("aiff"));
-        assert_eq!(ctx.containers.container_for_extension("aifc"), Some("aiff"));
-    }
-}
+// ---- Framework integration (registry feature) ----
+#[cfg(feature = "registry")]
+#[doc(hidden)]
+pub use registry::__oxideav_entry;
+#[cfg(feature = "registry")]
+pub use registry::{
+    make_decoder, make_encoder, register, register_codecs, register_containers,
+    register_registries, CODEC_ID_STR,
+};

@@ -7,7 +7,7 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
-# Five libFuzzer targets cover the highest-risk parser surface of
+# Seven libFuzzer targets cover the highest-risk parser surface of
 # the crate:
 #
 #  * `aiff_decode` — feeds arbitrary bytes to `AiffDemuxer::from_bytes`,
@@ -50,6 +50,12 @@ cargo-fuzz = true
 #                    strict-validation disambiguator, ABIT
 #                    de-contiguation, and the Turbo Silver genlock-RLE
 #                    decoders.
+#  * `contract_api` — feeds arbitrary bytes to the IMAGE_CRATE_API root
+#                    (`probe` / `info` / `decode_with` / `decode_all_with`
+#                    / `to_rgba8`) and, for anything that decodes, through
+#                    `encode` / `encode_all` and back — the FORM dispatch,
+#                    header-only `info`, the Pal8 packaging, the CAT/LIST
+#                    walk, the ANIM timeline and every encoder path.
 #  * `svx_decode`  — feeds arbitrary bytes to `svx::parse_voice` (the
 #                    FORM 8SVX structural walker: VHDR Voice8Header,
 #                    CHAN / PAN / ATAK / RLSE / SEQN / FADE typed
@@ -107,5 +113,11 @@ doc = false
 [[bin]]
 name = "ilbm_decode"
 path = "fuzz_targets/ilbm_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "contract_api"
+path = "fuzz_targets/contract_api.rs"
 test = false
 doc = false
