@@ -2,6 +2,176 @@
 
 [![CI](https://github.com/OxideAV/oxideav-iff/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-iff/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-iff.svg)](https://crates.io/crates/oxideav-iff) [![docs.rs](https://docs.rs/oxideav-iff/badge.svg)](https://docs.rs/oxideav-iff) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+Pure-Rust reader and writer for the EA IFF 85 picture, animation and
+sound FORMs: **ILBM** / **PBM** / **ACBM** (Amiga bitplanes), **DEEP**,
+**RGB8** / **RGBN** (true colour), **ANIM** (delta animation), **8SVX**
+(Amiga voice) and **AIFF** / **AIFF-C** (Apple audio), plus the generic
+`FORM` / `LIST` / `CAT ` chunk walker they all share. Zero C
+dependencies. The still pictures and animations follow the OxideAV
+image-crate contract (`IMAGE_CRATE_API`) at the crate root; the audio
+forms are framework-only.
+
+## Standalone use
+
+```toml
+[dependencies]
+oxideav-iff = { version = "0.0", default-features = false }
+```
+
+```rust
+# fn main() -> Result<(), oxideav_iff::Error> {
+# let palette = oxideav_iff::Palette::from_rgb_triples(&[[0, 0, 0], [255, 255, 255]]);
+# let src = oxideav_iff::IffImage::new_indexed(2, 1, vec![0, 1], palette)?;
+# let bytes = oxideav_iff::encode(&src, &oxideav_iff::EncodeOptions::default())?;
+if oxideav_iff::probe(&bytes) {
+    let info = oxideav_iff::info(&bytes)?;          // header only: width, height, format, frames
+    let img  = oxideav_iff::decode(&bytes)?;        // IffImage, native layout (Pal8 / Rgb24 / Rgba)
+    let rgba: Vec<u8> = img.to_rgba8();             // tightly packed RGBA, 4 * width bytes per row
+    let (w, h) = (img.width(), img.height());
+    assert_eq!((w, h, info.frames), (2, 1, 1));
+
+    // Write it back: 24-bit ILBM by default, or quantised bitplanes.
+    let opts = oxideav_iff::EncodeOptions::default().with_indexed(true);
+    let out: Vec<u8> = oxideav_iff::encode_rgba8(w, h, &rgba, &opts)?;
+    assert_eq!(oxideav_iff::decode_rgba8(&out)?.data, rgba);
+}
+# Ok(()) }
+```
+
+Root items: `probe`, `info -> ImageInfo`, `decode -> IffImage`,
+`decode_with(&DecodeOptions)`, `decode_rgb8 -> RgbImage`,
+`decode_rgba8 -> RgbaImage`, `decode_all -> Vec<Frame>` (ANIM frames,
+DEEP `DBOD`s, `CAT ` / `LIST` children), `decode_from<R: Read>`,
+`encode(&IffImage, &EncodeOptions)`, `encode_rgb8`, `encode_rgba8`,
+`encode_to<W: Write>`, `encode_all(&[Frame], &EncodeOptions)` (ANIM or
+multi-frame DEEP); types `IffImage { width, height, format, planes,
+color, metadata, palette, form, n_planes, viewmode, aspect }`,
+`IffPixelFormat` (= `PixelFormat`: `Pal8` / `Rgb24` / `Rgba`),
+`IffForm`, `Plane`, `ColorInfo` / `ColorRange`, `Metadata`, `Palette`,
+`RgbImage` / `RgbaImage`, `ImageInfo`, `Frame { image, delay, index }`,
+`DecodeOptions`, `EncodeOptions`, `AnimOp`, `IffError` (= `Error`:
+`InvalidData` / `Unsupported` / `LimitExceeded` / `Io`).
+
+The document models stay available below the contract:
+`ilbm::parse_ilbm` / `ilbm::encode_ilbm` (`IlbmImage` with every
+property chunk — `GRAB`, `DEST`, `SPRT`, `SHAM`, `PCHG`, `CRNG`, `CCRT`,
+`DRNG`), `ilbm::parse_acbm` / `encode_acbm`, `ilbm::parse_deep_frames`
+/ `encode_deep_frames`, `ilbm::parse_rgb8` / `parse_rgbn`,
+`ilbm::parse_tvpp`, `anim::parse_anim` and the per-operation ANIM
+encoders, and the `chunk` group walker. See *Format specifics* below.
+
+## Framework use
+
+With the default-on `registry` feature the crate depends on
+`oxideav-core` and plugs into the framework:
+
+- `register(&mut RuntimeContext)` (also dispatched by
+  `oxideav_core::register!` through `oxideav-meta`), `register_codecs`,
+  `register_containers`, `register_registries`.
+- The **`ilbm` image codec** — `make_decoder` / `make_encoder`
+  (`CODEC_ID_STR = "ilbm"`): one packet holding a whole raster `FORM`
+  in, one frame in the native layout out (`Pal8` with the palette on the
+  frame's palette side-channel, `Rgb24`, or `Rgba`); the encoder writes
+  a `FORM ILBM` from `Pal8` (index-for-index), `Rgb24` / `Rgba` /
+  `Bgr24` / `Bgra` (24-bit literal RGB, alpha dropped). Both are thin
+  adapters over `decode` / `encode`.
+- The frame bridge: `From<IffImage> for VideoFrame`,
+  `IffImage::from_video_frame(&VideoFrame, &CodecParameters)` and
+  `TryFrom<(&VideoFrame, &CodecParameters)>`. IFF carries no colour
+  signalling, so no colour signal is stamped on frames (the standalone
+  `ColorInfo` default is a documented convention only).
+- The **container demuxers and muxers** every IFF form had before the
+  contract, unchanged: `iff_ilbm`, `iff_acbm`, `iff_rgb8`, `iff_rgbn`,
+  `iff_deep`, `iff_tvpp`, `iff_anim` (each emits decoded `rawvideo` /
+  `Rgba` keyframes; `iff_deep` passes a §1.5b JPEG body through as
+  `mjpeg`), `iff_8svx` and `aiff`.
+
+## Supported layouts
+
+Decode (native layout of `decode`; `decode_rgba8` / `to_rgba8` always
+available and byte-identical to the document-model renderers):
+
+| FORM | Source | Native layout | Notes |
+|---|---|---|---|
+| `ILBM` / `ACBM` | 1–8 bitplanes + `CMAP`, masking none / transparent colour | `Pal8` + palette | transparent colour = palette entry alpha 0; palette padded to cover every index used |
+| `ILBM` / `ACBM` | Extra-Half-Brite (`CAMG` EHB, 6 planes) | `Pal8` + 64-entry palette | the 32 `CMAP` entries mirrored at half intensity |
+| `ILBM` / `ACBM` | HAM6 / HAM8 (`CAMG` HAM, or the assumed-HAM6 reading of a 6-plane file with no usable `CAMG`) | `Rgb24` | no indexed representation of the hold-and-modify state |
+| `ILBM` / `ACBM` | `SHAM` / `PCHG` per-line palettes | `Rgb24` (`Rgba` with a transparent colour) | one table per scanline cannot ride on `Pal8` |
+| `ILBM` / `ACBM` | `HasMask` mask plane, `mskLasso` seed fill | `Rgba` | per-pixel alpha |
+| `ILBM` | 24 bitplanes, no `CMAP` | `Rgb24` | literal RGB (R, G, B planes) |
+| `PBM ` | chunky 8 bpp + `CMAP` | `Pal8` + palette | `Rgba` under `mskLasso` |
+| `DEEP` | `DPEL` with / without ALPHA or OPACITY | `Rgba` / `Rgb24` | components scaled to 8 bits (top 8 bits of deeper ones); NOCOMPRESSION, RUNLENGTH, TVDC with `DecodeOptions::tvdc_table` |
+| `RGB8` / `RGBN` | Turbo Silver genlock RLE | `Rgb24` (`Rgba` under `GenlockPolicy::BrushTransparency`) | RGBN guns are 4-bit, nibble-replicated |
+| `ANIM` | ops 0, 1, 2, 3, 4, 5, 7, 8 | as the seed frame (`Pal8` unless HAM / masked) | `decode` = seed frame, `decode_all` = every frame with its display duration |
+| `CAT ` / `LIST` | raster `FORM` children | each child's own layout | `decode` = first child, `decode_all` = all decodable children |
+
+Encode (`encode` / `encode_all`; `form` on `EncodeOptions`, default the
+image's own, `ILBM` for caller-built images):
+
+| Input | Target | Written as |
+|---|---|---|
+| `Pal8` | `ILBM` / `ACBM` | index-for-index bitplanes (`n_planes` from the palette or the option), `CMAP`, `HasTransparentColor` from a palette entry with alpha 0, `CAMG` from `viewmode` (EHB: 6 planes, 32-entry `CMAP`) — lossless |
+| `Pal8` | `PBM ` | chunky 8 bpp — lossless |
+| `Rgb24` / `Rgba` | `ILBM` (default) | 24-bit literal RGB; alpha is `Error::Unsupported` unless `drop_alpha` |
+| `Rgb24` / `Rgba` | `ILBM` / `ACBM` / `PBM ` with `indexed` | first 256 distinct colours in scan order form the `CMAP`, later colours map to the nearest entry (squared RGB distance); alpha < 128 becomes a `HasMask` plane (not on `PBM `) |
+| `Rgb24` / `Rgba` | `ILBM` / `ACBM` with a HAM / EHB `viewmode` | the HAM6 / HAM8 / EHB encoders against a 16 / 64 / 32-entry palette |
+| `Rgb24` / `Rgba` | `DEEP` | RGB 8:8:8 or RGBA 8:8:8:8 `DPEL`; `compression` None / RunLength / Auto |
+| `Rgb24` / `Rgba` | `RGB8` / `RGBN` | genlock RLE; alpha 0 sets the genlock bit (RGBN keeps the top 4 bits of each gun) |
+| `&[Frame]` | `ILBM` (= `FORM ANIM`) | seed `FORM ILBM` + one delta frame per picture (`anim_op`, default op-5); one `CMAP` for the whole animation; `Frame::delay` → the next frame's `ANHD.reltime` (jiffies, 1/60 s) |
+| `&[Frame]` | `DEEP` | one `DBOD` per frame, `DCHG` from the first frame's `delay` |
+
+`decode(encode(img)) == img` is pinned for `Pal8` into `ILBM` / `PBM ` /
+`ACBM` (planes, palette, `form`, `aspect`), for `Rgb24` into 24-bit
+`ILBM`, `DEEP`, `RGB8` and (nibble-replicated guns) `RGBN`, for `Rgba`
+into `DEEP`, and for ANIM frame sequences through every delta
+operation. The ANIM encoders quantise each frame against the shared
+`CMAP` by nearest colour, so a palette with duplicate colours may come
+back with the first matching index.
+
+## Options
+
+`DecodeOptions` (`Default`, `with_*`): `max_width`, `max_height`,
+`max_pixels`, `max_bytes` (`Option`, `None` = unlimited; default 1 GiB of
+decoded RGBA working buffer), `strict` (a `FORM` size running past the
+buffer or trailing bytes after it become errors; a group child that
+fails to decode is an error instead of being skipped), `genlock`
+(`RGB8` / `RGBN` genlock-bit policy), `tvdc_table` (the 16-word DEEP
+TVDC delta table the FORM does not carry).
+
+`EncodeOptions` (`Default`, `with_*`): `form`, `compression`
+(`ByteRun1` default, `None`, `Auto` = shorter of the two), `indexed`,
+`n_planes`, `viewmode` (`CAMG`; `Some(0)` writes none), `masking`
+(derived when `None`), `drop_alpha`, `deep_rgb_only`, `anim_op`
+(`AnimOp::Op0` … `Op8 { long_data }`), `aspect`.
+
+## Metadata and colour
+
+IFF raster FORMs define no ICC / Exif / XMP chunk and no colorimetry
+(`CAMG` is a display-mode word), so `Metadata` is always empty and
+`ColorInfo` is the documented convention `ColorInfo::iff_default()`:
+full range, RGB (identity matrix), primaries and transfer unspecified
+(`2`). `Metadata.gamma` is `None`. Nothing is stamped on registry frames.
+
+`IffImage` carries the IFF-specific facts an encoder needs to write a
+faithful file: `form`, `n_planes` (`BMHD.nPlanes`, or the `DPEL` bit
+total), `viewmode` (`CAMG`), `aspect` (`BMHD` x/y aspect). `ImageInfo`
+adds `compression`, `masking`, `palette_len`, `ham`, `ehb`.
+
+## Limits
+
+Limits are checked against the header before any pixel buffer is
+allocated (`LimitExceeded`); a geometry whose RGBA working buffer does
+not fit the platform's address space is `Unsupported`. `info` is
+header-only and unaffected. Every parser is bounded by the declared
+`FORM` size; ByteRun1 rows, DEEP bodies (15× TVDC expansion bound,
+component count ≥ 1) and RGB8 / RGBN run streams are checked against
+the input length before expanding. Hostile input returns `IffError`,
+never panics — seven libFuzzer targets (`contract_api`, `ilbm_decode`,
+`anim_decode`, `deep_decode`, `pchg_parse`, `svx_decode`,
+`aiff_decode`) cover the surface.
+
+## Format specifics
+
 Pure-Rust EA IFF 85 container support for oxideav — the chunk reader
 that underlies the entire `FORM / LIST / CAT` family. Today this
 crate ships:
@@ -180,19 +350,19 @@ Zero C dependencies.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
-## Installation
+### Installation
 
 ```toml
 [dependencies]
-oxideav-core = "0.1"
-oxideav-codec = "0.1"
-oxideav-container = "0.1"
+# Standalone image use (no framework):
+oxideav-iff = { version = "0.0", default-features = false }
+# Framework use (default): the `registry` feature pulls `oxideav-core`.
 oxideav-iff = "0.0"
 ```
 
-## Supported formats
+### Supported formats
 
-### 8SVX — Amiga 8-bit Sampled Voice
+#### 8SVX — Amiga 8-bit Sampled Voice
 
 Full read and write support for `FORM / 8SVX`:
 
@@ -254,16 +424,16 @@ Full read and write support for `FORM / 8SVX`:
 - Fibonacci-delta is lossy; round-trips reconstruct each sample within
   +-2 LSBs on smooth signals.
 
-## Quick use
+### Quick use
 
-### Read an 8SVX voice
+#### Read an 8SVX voice
 
 ```rust
 use oxideav_container::ContainerRegistry;
 use oxideav_core::Error;
 
 let mut containers = ContainerRegistry::new();
-oxideav_iff::register(&mut containers);
+oxideav_iff::register_containers(&mut containers);
 
 let input: Box<dyn oxideav_container::ReadSeek> = Box::new(
     std::io::Cursor::new(std::fs::read("voice.8svx")?),
@@ -284,7 +454,7 @@ loop {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-### Write a stereo Fibonacci-delta voice
+#### Write a stereo Fibonacci-delta voice
 
 ```rust
 use oxideav_iff::svx::{Compression, SvxMuxer};
@@ -298,13 +468,13 @@ mux.write_packet(&packet)?;
 mux.write_trailer()?;
 ```
 
-### Container / codec IDs
+#### Container / codec IDs
 
 - Container: `"iff_8svx"`, probes `FORM....8SVX` and matches `.8svx` /
   `.iff` by extension.
 - Codec (inside the stream): `"pcm_s8"`.
 
-### ILBM — Amiga InterLeaved BitMap
+#### ILBM — Amiga InterLeaved BitMap
 
 Read + round-trip support for `FORM / ILBM`:
 
@@ -461,7 +631,7 @@ Read + round-trip support for `FORM / ILBM`:
   silently skip when the binary or its delegate isn't installed so CI
   stays green on hosts without it.
 
-### PBM — DPaint II / Brilliance chunky sibling
+#### PBM — DPaint II / Brilliance chunky sibling
 
 `FORM / PBM ` (note the trailing space) shares BMHD / CMAP / CAMG
 chunks with ILBM but stores the BODY as a chunky 8-bit-per-pixel byte
@@ -472,7 +642,7 @@ not legal in PBM and are rejected on encode/decode. The
 transparency both decode identically to the planar ILBM path (the
 lasso fill runs on the chunky index buffer).
 
-### ANIM — animated ILBM
+#### ANIM — animated ILBM
 
 Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
 
@@ -632,7 +802,7 @@ Read + round-trip support for `FORM / ANIM` (Aegis Animator / DPaint III):
   bit per §2.1 "Player code should check undefined bits … to assure
   they are zero".
 
-#### Read an ILBM picture
+##### Read an ILBM picture
 
 ```rust
 let bytes = std::fs::read("picture.ilbm")?;
@@ -671,7 +841,7 @@ println!("{}x{} → {} bytes RGBA", img.width, img.height, img.rgba.len());
   so animation viewers can compose per-scanline state + per-tick
   rotation without re-implementing the bookkeeping.
 
-### AIFF / AIFF-C marker chunks
+#### AIFF / AIFF-C marker chunks
 
 `MARK` chunks are parsed into a structured
 [`aiff::MarkerChunk`] surface exposed via
@@ -699,7 +869,7 @@ re-sort. `MarkerChunk::by_id(id)` is a convenience lookup that
 [`InstrumentChunk::resolve_sustain_loop`] (below) uses internally to
 join the sampler loop endpoints back against this list.
 
-### AIFF / AIFF-C instrument chunk
+#### AIFF / AIFF-C instrument chunk
 
 `INST` chunks are parsed into a structured
 [`aiff::InstrumentChunk`] surface exposed via
@@ -744,7 +914,7 @@ isn't strictly less than the end marker's — letting the caller
 ask "what does the spec say to actually play?" without
 re-implementing the bookkeeping.
 
-### AIFF / AIFF-C text chunks
+#### AIFF / AIFF-C text chunks
 
 `NAME`, `AUTH`, `(c) `, and `ANNO` are the four §13.0 text chunks.
 They share an identical wire layout — a four-byte ckID, a four-byte
@@ -785,7 +955,7 @@ the close parenthesis." The spec uses the round-bracket character
 itself as the on-wire stand-in for ©; downstream code that wants
 the © glyph should decode the text body, not the ckID.
 
-### AIFF / AIFF-C SAXL (Sound Accelerator) chunks
+#### AIFF / AIFF-C SAXL (Sound Accelerator) chunks
 
 `SAXL` chunks are parsed into a structured
 [`aiff::SaxelChunk`] surface exposed via [`aiff::Form::saxels`]:
@@ -828,7 +998,7 @@ the body bytes; the chunk header (`'SAXL' + ckSize`) and any
 odd-length outer pad byte are the caller's responsibility,
 matching every other AIFF write-side helper in this module.
 
-### AIFF-C §14 chunk precedence
+#### AIFF-C §14 chunk precedence
 
 §14 of the AIFF-C spec ranks every chunk class the spec defines so
 that callers can resolve overlapping information cleanly — the §14
@@ -877,7 +1047,7 @@ ordering. Multi-instance classes (§8.0 `SAXL`, §10.0 `MIDI`,
 the document-order semantics §14 ¶ "Annotation Chunk[s] -- in the
 order they appear in the FORM" requires.
 
-## Roadmap
+### Roadmap
 
 The chunk walker (`chunk.rs`) is format-agnostic; SMUS (music score)
 and MAUD are natural follow-ons that reuse the same FORM/LIST/CAT
@@ -1121,11 +1291,19 @@ MIDI decode lives in the `oxideav-midi` sibling crate; codec-bearing
 `compressionType` FourCCs are routed to sibling codec crates rather
 than decoded here.
 
-## Fuzzing
+### Fuzzing
 
 A [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harness
-lives in [`fuzz/`](fuzz/) with six libFuzzer targets covering the
+lives in [`fuzz/`](fuzz/) with seven libFuzzer targets covering the
 highest-risk parser surface of the crate:
+
+* `contract_api` — feeds arbitrary bytes to the IMAGE_CRATE_API root
+  (`probe` / `info` / `decode_with` / `decode_all_with` / `to_rgba8`)
+  and, for anything that decodes, through `encode` / `encode_all` and
+  back: the FORM dispatch, the header-only `info` walk, the `Pal8`
+  packaging, the `CAT ` / `LIST` child walk, the ANIM timeline and
+  every encoder path. A `Pal8` picture must re-decode to the same
+  planes.
 
 * `aiff_decode` — feeds arbitrary bytes to
   `aiff::demuxer::AiffDemuxer::from_bytes`, the top-of-stack entry
@@ -1205,6 +1383,6 @@ The harness builds under nightly Rust (libFuzzer needs nightly's
 `-Z` flags); see the `cargo-fuzz` book for corpus management,
 artifact triage, and coverage-guided minimisation.
 
-## License
+### License
 
 MIT - see [LICENSE](LICENSE).
