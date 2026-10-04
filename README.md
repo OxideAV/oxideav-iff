@@ -429,16 +429,15 @@ Full read and write support for `FORM / 8SVX`:
 #### Read an 8SVX voice
 
 ```rust
-use oxideav_container::ContainerRegistry;
-use oxideav_core::Error;
+use oxideav_core::{Error, RuntimeContext};
 
-let mut containers = ContainerRegistry::new();
-oxideav_iff::register_containers(&mut containers);
+let mut ctx = RuntimeContext::new();
+oxideav_iff::register(&mut ctx); // or register_containers(&mut ctx.containers)
 
-let input: Box<dyn oxideav_container::ReadSeek> = Box::new(
+let input: Box<dyn oxideav_core::ReadSeek> = Box::new(
     std::io::Cursor::new(std::fs::read("voice.8svx")?),
 );
-let mut dmx = containers.open_demuxer("iff_8svx", input)?;
+let mut dmx = ctx.containers.open_demuxer("iff_8svx", input, &ctx.codecs)?;
 let stream = &dmx.streams()[0];
 assert_eq!(stream.params.codec_id.as_str(), "pcm_s8");
 
@@ -446,6 +445,7 @@ loop {
     match dmx.next_packet() {
         Ok(pkt) => {
             // pkt.data is interleaved pcm_s8 (mono or stereo L R L R ...).
+            let _ = pkt;
         }
         Err(Error::Eof) => break,
         Err(e) => return Err(e.into()),
@@ -457,8 +457,21 @@ loop {
 #### Write a stereo Fibonacci-delta voice
 
 ```rust
+use oxideav_core::{CodecId, CodecParameters, Muxer, Packet, StreamInfo, TimeBase};
 use oxideav_iff::svx::{Compression, SvxMuxer};
 
+# let mut params = CodecParameters::audio(CodecId::new("pcm_s8"));
+# params.channels = Some(2);
+# params.sample_rate = Some(8_000);
+# let stream = StreamInfo {
+#     index: 0,
+#     time_base: TimeBase::new(1, 8_000),
+#     duration: None,
+#     start_time: None,
+#     params,
+# };
+# let packet = Packet::new(0, TimeBase::new(1, 8_000), vec![0u8; 64]);
+let out: Box<dyn oxideav_core::WriteSeek> = Box::new(std::fs::File::create("out.8svx")?);
 // `stream` describes 2-channel pcm_s8; `packet.data` is interleaved
 // L R L R ... at 8 bits per sample.
 let mut mux = SvxMuxer::new(out, &[stream])?
@@ -466,6 +479,7 @@ let mut mux = SvxMuxer::new(out, &[stream])?
 mux.write_header()?;
 mux.write_packet(&packet)?;
 mux.write_trailer()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 #### Container / codec IDs
