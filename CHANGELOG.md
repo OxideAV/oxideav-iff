@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-iff/compare/v0.0.10...v0.0.11) - 2026-10-04
+
+### Other
+
+- fleet sweep — container demuxers declare the native layout (Pal8 + palette extradata / Rgb24 / Rgba); muxers accept it
+- README examples use the current registry API
+- contract section order — standalone use, framework use, layout tables, options, metadata and colour, limits
+- core-optional + IMAGE_CRATE_API root: IffImage/IffError contract, ilbm codec, DEEP fuzz fixes
+
 ### Added
 
 - The OxideAV image-crate contract (`IMAGE_CRATE_API`) at the crate
