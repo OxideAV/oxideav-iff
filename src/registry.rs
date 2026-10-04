@@ -22,10 +22,14 @@
 //!
 //! The container demuxers (`iff_ilbm` / `iff_acbm` / `iff_rgb8` /
 //! `iff_rgbn` / `iff_deep` / `iff_tvpp` / `iff_anim` / `iff_8svx` /
-//! `aiff`) and muxers keep their pre-contract shape — they emit decoded
-//! `rawvideo` / `Rgba` (or PCM) packets — and live next to the parsers
-//! they wrap (`ilbm::framework`, `anim::framework`, `svx`,
-//! `aiff::demuxer`).
+//! `aiff`) and muxers live next to the parsers they wrap
+//! (`ilbm::framework`, `anim::framework`, `svx`, `aiff::demuxer`).
+//! `iff_ilbm` / `iff_acbm` declare an `ilbm` codec stream in the
+//! picture's native layout (`Pal8` + palette `extradata`, `Rgb24`,
+//! `Rgba`) and hand the whole `FORM` to [`make_decoder`]; the DEEP /
+//! TVPP / RGB8 / RGBN demuxers emit decoded `rawvideo` packets in
+//! `Rgb24` or `Rgba` per the picture; `iff_anim` emits composited `Rgba`
+//! frames; `iff_8svx` / `aiff` emit PCM.
 
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, ColorPrimaries,

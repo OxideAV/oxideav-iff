@@ -36,6 +36,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Container demuxers declare the native layout** (round 470 fleet
+  sweep, together with bmp / tga): `iff_ilbm` (ILBM / PBM) and
+  `iff_acbm` now declare an `ilbm` codec stream — `pixel_format` is what
+  `decode` returns (`Pal8` with the `CMAP` as RGB triples in
+  `extradata`, `Rgb24`, `Rgba`) — and emit the whole `FORM` as the one
+  keyframe packet, so the registered `ilbm` decoder yields the indexed
+  frame with its palette side-channel; previously they emitted a
+  pre-expanded `rawvideo` / `Rgba` packet (core's `rawvideo` decoder
+  cannot carry a palette, so the codec hop is the only way to keep
+  `Pal8`). `iff_deep` / `iff_tvpp` / `iff_rgb8` / `iff_rgbn` keep
+  `rawvideo` but declare `Rgb24` for opaque pictures (RGB 8:8:8 DPEL,
+  default genlock policy) and `Rgba` only for a DPEL alpha / opacity
+  component. Consumers reading `rawvideo` / `Rgba` samples off these
+  demuxers now receive `Pal8` + palette or `Rgb24`; decode through the
+  registry (`oxideav-image`, the CLI) sees the native layout.
+- **Muxers accept the native layouts**: `IlbmMuxer` writes `ilbm`
+  codec packets verbatim (demux → mux is byte-exact) and encodes
+  `rawvideo` `Rgba` / `Rgb24` / `Pal8` (+ palette `extradata`, rejected
+  when missing); `DeepMuxer`, the RGB8 / RGBN muxers and `AnimMuxer`
+  take `rawvideo` in any of the three (`Rgb24` / `Pal8` expand to RGBA
+  before encoding). `true_color_muxer_stream_shape` is `pub(crate)` and
+  returns the accepted layout as a fourth element.
+
 - `oxideav-core` is optional behind the default-on `registry` feature;
   with `default-features = false` the picture / animation / AIFF chunk
   parsers build without the framework. The container demuxers and

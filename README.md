@@ -80,11 +80,28 @@ With the default-on `registry` feature the crate depends on
   `TryFrom<(&VideoFrame, &CodecParameters)>`. IFF carries no colour
   signalling, so no colour signal is stamped on frames (the standalone
   `ColorInfo` default is a documented convention only).
-- The **container demuxers and muxers** every IFF form had before the
-  contract, unchanged: `iff_ilbm`, `iff_acbm`, `iff_rgb8`, `iff_rgbn`,
-  `iff_deep`, `iff_tvpp`, `iff_anim` (each emits decoded `rawvideo` /
-  `Rgba` keyframes; `iff_deep` passes a §1.5b JPEG body through as
-  `mjpeg`), `iff_8svx` and `aiff`.
+- The **container demuxers and muxers** of every IFF form, declaring
+  the **native layout** (contract rule; flipped together with bmp / tga
+  in the round-470 fleet sweep):
+  - `iff_ilbm` (ILBM / PBM) and `iff_acbm` declare an **`ilbm` codec
+    stream** whose `pixel_format` is what `decode` returns — `Pal8` with
+    the `CMAP` as RGB triples in `extradata`, `Rgb24` for 24-bit /
+    HAM / per-line-palette pictures, `Rgba` for masked ones — and emit
+    the whole `FORM` as one keyframe packet; the registered `ilbm`
+    decoder produces the frame with the palette side-channel. Through
+    the registry a palette picture therefore decodes to `Pal8` +
+    palette where it used to arrive as pre-expanded `Rgba`.
+  - `iff_deep`, `iff_tvpp`, `iff_rgb8`, `iff_rgbn` emit decoded
+    `rawvideo` keyframes in `Rgb24` (opaque pictures — an RGB 8:8:8
+    DPEL, the default genlock policy) or `Rgba` (a DPEL alpha / opacity
+    component); `iff_deep` passes a §1.5b JPEG body through as `mjpeg`.
+  - `iff_anim` keeps its composited `Rgba` frames (an animation is a
+    playback, like GIF's `decode_all`).
+  - The muxers accept the same layouts: `iff_ilbm` writes `ilbm`
+    packets verbatim and encodes `rawvideo` `Rgba` / `Rgb24` / `Pal8`
+    (+ palette `extradata`); the DEEP / RGB8 / RGBN / ANIM muxers take
+    `rawvideo` in any of the three.
+  - `iff_8svx` and `aiff` are unchanged.
 
 ## Supported layouts
 
@@ -605,7 +622,8 @@ Read + round-trip support for `FORM / ILBM`:
   selecting `HasMask` / `HasTransparentColor`).
 - Container id: `"iff_ilbm"`, probes `FORM....ILBM` (and
   `FORM....PBM `) and matches `.ilbm` / `.lbm` by extension.
-  Single-stream `rawvideo` / `Rgba`.
+  Single `ilbm` codec stream in the native layout (`Pal8` + palette
+  `extradata` / `Rgb24` / `Rgba`); the packet is the whole `FORM`.
 - HAM encode picks the cheapest of (palette-lookup, modify-R,
   modify-G, modify-B) per pixel by squared channel distance against
   the running channel state. EHB encode quantises against a 64-entry
@@ -1219,14 +1237,16 @@ registry**: [`ilbm::register`] installs the `iff_rgb8` / `iff_rgbn` /
 `.rgb8` / `.rgbn` / `.deep` extension), so a Turbo-Silver RGB8 / RGBN or
 an Amiga-Centre-Scotland DEEP file decodes through the standard
 `ContainerRegistry::probe_input` / `open_demuxer` path exactly like
-`iff_ilbm`. The RGB8 / RGBN demuxers surface a single `rawvideo` / `Rgba`
-keyframe and are EOF after one packet, and apply
+`iff_ilbm`. The RGB8 / RGBN demuxers surface a single `rawvideo` / `Rgb24`
+keyframe (opaque under the default genlock policy, so no alpha plane is
+invented) and are EOF after one packet, and apply
 [`GenlockPolicy::default`] ("ignore — use the coded RGB", the §3.3
 load-as-a-picture default); callers needing the Turbo-Silver
 zero-colour or brush-transparency genlock semantics use [`ilbm::parse_rgb8`]
 / [`ilbm::parse_rgbn`] directly. All three ids also register
 **container-level muxers**: [`ilbm::DeepMuxer`] (`iff_deep`) accepts a
-`rawvideo` / `Rgba` stream with one packet per DBOD cel — the DPEL is
+`rawvideo` stream (`Rgba`, `Rgb24` or `Pal8` + palette `extradata`) with
+one packet per DBOD cel — the DPEL is
 derived from the pixels (RGB 8:8:8 when every frame is opaque, RGBA
 8:8:8:8 otherwise), [`ilbm::DeepMuxerCompression`] picks the body coding
 (default `Auto` — NOCOMPRESSION vs RUNLENGTH, whichever FORM is
@@ -1236,8 +1256,9 @@ base, so a demux → mux → demux chain preserves the cel timing; the
 single-frame `iff_rgb8` / `iff_rgbn` muxers wrap one packet via
 [`ilbm::encode_rgb8`] / [`ilbm::encode_rgbn`] (alpha 0 drives the §3.3
 genlock bit, RGBN quantises each gun to its top nibble). The DEEP demuxer decodes the
-NOCOMPRESSION and RUNLENGTH (§1.5b ByteRun1) body codings to `rawvideo` /
-`Rgba` keyframes, and **passes a §1.5b JPEG FORM through as codec-id
+NOCOMPRESSION and RUNLENGTH (§1.5b ByteRun1) body codings to `rawvideo`
+keyframes in the DPEL's native layout (`Rgb24`, or `Rgba` when it has an
+alpha / opacity component), and **passes a §1.5b JPEG FORM through as codec-id
 `"mjpeg"` packets** — one validated JFIF stream per DBOD, DCHG timing
 honoured, no pixel format declared (the JPEG header is authoritative for
 the decoded geometry) — so the standard codec-resolution path hands the

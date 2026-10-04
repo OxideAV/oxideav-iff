@@ -207,10 +207,15 @@ fn tvpp_demuxer_emits_one_keyframe_per_layer() {
     let mut dmx = reg
         .open_demuxer("iff_tvpp", rs, &oxideav_core::NullCodecResolver)
         .unwrap();
+    // Native layout: an RGB 8:8:8 DPEL is `Rgb24`.
+    assert_eq!(
+        dmx.streams()[0].params.pixel_format,
+        Some(oxideav_core::PixelFormat::Rgb24)
+    );
     let p0 = dmx.next_packet().unwrap();
-    assert_eq!(&p0.data[0..4], &[1, 2, 3, 255]);
+    assert_eq!(p0.data, vec![1, 2, 3]);
     assert!(p0.flags.keyframe);
     let p1 = dmx.next_packet().unwrap();
-    assert_eq!(&p1.data[0..4], &[4, 5, 6, 255]);
+    assert_eq!(p1.data, vec![4, 5, 6]);
     assert!(matches!(dmx.next_packet(), Err(oxideav_core::Error::Eof)));
 }

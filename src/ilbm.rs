@@ -59,11 +59,11 @@ use crate::error::{IffError as Error, Result};
 #[cfg(feature = "registry")]
 mod framework;
 #[cfg(feature = "registry")]
-pub(crate) use framework::true_color_muxer_stream_shape;
-#[cfg(feature = "registry")]
 pub use framework::{
     register, DeepMuxer, DeepMuxerCompression, IlbmMuxer, MuxerMode, RgbTrueColorMuxer,
 };
+#[cfg(feature = "registry")]
+pub(crate) use framework::{true_color_muxer_stream_shape, MuxInput};
 
 // ───────────────────── BMHD ─────────────────────
 

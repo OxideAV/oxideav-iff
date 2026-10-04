@@ -2,7 +2,7 @@
 //! demuxers (`iff_rgb8`, `iff_rgbn`).
 //!
 //! These exercise the registry wiring — extension table, byte-signature
-//! probe, and `open_demuxer` → single `rawvideo` / `Rgba` keyframe — that
+//! probe, and `open_demuxer` → single `rawvideo` / `Rgb24` keyframe — that
 //! sits on top of the `ilbm::parse_rgb8` / `parse_rgbn` body decoders. The
 //! per-pixel decode correctness lives in `iff_truecolor.rs`; here we only
 //! confirm the demuxer surface decodes the same image, advertises the right
@@ -137,7 +137,7 @@ fn probe_rejects_unrelated_form() {
 // ──────────────────────────── demux RGB8 ───────────────────────────────
 
 #[test]
-fn rgb8_demuxer_emits_single_rgba_keyframe() {
+fn rgb8_demuxer_emits_single_rgb24_keyframe() {
     let reg = registry();
     let mut dmx = open(&reg, "iff_rgb8", rgb8_file());
     assert_eq!(dmx.format_name(), "iff_rgb8");
@@ -147,16 +147,18 @@ fn rgb8_demuxer_emits_single_rgba_keyframe() {
     assert_eq!(s.params.media_type, MediaType::Video);
     assert_eq!(s.params.width, Some(2));
     assert_eq!(s.params.height, Some(2));
-    assert_eq!(s.params.pixel_format, Some(PixelFormat::Rgba));
+    // Native layout (fleet sweep): the default GenlockPolicy keeps every
+    // pixel opaque, so the stream is `Rgb24` — no alpha plane is invented.
+    assert_eq!(s.params.pixel_format, Some(PixelFormat::Rgb24));
 
     let pkt = dmx.next_packet().unwrap();
     assert!(pkt.flags.keyframe);
-    assert_eq!(pkt.data.len(), 2 * 2 * 4);
+    assert_eq!(pkt.data.len(), 2 * 2 * 3);
     // Default GenlockPolicy is "ignore — use the coded RGB".
     for px in 0..3 {
-        assert_eq!(&pkt.data[px * 4..px * 4 + 4], &[0xC0, 0x10, 0xC0, 0xFF]);
+        assert_eq!(&pkt.data[px * 3..px * 3 + 3], &[0xC0, 0x10, 0xC0]);
     }
-    assert_eq!(&pkt.data[12..16], &[0x00, 0xFF, 0x00, 0xFF]);
+    assert_eq!(&pkt.data[9..12], &[0x00, 0xFF, 0x00]);
 
     // One image → one packet, then EOF.
     assert!(matches!(dmx.next_packet(), Err(oxideav_core::Error::Eof)));
@@ -173,14 +175,14 @@ fn rgbn_demuxer_widens_4bit_guns() {
     let s = &dmx.streams()[0];
     assert_eq!(s.params.width, Some(4));
     assert_eq!(s.params.height, Some(1));
-    assert_eq!(s.params.pixel_format, Some(PixelFormat::Rgba));
+    assert_eq!(s.params.pixel_format, Some(PixelFormat::Rgb24));
 
     let pkt = dmx.next_packet().unwrap();
-    assert_eq!(pkt.data.len(), 4 * 4);
-    assert_eq!(&pkt.data[0..4], &[0xFF, 0x00, 0x00, 0xFF]);
-    assert_eq!(&pkt.data[4..8], &[0xFF, 0x00, 0x00, 0xFF]);
-    assert_eq!(&pkt.data[8..12], &[0xFF, 0xFF, 0xFF, 0xFF]);
-    assert_eq!(&pkt.data[12..16], &[0xFF, 0xFF, 0xFF, 0xFF]);
+    assert_eq!(pkt.data.len(), 4 * 3);
+    assert_eq!(&pkt.data[0..3], &[0xFF, 0x00, 0x00]);
+    assert_eq!(&pkt.data[3..6], &[0xFF, 0x00, 0x00]);
+    assert_eq!(&pkt.data[6..9], &[0xFF, 0xFF, 0xFF]);
+    assert_eq!(&pkt.data[9..12], &[0xFF, 0xFF, 0xFF]);
 
     assert!(matches!(dmx.next_packet(), Err(oxideav_core::Error::Eof)));
 }

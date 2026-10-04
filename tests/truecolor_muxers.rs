@@ -114,8 +114,13 @@ fn deep_mux_single_opaque_frame_roundtrips_as_rgb888() {
     let mut dmx = reg
         .open_demuxer("iff_deep", input, &oxideav_core::NullCodecResolver)
         .unwrap();
+    // The demuxer declares the native layout: an RGB 8:8:8 DPEL is `Rgb24`.
+    assert_eq!(
+        dmx.streams()[0].params.pixel_format,
+        Some(PixelFormat::Rgb24)
+    );
     let pkt = dmx.next_packet().unwrap();
-    assert_eq!(pkt.data, rgba);
+    assert_eq!(pkt.data, strip_alpha(&rgba));
 }
 
 #[test]
@@ -261,8 +266,12 @@ fn rgb8_mux_roundtrips_through_the_demuxer() {
     let mut dmx = reg
         .open_demuxer("iff_rgb8", input, &oxideav_core::NullCodecResolver)
         .unwrap();
+    assert_eq!(
+        dmx.streams()[0].params.pixel_format,
+        Some(PixelFormat::Rgb24)
+    );
     let pkt = dmx.next_packet().unwrap();
-    assert_eq!(pkt.data, rgba);
+    assert_eq!(pkt.data, strip_alpha(&rgba));
 }
 
 #[test]
@@ -285,7 +294,48 @@ fn rgbn_mux_roundtrips_nibble_replicated_colours() {
         .open_demuxer("iff_rgbn", input, &oxideav_core::NullCodecResolver)
         .unwrap();
     let pkt = dmx.next_packet().unwrap();
-    assert_eq!(pkt.data, rgba);
+    assert_eq!(pkt.data, strip_alpha(&rgba));
+}
+
+/// The `Rgb24` bytes of an opaque RGBA buffer (what the native-layout
+/// demuxers emit for alpha-less pictures).
+fn strip_alpha(rgba: &[u8]) -> Vec<u8> {
+    rgba.chunks_exact(4)
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect()
+}
+
+#[test]
+fn muxers_accept_rgb24_and_pal8_rawvideo_streams() {
+    // Fleet-sweep layouts: a `Rgb24` stream and a `Pal8` stream (palette
+    // RGB triples in `extradata`) encode exactly like the equivalent RGBA.
+    let mut rgb_stream = video_stream(2, 1, TimeBase::new(1, 1));
+    rgb_stream.params.pixel_format = Some(PixelFormat::Rgb24);
+    let rgb = vec![10, 20, 30, 40, 50, 60];
+    let from_rgb = mux_frames("iff_deep", &rgb_stream, &[(rgb, 0, None)]);
+
+    let mut pal_stream = video_stream(2, 1, TimeBase::new(1, 1));
+    pal_stream.params.pixel_format = Some(PixelFormat::Pal8);
+    pal_stream.params.extradata = vec![40, 50, 60, 10, 20, 30];
+    let from_pal = mux_frames("iff_deep", &pal_stream, &[(vec![1, 0], 0, None)]);
+
+    let rgba_stream = video_stream(2, 1, TimeBase::new(1, 1));
+    let from_rgba = mux_frames(
+        "iff_deep",
+        &rgba_stream,
+        &[(vec![10, 20, 30, 255, 40, 50, 60, 255], 0, None)],
+    );
+    assert_eq!(from_rgb, from_rgba);
+    assert_eq!(from_pal, from_rgba);
+
+    // A Pal8 stream without its palette is rejected up front.
+    let mut bare = video_stream(2, 1, TimeBase::new(1, 1));
+    bare.params.pixel_format = Some(PixelFormat::Pal8);
+    let reg = registry();
+    let ws: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
+    assert!(reg
+        .open_muxer("iff_rgb8", ws, std::slice::from_ref(&bare))
+        .is_err());
 }
 
 #[test]

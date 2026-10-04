@@ -2,10 +2,22 @@
 //!
 //! Everything in this file needs the framework: the `iff_ilbm` /
 //! `iff_acbm` / `iff_rgb8` / `iff_rgbn` / `iff_deep` / `iff_tvpp`
-//! demuxers (one `rawvideo` / `Rgba` keyframe per decoded picture, or
-//! `mjpeg` passthrough packets for a §1.5b JPEG `FORM DEEP`), the
-//! `IlbmMuxer` / `DeepMuxer` / `RgbTrueColorMuxer` container muxers and
-//! [`register`]. The parsers and encoders they wrap live in the parent
+//! demuxers, the `IlbmMuxer` / `DeepMuxer` / `RgbTrueColorMuxer`
+//! container muxers and [`register`].
+//!
+//! **Stream layouts are the native ones** (image-crate contract, fleet
+//! sweep): `iff_ilbm` / `iff_acbm` declare an `ilbm` codec stream whose
+//! `pixel_format` is what [`crate::decode`] returns (`Pal8` with the
+//! palette's RGB triples in `extradata`, `Rgb24`, `Rgba`) and emit the
+//! whole `FORM` as one packet — the registered `ilbm` decoder
+//! ([`crate::make_decoder`]) turns it into the native frame with the
+//! palette side-channel. `iff_deep` / `iff_tvpp` / `iff_rgb8` /
+//! `iff_rgbn` emit decoded `rawvideo` packets in `Rgb24` (opaque
+//! pictures) or `Rgba` (a DPEL alpha / opacity component), one keyframe
+//! per decoded picture; a §1.5b JPEG `FORM DEEP` passes its JFIF
+//! streams through as `mjpeg` packets. The muxers accept the same
+//! layouts (`ilbm` packets verbatim; `rawvideo` `Pal8` + `extradata`,
+//! `Rgb24` or `Rgba`). The parsers and encoders they wrap live in the parent
 //! module and are framework-free; this module is compiled only with the
 //! default-on `registry` feature.
 
@@ -125,26 +137,35 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     full.extend_from_slice(&form_type);
     full.extend_from_slice(&form_body);
 
-    let image = parse_ilbm(&full)?;
-    let mut params = CodecParameters::video(CodecId::new("rawvideo"));
+    let stream = native_form_stream(&full)?;
+    Ok(Box::new(IlbmDemuxer {
+        streams: vec![stream],
+        form: Some(full),
+        format: "iff_ilbm",
+    }))
+}
+
+/// Stream description of a whole raster `FORM` handed to the `ilbm`
+/// codec: the layout [`crate::decode`] produces (validating the picture
+/// on the way), with the palette's RGB triples in `extradata` for `Pal8`
+/// so stream-level consumers see it before the first frame.
+fn native_form_stream(full: &[u8]) -> Result<StreamInfo> {
+    let image = crate::decode(full)?;
+    let mut params = CodecParameters::video(CodecId::new(crate::registry::CODEC_ID_STR));
     params.media_type = MediaType::Video;
     params.width = Some(image.width);
     params.height = Some(image.height);
-    params.pixel_format = Some(PixelFormat::Rgba);
-
-    let stream = StreamInfo {
+    params.pixel_format = Some(crate::registry::to_core_pixel_format(image.format));
+    if let (crate::IffPixelFormat::Pal8, Some(p)) = (image.format, &image.palette) {
+        params.extradata = p.to_rgb();
+    }
+    Ok(StreamInfo {
         index: 0,
         time_base: TimeBase::new(1, 1),
         duration: Some(1),
         start_time: Some(0),
         params,
-    };
-
-    Ok(Box::new(IlbmDemuxer {
-        streams: vec![stream],
-        image: Some(image),
-        format: "iff_ilbm",
-    }))
+    })
 }
 
 fn open_acbm(
@@ -183,31 +204,19 @@ fn open_acbm(
     full.extend_from_slice(&form_type);
     full.extend_from_slice(&form_body);
 
-    let image = parse_acbm(&full)?;
-    let mut params = CodecParameters::video(CodecId::new("rawvideo"));
-    params.media_type = MediaType::Video;
-    params.width = Some(image.width);
-    params.height = Some(image.height);
-    params.pixel_format = Some(PixelFormat::Rgba);
-
-    let stream = StreamInfo {
-        index: 0,
-        time_base: TimeBase::new(1, 1),
-        duration: Some(1),
-        start_time: Some(0),
-        params,
-    };
-
+    let stream = native_form_stream(&full)?;
     Ok(Box::new(IlbmDemuxer {
         streams: vec![stream],
-        image: Some(image),
+        form: Some(full),
         format: "iff_acbm",
     }))
 }
 
+/// `iff_ilbm` / `iff_acbm`: one `ilbm` codec packet holding the whole
+/// `FORM`; see [`native_form_stream`] for the stream shape.
 struct IlbmDemuxer {
     streams: Vec<StreamInfo>,
-    image: Option<IlbmImage>,
+    form: Option<Vec<u8>>,
     format: &'static str,
 }
 
@@ -219,9 +228,9 @@ impl Demuxer for IlbmDemuxer {
         &self.streams
     }
     fn next_packet(&mut self) -> Result<Packet> {
-        let img = self.image.take().ok_or(Error::Eof)?;
+        let form = self.form.take().ok_or(Error::Eof)?;
         let stream = &self.streams[0];
-        let mut pkt = Packet::new(0, stream.time_base, img.rgba);
+        let mut pkt = Packet::new(0, stream.time_base, form);
         pkt.pts = Some(0);
         pkt.dts = Some(0);
         pkt.duration = Some(1);
@@ -283,15 +292,19 @@ pub enum MuxerMode {
     Acbm,
 }
 
-/// Container-level ILBM / PBM muxer. Accepts a single `rawvideo`
-/// stream with `PixelFormat::Rgba`. The emitted file's encoder mode
-/// follows [`MuxerMode`] (default [`MuxerMode::IndexedAuto`]) and
-/// compression follows [`Compression`] (default
-/// [`Compression::Auto`]).
+/// Container-level ILBM / PBM muxer. Accepts a single video stream:
+/// either an `ilbm` codec stream (what the `iff_ilbm` / `iff_acbm`
+/// demuxers and [`crate::make_encoder`] produce — the one packet is a
+/// complete raster `FORM`, written verbatim), or a `rawvideo` stream in
+/// `Rgba`, `Rgb24` or `Pal8` (palette RGB triples in `extradata`),
+/// which is expanded to RGBA and encoded. The emitted file's encoder
+/// mode follows [`MuxerMode`] (default [`MuxerMode::IndexedAuto`]) and
+/// compression follows [`Compression`] (default [`Compression::Auto`]).
 pub struct IlbmMuxer {
     output: Box<dyn WriteSeek>,
     width: u32,
     height: u32,
+    input: MuxInput,
     compression: Compression,
     mode: MuxerMode,
     masking: Masking,
@@ -300,20 +313,106 @@ pub struct IlbmMuxer {
     pending: Vec<u8>,
 }
 
+/// Packet layout a raster muxer was opened with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MuxInput {
+    /// `ilbm` codec packets: a complete `FORM`, written as-is.
+    Form,
+    /// `rawvideo` packed RGBA, 4 bytes per pixel.
+    Rgba,
+    /// `rawvideo` packed RGB, 3 bytes per pixel.
+    Rgb24,
+    /// `rawvideo` palette indices with the RGB triples of `extradata`.
+    Pal8(Vec<[u8; 3]>),
+}
+
+impl MuxInput {
+    /// Classify a stream's declared layout; `form_ok` admits the `ilbm`
+    /// codec passthrough (ILBM / PBM / ACBM muxer only).
+    fn of(label: &str, params: &CodecParameters, form_ok: bool) -> Result<Self> {
+        if params.media_type != MediaType::Video {
+            return Err(Error::invalid(format!("{label} stream must be video")));
+        }
+        if form_ok && params.codec_id == CodecId::new(crate::registry::CODEC_ID_STR) {
+            return Ok(Self::Form);
+        }
+        match params.pixel_format {
+            Some(PixelFormat::Rgba) => Ok(Self::Rgba),
+            Some(PixelFormat::Rgb24) => Ok(Self::Rgb24),
+            Some(PixelFormat::Pal8) => {
+                if params.extradata.is_empty() || params.extradata.len() % 3 != 0 {
+                    return Err(Error::invalid(format!(
+                        "{label} muxer: Pal8 stream needs its palette as RGB triples in extradata"
+                    )));
+                }
+                Ok(Self::Pal8(
+                    params
+                        .extradata
+                        .chunks_exact(3)
+                        .map(|c| [c[0], c[1], c[2]])
+                        .collect(),
+                ))
+            }
+            other => Err(Error::unsupported(format!(
+                "{label} muxer accepts Rgba / Rgb24 / Pal8 rawvideo{}, not {other:?}",
+                if form_ok { " or ilbm packets" } else { "" }
+            ))),
+        }
+    }
+
+    /// Bytes one `rawvideo` pixel occupies in this layout.
+    fn bytes_per_pixel(&self) -> usize {
+        match self {
+            Self::Form => 0,
+            Self::Rgba => 4,
+            Self::Rgb24 => 3,
+            Self::Pal8(_) => 1,
+        }
+    }
+
+    /// Validate a `rawvideo` packet against the geometry and expand it to
+    /// packed RGBA (opaque for `Rgb24`; palette lookup for `Pal8`, out-of-
+    /// range indices opaque black like the renderer).
+    pub(crate) fn to_rgba(
+        &self,
+        label: &str,
+        data: &[u8],
+        width: usize,
+        height: usize,
+    ) -> Result<Vec<u8>> {
+        let bpp = self.bytes_per_pixel();
+        let expected = width * height * bpp;
+        if data.len() != expected {
+            return Err(Error::invalid(format!(
+                "{label} muxer: packet size {} does not match width*height*{bpp} = {expected}",
+                data.len()
+            )));
+        }
+        Ok(match self {
+            Self::Form => Vec::new(),
+            Self::Rgba => data.to_vec(),
+            Self::Rgb24 => data
+                .chunks_exact(3)
+                .flat_map(|p| [p[0], p[1], p[2], 0xFF])
+                .collect(),
+            Self::Pal8(pal) => data
+                .iter()
+                .flat_map(|&i| {
+                    let c = pal.get(usize::from(i)).copied().unwrap_or([0, 0, 0]);
+                    [c[0], c[1], c[2], 0xFF]
+                })
+                .collect(),
+        })
+    }
+}
+
 impl IlbmMuxer {
     pub fn new(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Self> {
         if streams.len() != 1 {
             return Err(Error::unsupported("ILBM supports exactly one video stream"));
         }
         let s = &streams[0];
-        if s.params.media_type != MediaType::Video {
-            return Err(Error::invalid("ILBM stream must be video"));
-        }
-        if s.params.pixel_format != Some(PixelFormat::Rgba) {
-            return Err(Error::unsupported(
-                "ILBM muxer requires PixelFormat::Rgba (round 1)",
-            ));
-        }
+        let input = MuxInput::of("ILBM", &s.params, true)?;
         let width = s
             .params
             .width
@@ -326,6 +425,7 @@ impl IlbmMuxer {
             output,
             width,
             height,
+            input,
             compression: Compression::Auto,
             mode: MuxerMode::IndexedAuto,
             masking: Masking::None,
@@ -369,26 +469,42 @@ impl Muxer for IlbmMuxer {
         Ok(()) // header is emitted lazily at write_trailer time
     }
     fn write_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.pending.is_empty() {
-            self.pending.extend_from_slice(&packet.data);
-        } else {
+        if !self.pending.is_empty() {
             return Err(Error::unsupported(
-                "ILBM muxer: round 1 emits one frame per file (single packet)",
+                "ILBM muxer: the FORM stores one image (single packet)",
             ));
         }
+        if self.input == MuxInput::Form {
+            // `ilbm` codec packet: a complete raster FORM, kept verbatim
+            // (validated at write_trailer).
+            self.pending.extend_from_slice(&packet.data);
+            return Ok(());
+        }
+        self.pending = self.input.to_rgba(
+            "ILBM",
+            &packet.data,
+            self.width as usize,
+            self.height as usize,
+        )?;
         Ok(())
     }
     fn write_trailer(&mut self) -> Result<()> {
         if self.written {
             return Ok(());
         }
-        let expected = (self.width as usize) * (self.height as usize) * 4;
-        if self.pending.len() != expected {
-            return Err(Error::invalid(format!(
-                "ILBM muxer: packet size {} does not match width*height*4 = {}",
-                self.pending.len(),
-                expected
-            )));
+        if self.input == MuxInput::Form {
+            if !crate::probe(&self.pending) {
+                return Err(Error::invalid(
+                    "ILBM muxer: ilbm packet is not a raster FORM",
+                ));
+            }
+            self.output.write_all(&self.pending)?;
+            self.output.flush()?;
+            self.written = true;
+            return Ok(());
+        }
+        if self.pending.is_empty() {
+            return Err(Error::invalid("ILBM muxer: no frame written"));
         }
 
         // Plane count, palette, CAMG flags + form type are mode-driven.
@@ -512,7 +628,17 @@ fn probe_rgb_form(buf: &[u8], form_type: &[u8; 4]) -> u8 {
     }
 }
 
-/// Single-frame true-colour demuxer shared by `iff_rgb8` / `iff_rgbn`.
+/// Drop the alpha byte of a packed RGBA buffer (the `Rgb24` packet of an
+/// opaque picture).
+fn strip_alpha(rgba: Vec<u8>) -> Vec<u8> {
+    rgba.chunks_exact(4)
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect()
+}
+
+/// Single-frame true-colour demuxer shared by `iff_rgb8` / `iff_rgbn`:
+/// one `rawvideo` `Rgb24` keyframe (the default [`GenlockPolicy`] keeps
+/// every pixel opaque, so no alpha plane is invented).
 struct RgbTrueColorDemuxer {
     format_name: &'static str,
     streams: Vec<StreamInfo>,
@@ -593,12 +719,18 @@ fn read_true_color_form(
     Ok(full)
 }
 
-fn true_color_stream(width: u16, height: u16) -> StreamInfo {
+/// `rawvideo` stream in the picture's native layout: `Rgba` when the
+/// decoded pixels carry alpha, else `Rgb24`.
+fn true_color_stream(width: u16, height: u16, has_alpha: bool) -> StreamInfo {
     let mut params = CodecParameters::video(CodecId::new("rawvideo"));
     params.media_type = MediaType::Video;
     params.width = Some(u32::from(width));
     params.height = Some(u32::from(height));
-    params.pixel_format = Some(PixelFormat::Rgba);
+    params.pixel_format = Some(if has_alpha {
+        PixelFormat::Rgba
+    } else {
+        PixelFormat::Rgb24
+    });
     StreamInfo {
         index: 0,
         time_base: TimeBase::new(1, 1),
@@ -616,8 +748,8 @@ fn open_rgb8(
     let image = parse_rgb8(&full, GenlockPolicy::default())?;
     Ok(Box::new(RgbTrueColorDemuxer {
         format_name: "iff_rgb8",
-        streams: vec![true_color_stream(image.width, image.height)],
-        rgba: Some(image.rgba),
+        streams: vec![true_color_stream(image.width, image.height, false)],
+        rgba: Some(strip_alpha(image.rgba)),
     }))
 }
 
@@ -629,8 +761,8 @@ fn open_rgbn(
     let image = parse_rgbn(&full, GenlockPolicy::default())?;
     Ok(Box::new(RgbTrueColorDemuxer {
         format_name: "iff_rgbn",
-        streams: vec![true_color_stream(image.width, image.height)],
-        rgba: Some(image.rgba),
+        streams: vec![true_color_stream(image.width, image.height, false)],
+        rgba: Some(strip_alpha(image.rgba)),
     }))
 }
 
@@ -640,8 +772,9 @@ fn open_rgbn(
 // already existed: `iff_deep` (multi-frame `FORM DEEP`, NOCOMPRESSION /
 // RUNLENGTH with an auto picker, DCHG timing from the packet durations),
 // and `iff_rgb8` / `iff_rgbn` (single-frame Turbo-Silver genlock-RLE FORMs).
-// All accept a single `rawvideo` / `Rgba` video stream, mirroring the
-// `IlbmMuxer` contract, and assemble the FORM at `write_trailer` time.
+// All accept a single `rawvideo` video stream in `Rgba` / `Rgb24` / `Pal8`,
+// mirroring the `IlbmMuxer` contract, and assemble the FORM at
+// `write_trailer` time.
 
 /// Body-compression choice for [`DeepMuxer`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -658,7 +791,8 @@ pub enum DeepMuxerCompression {
 }
 
 /// Container-level `FORM DEEP` muxer (`iff_deep`). Accepts a single
-/// `rawvideo` / `Rgba` video stream and one packet per DBOD frame (§1.4 —
+/// `rawvideo` video stream (`Rgba`, `Rgb24` or `Pal8` + palette
+/// `extradata`) and one packet per DBOD frame (§1.4 —
 /// several images in one FORM are successive cels).
 ///
 /// * **DPEL** is derived from the pixels at `write_trailer`: RGB 8:8:8 when
@@ -675,6 +809,7 @@ pub struct DeepMuxer {
     output: Box<dyn WriteSeek>,
     width: u16,
     height: u16,
+    input: MuxInput,
     time_base: TimeBase,
     compression: DeepMuxerCompression,
     frames: Vec<Vec<u8>>,
@@ -684,11 +819,12 @@ pub struct DeepMuxer {
 
 impl DeepMuxer {
     pub fn new(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Self> {
-        let (width, height, time_base) = true_color_muxer_stream_shape("DEEP", streams)?;
+        let (width, height, time_base, input) = true_color_muxer_stream_shape("DEEP", streams)?;
         Ok(Self {
             output,
             width,
             height,
+            input,
             time_base,
             compression: DeepMuxerCompression::default(),
             frames: Vec::new(),
@@ -705,26 +841,20 @@ impl DeepMuxer {
 }
 
 /// Shared stream-shape validation for the true-colour muxers: exactly one
-/// `rawvideo`-style video stream, `PixelFormat::Rgba`, with dimensions that
-/// fit the 16-bit fields every IFF raster header uses.
+/// `rawvideo`-style video stream in `Rgba`, `Rgb24` or `Pal8` (+ palette
+/// `extradata`), with dimensions that fit the 16-bit fields every IFF
+/// raster header uses.
 pub(crate) fn true_color_muxer_stream_shape(
     label: &str,
     streams: &[StreamInfo],
-) -> Result<(u16, u16, TimeBase)> {
+) -> Result<(u16, u16, TimeBase, MuxInput)> {
     if streams.len() != 1 {
         return Err(Error::unsupported(format!(
             "{label} muxer supports exactly one video stream"
         )));
     }
     let s = &streams[0];
-    if s.params.media_type != MediaType::Video {
-        return Err(Error::invalid(format!("{label} stream must be video")));
-    }
-    if s.params.pixel_format != Some(PixelFormat::Rgba) {
-        return Err(Error::unsupported(format!(
-            "{label} muxer requires PixelFormat::Rgba"
-        )));
-    }
+    let input = MuxInput::of(label, &s.params, false)?;
     let width = s
         .params
         .width
@@ -737,7 +867,7 @@ pub(crate) fn true_color_muxer_stream_shape(
         .map_err(|_| Error::invalid(format!("{label} muxer: width {width} exceeds 65535")))?;
     let height = u16::try_from(height)
         .map_err(|_| Error::invalid(format!("{label} muxer: height {height} exceeds 65535")))?;
-    Ok((width, height, s.time_base))
+    Ok((width, height, s.time_base, input))
 }
 
 impl Muxer for DeepMuxer {
@@ -748,17 +878,16 @@ impl Muxer for DeepMuxer {
         Ok(()) // the FORM is assembled at write_trailer time
     }
     fn write_packet(&mut self, packet: &Packet) -> Result<()> {
-        let expected = usize::from(self.width) * usize::from(self.height) * 4;
-        if packet.data.len() != expected {
-            return Err(Error::invalid(format!(
-                "DEEP muxer: packet size {} does not match width*height*4 = {expected}",
-                packet.data.len()
-            )));
-        }
+        let rgba = self.input.to_rgba(
+            "DEEP",
+            &packet.data,
+            usize::from(self.width),
+            usize::from(self.height),
+        )?;
         if self.frames.is_empty() {
             self.first_duration = packet.duration;
         }
-        self.frames.push(packet.data.clone());
+        self.frames.push(rgba);
         Ok(())
     }
     fn write_trailer(&mut self) -> Result<()> {
@@ -846,7 +975,8 @@ impl Muxer for DeepMuxer {
 
 /// Container-level single-frame muxer for the Turbo-Silver `FORM RGB8` /
 /// `FORM RGBN` genlock-RLE FORMs (`iff_rgb8` / `iff_rgbn`). Accepts one
-/// `rawvideo` / `Rgba` packet and assembles the FORM via [`encode_rgb8`] /
+/// `rawvideo` packet (`Rgba`, `Rgb24` or `Pal8` + palette `extradata`,
+/// expanded to RGBA) and assembles the FORM via [`encode_rgb8`] /
 /// [`encode_rgbn`] at `write_trailer` — alpha 0 drives the §3.3 genlock bit
 /// (brush-transparency semantics), and RGBN quantises each gun to its top
 /// nibble (§3.1, 4 bits per gun).
@@ -856,6 +986,7 @@ pub struct RgbTrueColorMuxer {
     output: Box<dyn WriteSeek>,
     width: u16,
     height: u16,
+    input: MuxInput,
     pending: Vec<u8>,
     written: bool,
 }
@@ -868,13 +999,14 @@ impl RgbTrueColorMuxer {
         streams: &[StreamInfo],
     ) -> Result<Self> {
         let label = if is_rgb8 { "RGB8" } else { "RGBN" };
-        let (width, height, _tb) = true_color_muxer_stream_shape(label, streams)?;
+        let (width, height, _tb, input) = true_color_muxer_stream_shape(label, streams)?;
         Ok(Self {
             format_name,
             is_rgb8,
             output,
             width,
             height,
+            input,
             pending: Vec::new(),
             written: false,
         })
@@ -894,14 +1026,12 @@ impl Muxer for RgbTrueColorMuxer {
                 "RGB8/RGBN muxer: the FORM stores one image (single packet)",
             ));
         }
-        let expected = usize::from(self.width) * usize::from(self.height) * 4;
-        if packet.data.len() != expected {
-            return Err(Error::invalid(format!(
-                "RGB8/RGBN muxer: packet size {} does not match width*height*4 = {expected}",
-                packet.data.len()
-            )));
-        }
-        self.pending.extend_from_slice(&packet.data);
+        self.pending = self.input.to_rgba(
+            "RGB8/RGBN",
+            &packet.data,
+            usize::from(self.width),
+            usize::from(self.height),
+        )?;
         Ok(())
     }
     fn write_trailer(&mut self) -> Result<()> {
@@ -945,7 +1075,8 @@ fn open_rgbn_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result
 // the standard `ContainerRegistry::open_*` path, surfacing **one** keyframe per
 // DBOD frame (§1.4) — a still DEEP is one packet, a cel-anim DEEP plays every
 // DBOD with per-frame PTS from the DCHG timing (§1.6). NOCOMPRESSION + §1.5b
-// RUNLENGTH bodies are pixel-decoded to `rawvideo` / `Rgba` packets; a §1.5b
+// RUNLENGTH bodies are pixel-decoded to `rawvideo` packets in the native
+// layout (`Rgb24`, or `Rgba` when the DPEL has an alpha component); a §1.5b
 // JPEG FORM is passed through as `"mjpeg"` packets (one validated JFIF stream
 // per DBOD) for a downstream JPEG decoder. TVDC (no in-FORM delta table — the
 // §1.5 gap) and HUFFMAN / DYNAMICHUFF return the same `Error::invalid`
@@ -962,7 +1093,8 @@ fn probe_deep(p: &oxideav_core::ProbeData) -> u8 {
 /// `FORM DEEP` demuxer. Emits one keyframe per DBOD frame (§1.4): a still
 /// DEEP is a one-packet stream, a cel-anim DEEP plays every frame in document
 /// order with per-frame PTS derived from the DCHG timing (§1.6). Packets are
-/// decoded `rawvideo` / `Rgba` frames for the pixel-decodable codings, or
+/// decoded `rawvideo` frames (`Rgb24` / `Rgba` per DPEL) for the
+/// pixel-decodable codings, or
 /// verbatim JFIF streams under codec id `"mjpeg"` for a §1.5b JPEG FORM.
 struct DeepDemuxer {
     streams: Vec<StreamInfo>,
@@ -1012,7 +1144,7 @@ fn probe_tvpp(p: &oxideav_core::ProbeData) -> u8 {
 }
 
 /// `FORM TVPP` demuxer (best-effort, §2). Surfaces every decoded DBOD layer as
-/// a `rawvideo` / `Rgba` keyframe in document order. The TVPP-specific
+/// a `rawvideo` keyframe (`Rgb24` / `Rgba` per DPEL) in document order. The TVPP-specific
 /// MIXR/BGP1/BGP2 chunks are not exposed through the packet stream; a caller
 /// that wants them uses [`parse_tvpp`] directly.
 fn open_tvpp(
@@ -1028,12 +1160,22 @@ fn open_tvpp(
     let (time_base, frame_duration, duration_us) =
         deep_stream_timing(img.dchg.and_then(|d| d.delay_millis()), frame_count);
 
-    let mut stream = true_color_stream(width, height);
+    let has_alpha = img.dpel.has_alpha();
+    let mut stream = true_color_stream(width, height, has_alpha);
     stream.time_base = time_base;
     stream.duration = Some(frame_duration.saturating_mul(frame_count));
 
-    let frames: std::collections::VecDeque<Vec<u8>> =
-        img.layers.into_iter().map(|f| f.rgba).collect();
+    let frames: std::collections::VecDeque<Vec<u8>> = img
+        .layers
+        .into_iter()
+        .map(|f| {
+            if has_alpha {
+                f.rgba
+            } else {
+                strip_alpha(f.rgba)
+            }
+        })
+        .collect();
 
     Ok(Box::new(DeepDemuxer {
         streams: vec![stream],
@@ -1152,12 +1294,25 @@ fn open_deep(
     let (time_base, frame_duration, duration_us) =
         deep_stream_timing(movie.frame_delay_millis(), frame_count);
 
-    let mut stream = true_color_stream(width, height);
+    // Native layout per DPEL: `Rgba` only when the pixel element carries
+    // an alpha / opacity component, else `Rgb24` (what `crate::decode`
+    // returns for the same FORM).
+    let has_alpha = movie.dpel.has_alpha();
+    let mut stream = true_color_stream(width, height, has_alpha);
     stream.time_base = time_base;
     stream.duration = Some(frame_duration.saturating_mul(frame_count));
 
-    let frames: std::collections::VecDeque<Vec<u8>> =
-        movie.frames.into_iter().map(|f| f.rgba).collect();
+    let frames: std::collections::VecDeque<Vec<u8>> = movie
+        .frames
+        .into_iter()
+        .map(|f| {
+            if has_alpha {
+                f.rgba
+            } else {
+                strip_alpha(f.rgba)
+            }
+        })
+        .collect();
 
     Ok(Box::new(DeepDemuxer {
         streams: vec![stream],

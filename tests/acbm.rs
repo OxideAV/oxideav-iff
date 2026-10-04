@@ -28,8 +28,8 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use oxideav_core::{
-    CodecId, CodecParameters, ContainerRegistry, Error, MediaType, Muxer, Packet, PixelFormat,
-    ReadSeek, StreamInfo, TimeBase, WriteSeek,
+    CodecId, CodecParameters, ContainerRegistry, Error, Frame, MediaType, Muxer, Packet,
+    PixelFormat, ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
 use oxideav_iff::ilbm::{
     encode_acbm, encode_ilbm, indices_to_planar_row, parse_acbm, parse_ilbm, Bmhd, Camg,
@@ -333,14 +333,41 @@ fn acbm_demuxer_decodes_one_keyframe() {
         .unwrap();
     assert_eq!(dmx.format_name(), "iff_acbm");
     let s = &dmx.streams()[0];
+    // Native layout (fleet sweep): an `ilbm` codec stream declaring the
+    // picture's own layout — `Pal8` with the CMAP as RGB triples in
+    // `extradata` — whose one packet is the whole FORM; the registered
+    // `ilbm` decoder turns it into the indexed frame + palette side-channel.
+    assert_eq!(s.params.codec_id, CodecId::new(oxideav_iff::CODEC_ID_STR));
     assert_eq!(s.params.width, Some(10));
     assert_eq!(s.params.height, Some(6));
+    assert_eq!(s.params.pixel_format, Some(PixelFormat::Pal8));
+    assert_eq!(s.params.extradata.len(), 16 * 3);
+    let params = s.params.clone();
 
     let pkt = dmx.next_packet().unwrap();
     assert!(pkt.flags.keyframe);
-    assert_eq!(pkt.data, img.rgba);
+    assert_eq!(pkt.data, bytes);
     // EOF after the single frame.
     assert!(matches!(dmx.next_packet(), Err(Error::Eof)));
+
+    let mut dec = oxideav_iff::make_decoder(&params).unwrap();
+    dec.send_packet(&pkt).unwrap();
+    let Frame::Video(v) = dec.receive_frame().unwrap() else {
+        panic!("expected a video frame");
+    };
+    assert_eq!(v.planes[0].stride, 10);
+    assert_eq!(v.planes[0].data.len(), 10 * 6);
+    assert_eq!(v.palette(), Some(&params.extradata[..]));
+    // The indexed samples expand to the same RGBA the parser renders.
+    let rgba: Vec<u8> = v.planes[0]
+        .data
+        .iter()
+        .flat_map(|&i| {
+            let p = &params.extradata[usize::from(i) * 3..usize::from(i) * 3 + 3];
+            [p[0], p[1], p[2], 0xFF]
+        })
+        .collect();
+    assert_eq!(rgba, img.rgba);
 }
 
 #[test]

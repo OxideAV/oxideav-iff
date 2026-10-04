@@ -41,6 +41,10 @@ registry = ["dep:oxideav-core"]
 # `oxideav-core`; the standalone CI job (`--no-default-features`) skips
 # them and runs every other test.
 [[test]]
+name = "ilbm_demuxer_native"
+required-features = ["registry"]
+
+[[test]]
 name = "acbm"
 required-features = ["registry"]
 

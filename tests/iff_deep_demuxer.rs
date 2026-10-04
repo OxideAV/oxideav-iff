@@ -1,7 +1,7 @@
 //! Container-registry coverage for the `iff_deep` demuxer.
 //!
 //! Exercises the registry wiring — extension table, byte-signature probe,
-//! and `open_demuxer` → single `rawvideo` / `Rgba` keyframe — that sits on
+//! and `open_demuxer` → single `rawvideo` / `Rgb24` keyframe — that sits on
 //! top of the `ilbm::parse_deep` body decoder. The per-pixel decode
 //! correctness lives in `iff_truecolor.rs`; here we only confirm the demuxer
 //! surface decodes the same image, advertises the right stream params, and
@@ -112,15 +112,17 @@ fn deep_demuxer_emits_chunky_rgb888() {
     assert_eq!(s.params.media_type, MediaType::Video);
     assert_eq!(s.params.width, Some(2));
     assert_eq!(s.params.height, Some(2));
-    assert_eq!(s.params.pixel_format, Some(PixelFormat::Rgba));
+    // Native layout (fleet sweep): an RGB 8:8:8 DPEL is `Rgb24`, not a
+    // widened `Rgba`.
+    assert_eq!(s.params.pixel_format, Some(PixelFormat::Rgb24));
 
     let pkt = dmx.next_packet().unwrap();
     assert!(pkt.flags.keyframe);
-    assert_eq!(pkt.data.len(), 2 * 2 * 4);
-    assert_eq!(&pkt.data[0..4], &[10, 11, 12, 0xFF]);
-    assert_eq!(&pkt.data[4..8], &[20, 21, 22, 0xFF]);
-    assert_eq!(&pkt.data[8..12], &[30, 31, 32, 0xFF]);
-    assert_eq!(&pkt.data[12..16], &[40, 41, 42, 0xFF]);
+    assert_eq!(pkt.data.len(), 2 * 2 * 3);
+    assert_eq!(&pkt.data[0..3], &[10, 11, 12]);
+    assert_eq!(&pkt.data[3..6], &[20, 21, 22]);
+    assert_eq!(&pkt.data[6..9], &[30, 31, 32]);
+    assert_eq!(&pkt.data[9..12], &[40, 41, 42]);
 
     assert!(matches!(dmx.next_packet(), Err(oxideav_core::Error::Eof)));
 }
@@ -143,9 +145,9 @@ fn deep_demuxer_emits_runlength_rgb888() {
         .open_demuxer("iff_deep", rs, &oxideav_core::NullCodecResolver)
         .unwrap();
     let pkt = dmx.next_packet().unwrap();
-    assert_eq!(pkt.data.len(), 2 * 2 * 4);
-    assert_eq!(&pkt.data[0..4], &[10, 11, 12, 0xFF]);
-    assert_eq!(&pkt.data[12..16], &[40, 41, 42, 0xFF]);
+    assert_eq!(pkt.data.len(), 2 * 2 * 3);
+    assert_eq!(&pkt.data[0..3], &[10, 11, 12]);
+    assert_eq!(&pkt.data[9..12], &[40, 41, 42]);
     assert!(matches!(dmx.next_packet(), Err(oxideav_core::Error::Eof)));
 }
 
@@ -186,12 +188,13 @@ fn deep_demuxer_plays_every_frame_of_a_cel_anim() {
     assert!(p0.flags.keyframe);
     assert_eq!(p0.pts, Some(0));
     assert_eq!(p0.duration, Some(50));
-    assert_eq!(&p0.data[0..4], &[1, 2, 3, 0xFF]);
+    assert_eq!(p0.data.len(), 2 * 2 * 3);
+    assert_eq!(&p0.data[0..3], &[1, 2, 3]);
 
     let p1 = dmx.next_packet().unwrap();
     assert!(p1.flags.keyframe);
     assert_eq!(p1.pts, Some(50));
-    assert_eq!(&p1.data[0..4], &[21, 22, 23, 0xFF]);
+    assert_eq!(&p1.data[0..3], &[21, 22, 23]);
 
     assert!(matches!(dmx.next_packet(), Err(oxideav_core::Error::Eof)));
 }

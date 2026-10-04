@@ -209,6 +209,7 @@ pub struct AnimMuxer {
     output: Box<dyn WriteSeek>,
     width: u16,
     height: u16,
+    input: crate::ilbm::MuxInput,
     time_base: TimeBase,
     op: AnimMuxerOp,
     frames: Vec<Vec<u8>>,
@@ -218,12 +219,13 @@ pub struct AnimMuxer {
 
 impl AnimMuxer {
     pub fn new(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Self> {
-        let (width, height, time_base) =
+        let (width, height, time_base, input) =
             crate::ilbm::true_color_muxer_stream_shape("ANIM", streams)?;
         Ok(Self {
             output,
             width,
             height,
+            input,
             time_base,
             op: AnimMuxerOp::default(),
             frames: Vec::new(),
@@ -258,14 +260,13 @@ impl Muxer for AnimMuxer {
         Ok(()) // the FORM is assembled at write_trailer time
     }
     fn write_packet(&mut self, packet: &Packet) -> Result<()> {
-        let expected = usize::from(self.width) * usize::from(self.height) * 4;
-        if packet.data.len() != expected {
-            return Err(Error::invalid(format!(
-                "ANIM muxer: packet size {} does not match width*height*4 = {expected}",
-                packet.data.len()
-            )));
-        }
-        self.frames.push(packet.data.clone());
+        let rgba = self.input.to_rgba(
+            "ANIM",
+            &packet.data,
+            usize::from(self.width),
+            usize::from(self.height),
+        )?;
+        self.frames.push(rgba);
         self.durations.push(packet.duration);
         Ok(())
     }
