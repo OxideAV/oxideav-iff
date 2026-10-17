@@ -118,7 +118,14 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     // Grow-on-read (take + read_to_end) instead of pre-allocating the
     // declared FORM size, so a forged 32-bit size over a tiny stream
     // can't demand an attacker-sized buffer; a short read is rejected.
-    let body_size = hdr.size as u64 - 4;
+    // A FORM shorter than its 4-byte type is malformed (the size counts
+    // the type), not a reason to underflow.
+    let body_size = u64::from(hdr.size).checked_sub(4).ok_or_else(|| {
+        Error::invalid(format!(
+            "ILBM: FORM size {} is shorter than its form type",
+            hdr.size
+        ))
+    })?;
     let mut form_body = Vec::new();
     (&mut *input).take(body_size).read_to_end(&mut form_body)?;
     if (form_body.len() as u64) < body_size {
@@ -191,7 +198,14 @@ fn open_acbm(
         )));
     }
     // Same grow-on-read allocation guard as the ILBM demuxer above.
-    let body_size = hdr.size as u64 - 4;
+    // A FORM shorter than its 4-byte type is malformed (the size counts
+    // the type), not a reason to underflow.
+    let body_size = u64::from(hdr.size).checked_sub(4).ok_or_else(|| {
+        Error::invalid(format!(
+            "ACBM: FORM size {} is shorter than its form type",
+            hdr.size
+        ))
+    })?;
     let mut form_body = Vec::new();
     (&mut *input).take(body_size).read_to_end(&mut form_body)?;
     if (form_body.len() as u64) < body_size {

@@ -7,7 +7,7 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
-# Seven libFuzzer targets cover the highest-risk parser surface of
+# Eight libFuzzer targets cover the highest-risk parser surface of
 # the crate:
 #
 #  * `aiff_decode` — feeds arbitrary bytes to `AiffDemuxer::from_bytes`,
@@ -56,6 +56,13 @@ cargo-fuzz = true
 #                    `encode` / `encode_all` and back — the FORM dispatch,
 #                    header-only `info`, the Pal8 packaging, the CAT/LIST
 #                    walk, the ANIM timeline and every encoder path.
+#  * `registry_path` — feeds arbitrary bytes through the framework
+#                    surface: the `iff_ilbm` / `iff_acbm` / `iff_anim`
+#                    demuxers, the registered `ilbm` decoder (palette +
+#                    palette-alpha + blobs side-channels), the frame
+#                    bridge and the `ilbm` encoder on every form /
+#                    masking option, then a strict decode of the
+#                    output (chunk splice, FORM size, truthful label).
 #  * `svx_decode`  — feeds arbitrary bytes to `svx::parse_voice` (the
 #                    FORM 8SVX structural walker: VHDR Voice8Header,
 #                    CHAN / PAN / ATAK / RLSE / SEQN / FADE typed
@@ -119,5 +126,11 @@ doc = false
 [[bin]]
 name = "contract_api"
 path = "fuzz_targets/contract_api.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "registry_path"
+path = "fuzz_targets/registry_path.rs"
 test = false
 doc = false

@@ -18,7 +18,9 @@ use oxideav_iff::{DecodeOptions, EncodeOptions, IffForm};
 
 fuzz_target!(|data: &[u8]| {
     let _ = oxideav_iff::probe(data);
-    let _ = oxideav_iff::info(data);
+    if let Ok(info) = oxideav_iff::info(data) {
+        let _ = (info.chunks.len(), info.has_text);
+    }
     // Keep the working buffer small enough for a fuzz iteration.
     let opts = DecodeOptions::default()
         .with_max_pixels(1u64 << 20)
@@ -33,9 +35,18 @@ fuzz_target!(|data: &[u8]| {
                     .with_drop_alpha(true)
                     .with_indexed(form != IffForm::Ilbm);
                 if let Ok(bytes) = oxideav_iff::encode(&img, &opts) {
-                    let back = oxideav_iff::decode(&bytes).expect("own output decodes");
+                    // Strict: the chunk splice must leave the FORM size exact.
+                    let back = oxideav_iff::decode_with(
+                        &bytes,
+                        &DecodeOptions::default().with_strict(true),
+                    )
+                    .expect("own output decodes strictly");
+                    assert_eq!(back.chunks, img.chunks, "carried chunks round-trip");
                     if img.format == oxideav_iff::PixelFormat::Pal8 && form != IffForm::Deep {
                         assert_eq!(back.planes, img.planes);
+                        if form != IffForm::Pbm {
+                            assert_eq!(back.palette, img.palette, "palette alpha round-trips");
+                        }
                     }
                 }
             }

@@ -2612,6 +2612,31 @@ impl Drng {
     }
 }
 
+/// Reject a body that cannot possibly fill `uncompressed` bytes of
+/// pixel data before anything proportional to the declared geometry is
+/// allocated: an uncompressed body needs every byte; a ByteRun1 body
+/// needs at least two bytes per 128 output bytes (the longest run a
+/// `-127` count can produce). The row decoders report the exact
+/// shortfall later; this is the allocation guard.
+pub(crate) fn check_body_budget(
+    body_len: usize,
+    uncompressed: usize,
+    compression: Compression,
+    label: &str,
+) -> Result<()> {
+    let min = match compression {
+        Compression::None => uncompressed,
+        Compression::ByteRun1 | Compression::Auto => uncompressed.div_ceil(128) * 2,
+    };
+    if body_len < min {
+        return Err(Error::invalid(format!(
+            "{label}: body holds {body_len} bytes, too short for the declared geometry \
+             ({uncompressed} bytes of pixel data need at least {min})"
+        )));
+    }
+    Ok(())
+}
+
 // ───────────────────── ByteRun1 (PackBits) ─────────────────────
 
 /// Decode one ByteRun1-compressed plane-row into `out`. Reads from
@@ -3195,6 +3220,33 @@ pub(crate) fn parse_ilbm_indexed(bytes: &[u8]) -> Result<(IlbmImage, IndexedView
 
     let width = bmhd.width as u32;
     let height = bmhd.height as u32;
+    if width == 0 || height == 0 {
+        return Err(Error::invalid(format!(
+            "ILBM: zero-dimension picture ({width}x{height})"
+        )));
+    }
+    // The BODY must be able to fill the declared geometry before the
+    // RGBA working buffer (`width × height × 4`, up to 16 GiB from a
+    // forged BMHD) is allocated: a ByteRun1 stream expands at most 64×
+    // (two bytes → a 128-byte run), an uncompressed one not at all.
+    let uncompressed_body = if is_pbm {
+        ((bmhd.width as usize + 1) & !1) * height as usize
+    } else {
+        // The plane count the planar path accepts (1..=8, or 24 for
+        // literal RGB), checked here so a 0-plane header (a colour-map
+        // file, ilbm.txt §BMHD, which this walker does not render)
+        // never sizes the buffer on a geometry it holds no pixels for.
+        let n_planes = bmhd.n_planes as usize;
+        if n_planes != 24 && !(1..=8).contains(&n_planes) {
+            return Err(Error::unsupported(format!(
+                "ILBM: indexed planar supports 1..=8 colour bitplanes (got {n_planes}); \
+                 use n_planes=24 for literal-RGB true-colour"
+            )));
+        }
+        let planes = n_planes + usize::from(bmhd.masking == Masking::HasMask);
+        bmhd.row_bytes() * planes * height as usize
+    };
+    check_body_budget(body.len(), uncompressed_body, bmhd.compression, "ILBM")?;
     let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
 
     if is_pbm {
@@ -3845,6 +3897,12 @@ pub(crate) fn parse_acbm_indexed(bytes: &[u8]) -> Result<(IlbmImage, IndexedView
 
     let bmhd = bmhd.ok_or_else(|| Error::invalid("ACBM: missing BMHD chunk"))?;
     let abit = abit_data.ok_or_else(|| Error::invalid("ACBM: missing ABIT chunk"))?;
+    if bmhd.width == 0 || bmhd.height == 0 {
+        return Err(Error::invalid(format!(
+            "ACBM: zero-dimension picture ({}x{})",
+            bmhd.width, bmhd.height
+        )));
+    }
 
     if bmhd.compression != Compression::None {
         return Err(Error::unsupported(
@@ -7366,6 +7424,76 @@ mod tests {
         let rgba = decode_rgbn_body(2, 1, &body, GenlockPolicy::BrushTransparency).unwrap();
         assert_eq!(&rgba[0..4], &[255, 0, 0, 0]);
         assert_eq!(&rgba[4..8], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn forged_geometry_with_a_tiny_body_is_rejected_before_allocating() {
+        // 48000 × 48000 × 4 would be a 9.2 GB working buffer; a 2-byte
+        // BODY cannot fill it, so the parser must refuse up front.
+        let mut bmhd = vec![0u8; 20];
+        bmhd[0..2].copy_from_slice(&48000u16.to_be_bytes());
+        bmhd[2..4].copy_from_slice(&48000u16.to_be_bytes());
+        bmhd[8] = 1; // nPlanes
+        bmhd[10] = 1; // ByteRun1
+        for (form, body_id) in [(b"ILBM", b"BODY"), (b"PBM ", b"BODY")] {
+            let mut f = Vec::new();
+            f.extend_from_slice(b"FORM");
+            f.extend_from_slice(&0u32.to_be_bytes());
+            f.extend_from_slice(form);
+            f.extend_from_slice(b"BMHD");
+            f.extend_from_slice(&20u32.to_be_bytes());
+            f.extend_from_slice(&bmhd);
+            f.extend_from_slice(body_id);
+            f.extend_from_slice(&2u32.to_be_bytes());
+            f.extend_from_slice(&[0x81, 0]);
+            let size = (f.len() - 8) as u32;
+            f[4..8].copy_from_slice(&size.to_be_bytes());
+            let err = parse_ilbm(&f).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("too short for the declared geometry"),
+                "{err}"
+            );
+        }
+        // A zero-width picture used to reach `chunks_exact(0)`.
+        bmhd[0..2].copy_from_slice(&0u16.to_be_bytes());
+        let mut f = Vec::new();
+        f.extend_from_slice(b"FORM");
+        f.extend_from_slice(&0u32.to_be_bytes());
+        f.extend_from_slice(b"ILBM");
+        f.extend_from_slice(b"BMHD");
+        f.extend_from_slice(&20u32.to_be_bytes());
+        f.extend_from_slice(&bmhd);
+        f.extend_from_slice(b"BODY");
+        f.extend_from_slice(&0u32.to_be_bytes());
+        let size = (f.len() - 8) as u32;
+        f[4..8].copy_from_slice(&size.to_be_bytes());
+        assert!(matches!(parse_ilbm(&f), Err(Error::InvalidData(_))));
+        f[8..12].copy_from_slice(b"ACBM");
+        f[size as usize + 8 - 8..size as usize + 8 - 4].copy_from_slice(b"ABIT");
+        assert!(matches!(parse_acbm(&f), Err(Error::InvalidData(_))));
+        bmhd[0..2].copy_from_slice(&48000u16.to_be_bytes());
+        // A 0-plane header (colour-map file) on a huge geometry is refused
+        // before the buffer too; the planar path never renders it.
+        bmhd[8] = 0;
+        bmhd[10] = 0;
+        let mut f = Vec::new();
+        f.extend_from_slice(b"FORM");
+        f.extend_from_slice(&0u32.to_be_bytes());
+        f.extend_from_slice(b"ILBM");
+        f.extend_from_slice(b"BMHD");
+        f.extend_from_slice(&20u32.to_be_bytes());
+        f.extend_from_slice(&bmhd);
+        f.extend_from_slice(b"BODY");
+        f.extend_from_slice(&0u32.to_be_bytes());
+        let size = (f.len() - 8) as u32;
+        f[4..8].copy_from_slice(&size.to_be_bytes());
+        assert!(matches!(parse_ilbm(&f), Err(Error::Unsupported(_))));
+        // The guard is exact for an uncompressed body and 64× for ByteRun1.
+        assert!(check_body_budget(10, 10, Compression::None, "t").is_ok());
+        assert!(check_body_budget(9, 10, Compression::None, "t").is_err());
+        assert!(check_body_budget(2, 128, Compression::ByteRun1, "t").is_ok());
+        assert!(check_body_budget(2, 129, Compression::ByteRun1, "t").is_err());
     }
 
     #[test]

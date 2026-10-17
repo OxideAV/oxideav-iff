@@ -301,9 +301,13 @@ header-only and unaffected. Every parser is bounded by the declared
 `FORM` size; ByteRun1 rows, DEEP bodies (15× TVDC expansion bound,
 component count ≥ 1) and RGB8 / RGBN run streams are checked against
 the input length before expanding. Hostile input returns `IffError`,
-never panics — seven libFuzzer targets (`contract_api`, `ilbm_decode`,
-`anim_decode`, `deep_decode`, `pchg_parse`, `svx_decode`,
-`aiff_decode`) cover the surface.
+never panics — eight libFuzzer targets (`contract_api`,
+`registry_path`, `ilbm_decode`, `anim_decode`, `deep_decode`,
+`pchg_parse`, `svx_decode`, `aiff_decode`) cover the surface, run daily
+by the `Fuzz` workflow. The RGBA working buffer of a planar / chunky
+picture is sized only after the `BODY` is shown able to fill the
+declared geometry (uncompressed: every byte; ByteRun1: at most 64×
+expansion), so a forged `BMHD` cannot demand gigabytes.
 
 ## Format specifics
 
@@ -1447,8 +1451,19 @@ than decoded here.
 ### Fuzzing
 
 A [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harness
-lives in [`fuzz/`](fuzz/) with seven libFuzzer targets covering the
-highest-risk parser surface of the crate:
+lives in [`fuzz/`](fuzz/) with eight libFuzzer targets covering the
+highest-risk parser surface of the crate; the `Fuzz` workflow runs them
+daily on a shared 30-minute budget:
+
+* `registry_path` — feeds arbitrary bytes through the framework
+  surface: the `iff_ilbm` / `iff_acbm` / `iff_anim` demuxers (stream
+  labels, palette `extradata`, metadata blobs), the registered `ilbm`
+  decoder (palette + palette-alpha + blobs side-channels), the frame
+  bridge, and the `ilbm` encoder on every `form` / `masking` option,
+  then a strict decode of the output (chunk splice, FORM size, truthful
+  label, `Pal8` planes and palette alpha preserved). Its introduction
+  campaign found the demuxers' FORM-size underflow (a `FORM` shorter
+  than its type) and then ran ~12.7M execs clean in ten minutes.
 
 * `contract_api` — feeds arbitrary bytes to the IMAGE_CRATE_API root
   (`probe` / `info` / `decode_with` / `decode_all_with` / `to_rgba8`)
@@ -1503,7 +1518,10 @@ highest-risk parser surface of the crate:
   LIST/CAT — the EA IFF 85 §5 group-children grammar walker. The
   introduction campaign ran ~51.0M execs clean under ASan, with the
   `pchg_parse` / `anim_decode` targets re-run over the newly added
-  code paths (~49.3M / ~67.7M execs clean).
+  code paths (~49.3M / ~67.7M execs clean). The round-477 campaign
+  found two allocation-order OOMs (the RGBA working buffer sized from
+  a forged `BMHD` before the `BODY` was checked; a 0-plane header on
+  a huge geometry) — both fixed by the body-budget guard.
 * `svx_decode` — feeds arbitrary bytes to `svx::parse_voice` (the
   FORM 8SVX structural walker: the 20-byte VHDR decode, the
   CHAN / PAN / ATAK / RLSE / SEQN / FADE typed chunk parsers with
@@ -1529,7 +1547,8 @@ To run a target:
 cargo install cargo-fuzz
 cd crates/oxideav-iff
 cargo +nightly fuzz run aiff_decode
-# or anim_decode / pchg_parse / deep_decode / svx_decode / ilbm_decode
+# or contract_api / registry_path / anim_decode / pchg_parse / deep_decode
+# / svx_decode / ilbm_decode
 ```
 
 The harness builds under nightly Rust (libFuzzer needs nightly's

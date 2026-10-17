@@ -359,3 +359,30 @@ fn rawvideo_muxer_writes_the_stream_blobs_as_chunks() {
     assert_eq!(img.chunks.len(), 1, "XMP has no IFF chunk");
     assert_eq!(img.to_rgb8(), vec![1, 2, 3, 4, 5, 6]);
 }
+
+#[test]
+fn a_form_shorter_than_its_type_is_an_error_not_a_panic() {
+    // Found by the registry_path fuzz target: `FORM` with size 0..3
+    // underflowed the body length in the demuxers' open paths.
+    let reg = registry();
+    for (name, form) in [
+        ("iff_ilbm", b"PBM "),
+        ("iff_ilbm", b"ILBM"),
+        ("iff_acbm", b"ACBM"),
+        ("iff_anim", b"ANIM"),
+    ] {
+        for size in 0u32..4 {
+            let mut bytes = b"FORM".to_vec();
+            bytes.extend_from_slice(&size.to_be_bytes());
+            bytes.extend_from_slice(form);
+            let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+            assert!(
+                matches!(
+                    reg.open_demuxer(name, rs, &oxideav_core::NullCodecResolver),
+                    Err(Error::InvalidData(_))
+                ),
+                "{name} size {size}"
+            );
+        }
+    }
+}

@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layout of the last picture it decoded (`Pal8` / `Rgb24` / `Rgba`, the
   file decides). ANIM per-frame timing is pinned on both paths
   (`decode_all` delays = the `iff_anim` packets' `duration` in 1/60 s).
+- Fuzz: the `registry_path` target (demuxers → `ilbm` decoder → frame
+  bridge → encoder on every form / masking option → strict decode) and
+  the daily `Fuzz` workflow; `contract_api` now checks the carried
+  chunks and palette alpha round-trip under `strict`.
 - `Palette::TRANSPARENT_BELOW`, `is_transparent`, `transparent_indices`,
   `alpha_bytes`.
 - The registry encoder declares its input layouts
@@ -60,6 +64,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a typed `Unsupported` (the lasso region is a decoder-side seed
   fill). `PBM ` refuses a derived mask plane (chunky, no plane) instead
   of writing one.
+
+### Fixed
+
+- Hostile input (found by the new `registry_path` fuzz target and the
+  round-477 `ilbm_decode` campaign): the `iff_ilbm` / `iff_acbm` /
+  `iff_anim` demuxers no longer underflow on a `FORM` whose size is
+  shorter than its 4-byte type (`InvalidData` instead of a panic in
+  debug builds); `parse_ilbm` / `parse_acbm` size the RGBA working
+  buffer only after the `BODY` is shown able to fill the declared
+  geometry (uncompressed: every byte, ByteRun1: ≤ 64× expansion) and
+  after the plane count is validated, so a forged `BMHD` (65535² × 4
+  bytes, or 0 planes on a huge geometry) is refused instead of
+  allocating gigabytes.
 
 ### Changed
 
