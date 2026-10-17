@@ -21,11 +21,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoding to composed `Rgba`.
 - `Palette::TRANSPARENT_BELOW`, `is_transparent`, `transparent_indices`,
   `alpha_bytes`.
+- The registry encoder declares its input layouts
+  (`CodecCapabilities::accepted_pixel_formats` = `ENCODER_PIXEL_FORMATS`:
+  `Pal8`, `Rgb24`, `Rgba`, `Bgr24`, `Bgra`, `Gray8`) and refuses any
+  other layout with a typed `Unsupported` at construction. `Gray8` is
+  written as an exact `Pal8` picture over the grey ramp; an opaque
+  `Rgba` as the 24-bit form; a non-opaque `Rgba` as a mask plane over
+  an exact `CMAP` when it has at most 256 colours, and is refused above
+  that unless `indexed` / `drop_alpha` / `form=deep` is chosen — alpha
+  is no longer dropped silently. `output_params().pixel_format` (+
+  palette `extradata`) is the layout the written file decodes to.
+- `IlbmEncoderOptions` (`CodecOptionsStruct`, declared through
+  `CodecInfo::encoder_options`): `form`, `compression`, `masking`,
+  `indexed`, `n_planes`, `viewmode`, `drop_alpha`, `deep_rgb_only`; no
+  `quality` (lossless).
 - `encode` accepts `masking = HasMask` for `Pal8` input (plane from the
   palette alpha, all-opaque when it has none); `Lasso` on `Pal8` input
   is a typed `Unsupported` (the lasso region is a decoder-side seed
   fill). `PBM ` refuses a derived mask plane (chunky, no plane) instead
   of writing one.
+
+### Changed
+
+- The registry encoder no longer discards the alpha of a non-opaque
+  `Rgba` / `Bgra` frame by default (it was written as 24-bit with
+  `drop_alpha`); set the `drop_alpha` option for the old behaviour.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-iff/compare/v0.0.10...v0.0.11) - 2026-10-04
 

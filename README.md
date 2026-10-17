@@ -72,11 +72,14 @@ With the default-on `registry` feature the crate depends on
   (`CODEC_ID_STR = "ilbm"`): one packet holding a whole raster `FORM`
   in, one frame in the native layout out (`Pal8` with the palette on the
   frame's palette side-channel plus the palette-alpha record for a
-  transparent colour key, `Rgb24`, or `Rgba`); the encoder writes a
-  `FORM ILBM` from `Pal8` (index-for-index, the alpha record mapped back
-  to a masking mode — see *Palette alpha*), `Rgb24` / `Rgba` / `Bgr24` /
-  `Bgra` (24-bit literal RGB, alpha dropped). Both are thin adapters
-  over `decode` / `encode`.
+  transparent colour key, `Rgb24`, or `Rgba`); the encoder **declares
+  its accepted input layouts** (`ENCODER_PIXEL_FORMATS`, the table under
+  *Supported layouts*), refuses anything else by type, and takes
+  `IlbmEncoderOptions` from `CodecParameters::options` (the table under
+  *Options*; lossless, no `quality`). Its `output_params().pixel_format`
+  is the layout the written file decodes to (`Pal8` + palette
+  `extradata`, `Rgb24`, `Rgba`), refined from the file after the first
+  frame. Both are thin adapters over `decode` / `encode`.
 - The frame bridge: `From<IffImage> for VideoFrame`,
   `IffImage::from_video_frame(&VideoFrame, &CodecParameters)` and
   `TryFrom<(&VideoFrame, &CodecParameters)>`. IFF carries no colour
@@ -139,6 +142,23 @@ image's own, `ILBM` for caller-built images):
 | `&[Frame]` | `ILBM` (= `FORM ANIM`) | seed `FORM ILBM` + one delta frame per picture (`anim_op`, default op-5); one `CMAP` for the whole animation; `Frame::delay` → the next frame's `ANHD.reltime` (jiffies, 1/60 s) |
 | `&[Frame]` | `DEEP` | one `DBOD` per frame, `DCHG` from the first frame's `delay` |
 
+Registry encoder (`make_encoder`, `CodecCapabilities::accepted_pixel_formats`
+= `ENCODER_PIXEL_FORMATS`, in ladder order — colour before grey). Every
+declared layout has an exact form; the one lossy step (`indexed`
+quantisation) is opt-in, and an undeclared layout is `Unsupported` at
+construction, never converted silently:
+
+| Declared input | Written as (default `form = ilbm`) | Decodes as | Exact |
+|---|---|---|---|
+| `Pal8` (+ palette side-channel, ± alpha record) | index-for-index bitplanes, 1–8 planes; masking by the *Palette alpha* rule | `Pal8` (+ record), or `Rgba` under a mask plane | yes |
+| `Gray8` | `Pal8` over the 256-entry grey ramp, 8 planes | `Pal8` | yes |
+| `Rgb24` / `Bgr24` | 24-bit literal-RGB `ILBM` (`Bgr24` byte-swapped) | `Rgb24` | yes |
+| `Rgba` / `Bgra`, every pixel opaque | as `Rgb24` | `Rgb24` | yes |
+| `Rgba` / `Bgra`, non-opaque, ≤ 256 distinct colours | exact `CMAP` + mask plane (alpha below 128 masked out) | `Rgba` | alpha 1-bit |
+| `Rgba` / `Bgra`, non-opaque, > 256 colours | `Unsupported` — unless `indexed` (quantise + mask plane), `drop_alpha` (24-bit), or `form = deep` (RGBA `DPEL`) / `rgb8` / `rgbn` (genlock) | — | — |
+| `form = deep` / `rgb8` / `rgbn` with any of the above | the true-colour FORM (`Pal8` / `Gray8` expanded through the palette) | `Rgba` / `Rgb24` | DEEP yes; RGBN 4-bit guns |
+| anything else (`Yuv*`, 16-bit, float …) | `Unsupported` | — | — |
+
 `decode(encode(img)) == img` is pinned for `Pal8` into `ILBM` / `PBM ` /
 `ACBM` (planes, palette, `form`, `aspect`), for `Rgb24` into 24-bit
 `ILBM`, `DEEP`, `RGB8` and (nibble-replicated guns) `RGBN`, for `Rgba`
@@ -162,6 +182,23 @@ TVDC delta table the FORM does not carry).
 `n_planes`, `viewmode` (`CAMG`; `Some(0)` writes none), `masking`
 (derived when `None`), `drop_alpha`, `deep_rgb_only`, `anim_op`
 (`AnimOp::Op0` … `Op8 { long_data }`), `aspect`.
+
+Registry encoder (`IlbmEncoderOptions`, parsed from
+`CodecParameters::options`; unknown keys and out-of-range values are
+`InvalidData` at construction):
+
+| key | values | default | maps to |
+|---|---|---|---|
+| `form` | `ilbm` `pbm` `acbm` `deep` `rgb8` `rgbn` | `ilbm` | `EncodeOptions::form` |
+| `compression` | `byterun1` `none` `auto` | `byterun1` | `compression` |
+| `masking` | `auto` `none` `mask` `transparent` | `auto` | `masking` (`auto` = derived) |
+| `indexed` | bool | `false` | `indexed` — quantise RGB with > 256 colours (lossy, explicit) |
+| `n_planes` | `0` (derive) or `1..=8` | `0` | `n_planes` |
+| `viewmode` | u32 `CAMG` word, `0` = none | `0` | `viewmode` |
+| `drop_alpha` | bool | `false` | `drop_alpha` |
+| `deep_rgb_only` | bool | `false` | `deep_rgb_only` |
+
+No `quality`: every path is lossless (or an explicit opt-in).
 
 ## Metadata and colour
 

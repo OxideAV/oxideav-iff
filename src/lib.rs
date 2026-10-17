@@ -88,5 +88,5 @@ pub use registry::__oxideav_entry;
 #[cfg(feature = "registry")]
 pub use registry::{
     make_decoder, make_encoder, register, register_codecs, register_containers,
-    register_registries, CODEC_ID_STR,
+    register_registries, IlbmEncoderOptions, CODEC_ID_STR, ENCODER_PIXEL_FORMATS,
 };
