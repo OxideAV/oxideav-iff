@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rawvideo` path of the `iff_ilbm` muxer write them back (frame blobs
   over stream blobs); well-known kinds (ICC / Exif / XMP) have no IFF
   chunk and are not written.
+- The `ilbm` decoder reports `Decoder::output_pixel_format` — the
+  layout of the last picture it decoded (`Pal8` / `Rgb24` / `Rgba`, the
+  file decides). ANIM per-frame timing is pinned on both paths
+  (`decode_all` delays = the `iff_anim` packets' `duration` in 1/60 s).
 - `Palette::TRANSPARENT_BELOW`, `is_transparent`, `transparent_indices`,
   `alpha_bytes`.
 - The registry encoder declares its input layouts

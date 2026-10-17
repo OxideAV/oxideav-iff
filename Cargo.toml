@@ -49,6 +49,10 @@ name = "acbm"
 required-features = ["registry"]
 
 [[test]]
+name = "anim_timing_registry"
+required-features = ["registry"]
+
+[[test]]
 name = "anim_muxer"
 required-features = ["registry"]
 

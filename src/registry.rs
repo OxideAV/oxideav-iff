@@ -347,6 +347,7 @@ pub fn make_decoder(_params: &CodecParameters) -> oxideav_core::Result<Box<dyn D
     Ok(Box::new(IffDecoder {
         codec_id: CodecId::new(CODEC_ID_STR),
         pending: None,
+        emitted: None,
         eof: false,
     }))
 }
@@ -354,6 +355,9 @@ pub fn make_decoder(_params: &CodecParameters) -> oxideav_core::Result<Box<dyn D
 struct IffDecoder {
     codec_id: CodecId,
     pending: Option<VideoFrame>,
+    /// The layout of the last decoded picture — what
+    /// [`Decoder::output_pixel_format`] reports.
+    emitted: Option<PixelFormat>,
     eof: bool,
 }
 
@@ -363,8 +367,14 @@ impl Decoder for IffDecoder {
     }
     fn send_packet(&mut self, packet: &Packet) -> oxideav_core::Result<()> {
         let image = crate::decode(&packet.data)?;
+        self.emitted = Some(to_core_pixel_format(image.format));
         self.pending = Some(image_into_video_frame(image, packet.pts));
         Ok(())
+    }
+    /// The layout of the last picture decoded (`None` before the first
+    /// packet): the file decides it, not `params.pixel_format`.
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.emitted
     }
     fn receive_frame(&mut self) -> oxideav_core::Result<Frame> {
         match self.pending.take() {

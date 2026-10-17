@@ -127,6 +127,21 @@ available and byte-identical to the document-model renderers):
 | `ANIM` | ops 0, 1, 2, 3, 4, 5, 7, 8 | as the seed frame (`Pal8` unless HAM / masked) | `decode` = seed frame, `decode_all` = every frame with its display duration |
 | `CAT ` / `LIST` | raster `FORM` children | each child's own layout | `decode` = first child, `decode_all` = all decodable children |
 
+Which layout each `ILBM` / `ACBM` mode emits (the `BMHD` / `CAMG` /
+chunk facts that decide it, in the order the decoder checks them; the
+registry decoder labels the same layout through
+`Decoder::output_pixel_format`):
+
+| ILBM mode | Decided by | Layout |
+|---|---|---|
+| 24-bit literal RGB | `nPlanes == 24` | `Rgb24` |
+| HAM6 / HAM8 | `CAMG` HAM (6 / 8 planes), or 6 planes with no usable `CAMG` | `Rgb24` (`Rgba` only with a mask plane / lasso) |
+| per-line palettes | `SHAM` or a valid `PCHG` | `Rgb24` (`Rgba` with a transparent colour) |
+| mask plane / lasso | `masking` 1 / 3 | `Rgba` |
+| Extra-Half-Brite | `CAMG` EHB, 6 planes | `Pal8` + 64-entry palette (32 `CMAP` entries + half-intensity mirror), alpha record for a transparent colour |
+| indexed, transparent colour | `masking` 2, 1–8 planes | `Pal8` + palette, that entry alpha 0 (registry: the palette-alpha record) |
+| indexed, opaque | `masking` 0, 1–8 planes | `Pal8` + palette, no alpha record |
+
 Encode (`encode` / `encode_all`; `form` on `EncodeOptions`, default the
 image's own, `ILBM` for caller-built images):
 
