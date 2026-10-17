@@ -129,6 +129,12 @@ pub fn from_color_signal(s: &ColorSignal) -> ColorInfo {
 fn stamp_frame_side_channels(frame: &mut VideoFrame, image: &IffImage) {
     if let (IffPixelFormat::Pal8, Some(p)) = (image.format, &image.palette) {
         frame.set_palette(p.to_rgb());
+        // The palette-alpha record (core 0.1.40) carries a transparent
+        // colour key: that entry 0, every other entry 255. An opaque
+        // palette attaches no record, so such a picture reads as opaque.
+        if p.has_alpha() {
+            frame.set_palette_alpha(p.alpha_bytes());
+        }
     }
     // IFF never signals colour, so the documented default is NOT stamped
     // on the frame; only a caller-supplied signal beyond it is.
@@ -139,10 +145,11 @@ fn stamp_frame_side_channels(frame: &mut VideoFrame, image: &IffImage) {
 }
 
 /// [`IffImage`] → `VideoFrame` with `pts` stamped: the single packed
-/// plane, the palette side-channel for `Pal8` (RGB only — the
-/// framework's palette record has no alpha; a transparent-colour key is
-/// therefore lost on this path), and the colour-signal side-channel
-/// only when the image signals more than the IFF default.
+/// plane, the palette side-channel for `Pal8` plus the palette-alpha
+/// record when the palette is not fully opaque (a `BMHD` transparent
+/// colour key arrives as that entry's alpha `0`, every other entry
+/// `255`), and the colour-signal side-channel only when the image
+/// signals more than the IFF default.
 pub fn image_into_video_frame(mut image: IffImage, pts: Option<i64>) -> VideoFrame {
     let stride = image.stride();
     let data = if image.planes.is_empty() {
@@ -176,9 +183,9 @@ impl IffImage {
     /// Rebuild an image from a framework frame and the stream parameters
     /// that describe it (`width`, `height` required; `pixel_format`
     /// defaults to `Rgba`). For `Pal8` the palette comes from the frame's
-    /// palette side-channel (opaque entries); the frame's colour-signal
-    /// side-channel, when attached, becomes `color`. The geometry is
-    /// validated.
+    /// palette side-channel, its alpha from the palette-alpha record
+    /// (opaque when absent); the frame's colour-signal side-channel,
+    /// when attached, becomes `color`. The geometry is validated.
     pub fn from_video_frame(frame: &VideoFrame, params: &CodecParameters) -> crate::Result<Self> {
         let width = params
             .width
@@ -211,7 +218,15 @@ impl IffImage {
                     rgb.len()
                 )));
             }
-            img.palette = Some(Palette::from_rgb(rgb));
+            let mut palette = Palette::from_rgb(rgb);
+            // Palette alpha (core 0.1.40): the record may be shorter than
+            // the palette; uncovered entries stay opaque.
+            if let Some(alpha) = frame.palette_alpha() {
+                for (e, &a) in palette.entries.iter_mut().zip(alpha) {
+                    e[3] = a;
+                }
+            }
+            img.palette = Some(palette);
             img.validate()?;
         }
         if let Some(sig) = frame.color_signal() {
@@ -555,6 +570,106 @@ mod tests {
         assert_eq!(back.palette, img.palette);
         dec.flush().unwrap();
         assert!(matches!(dec.receive_frame(), Err(oxideav_core::Error::Eof)));
+    }
+
+    fn pal8_params(w: u32, h: u32) -> CodecParameters {
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(w);
+        params.height = Some(h);
+        params.pixel_format = Some(PixelFormat::Pal8);
+        params
+    }
+
+    fn encode_frame(params: &CodecParameters, frame: VideoFrame) -> Packet {
+        let mut enc = make_encoder(params).unwrap();
+        enc.send_frame(&Frame::Video(frame)).unwrap();
+        enc.receive_packet().unwrap()
+    }
+
+    fn decode_packet(params: &CodecParameters, pkt: &Packet) -> VideoFrame {
+        let mut dec = make_decoder(params).unwrap();
+        dec.send_packet(pkt).unwrap();
+        let Frame::Video(vf) = dec.receive_frame().unwrap() else {
+            panic!("video frame expected");
+        };
+        vf
+    }
+
+    #[test]
+    fn frame_bridge_carries_the_palette_alpha_record() {
+        // A transparent colour key: that entry 0, every other 255.
+        let pal = Palette::new(vec![[1, 2, 3, 255], [4, 5, 6, 0], [7, 8, 9, 255]]);
+        let img = IffImage::new_indexed(3, 1, vec![0, 1, 2], pal.clone()).unwrap();
+        let frame: VideoFrame = img.clone().into();
+        assert_eq!(frame.palette(), Some(&[1u8, 2, 3, 4, 5, 6, 7, 8, 9][..]));
+        assert_eq!(frame.palette_alpha(), Some(&[255u8, 0, 255][..]));
+        assert_eq!(frame.palette_rgba(1), Some([4, 5, 6, 0]));
+        let back = IffImage::from_video_frame(&frame, &pal8_params(3, 1)).unwrap();
+        assert_eq!(back.palette, Some(pal));
+        assert!(back.has_alpha());
+
+        // An opaque palette attaches no record.
+        let opaque = IffImage::new_indexed(1, 1, vec![0], Palette::from_rgb(&[9, 9, 9])).unwrap();
+        let frame: VideoFrame = opaque.into();
+        assert!(frame.palette_alpha().is_none());
+        assert_eq!(frame.palette_rgba(0), Some([9, 9, 9, 255]));
+    }
+
+    #[test]
+    fn a_shorter_alpha_record_leaves_uncovered_entries_opaque() {
+        let mut frame = VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane {
+                stride: 2,
+                data: vec![0, 1],
+            }],
+        };
+        frame.set_palette(vec![1, 1, 1, 2, 2, 2]);
+        frame.set_palette_alpha(vec![0]);
+        let back = IffImage::from_video_frame(&frame, &pal8_params(2, 1)).unwrap();
+        assert_eq!(
+            back.palette.unwrap().entries,
+            vec![[1, 1, 1, 0], [2, 2, 2, 255]]
+        );
+    }
+
+    #[test]
+    fn transparent_key_survives_the_codec_round_trip() {
+        // One transparent entry → BMHD masking 2 (transparent colour),
+        // the picture stays Pal8 with the alpha record on the way back.
+        let pal = Palette::new(vec![[0, 0, 0, 255], [255, 0, 0, 0], [0, 255, 0, 255]]);
+        let img = IffImage::new_indexed(3, 2, vec![0, 1, 2, 2, 1, 0], pal.clone()).unwrap();
+        let params = pal8_params(3, 2);
+        let pkt = encode_frame(&params, img.clone().into());
+        let info = crate::info(&pkt.data).unwrap();
+        assert_eq!(info.masking, 2);
+        assert_eq!(info.format, Pf::Pal8);
+        assert!(info.has_alpha);
+        let vf = decode_packet(&params, &pkt);
+        assert_eq!(vf.palette_alpha(), Some(&[255u8, 0, 255][..]));
+        let back = IffImage::from_video_frame(&vf, &params).unwrap();
+        assert_eq!(back.planes, img.planes);
+        assert_eq!(back.palette, Some(pal));
+    }
+
+    #[test]
+    fn several_transparent_entries_write_a_mask_plane() {
+        // Two transparent entries cannot share one colour key: the
+        // encoder writes a mask plane (masking 1); the file decodes as
+        // Rgba with those pixels at alpha 0 and the rest opaque.
+        let pal = Palette::new(vec![[0, 0, 0, 255], [255, 0, 0, 0], [0, 255, 0, 100]]);
+        let img = IffImage::new_indexed(3, 1, vec![0, 1, 2], pal).unwrap();
+        let params = pal8_params(3, 1);
+        let pkt = encode_frame(&params, img.into());
+        let info = crate::info(&pkt.data).unwrap();
+        assert_eq!(info.masking, 1);
+        assert_eq!(info.format, Pf::Rgba);
+        let back = crate::decode(&pkt.data).unwrap();
+        assert_eq!(back.format, Pf::Rgba);
+        assert_eq!(
+            back.to_rgba8(),
+            vec![0, 0, 0, 255, 255, 0, 0, 0, 0, 255, 0, 0]
+        );
     }
 
     #[test]

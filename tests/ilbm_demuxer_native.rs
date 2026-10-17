@@ -158,3 +158,85 @@ fn ilbm_muxer_rejects_a_non_form_ilbm_packet() {
     mux.write_packet(&pkt).unwrap();
     assert!(mux.write_trailer().is_err());
 }
+
+#[test]
+fn transparent_colour_key_arrives_as_the_palette_alpha_record() {
+    // BMHD masking 2 on disk: the demuxer declares Pal8 (the stream
+    // palette has no alpha side), the registered decoder attaches the
+    // palette-alpha record — that entry 0, every other entry 255 — so a
+    // framework consumer sees the key instead of losing it.
+    let pal = Palette::new(vec![[0, 0, 0, 255], [255, 0, 0, 0], [0, 0, 255, 255]]);
+    let img = IffImage::new_indexed(3, 1, vec![0, 1, 2], pal).unwrap();
+    let bytes = encode(&img, &EncodeOptions::default()).unwrap();
+    assert_eq!(oxideav_iff::info(&bytes).unwrap().masking, 2);
+    let (dmx, pkt) = demux(&bytes);
+    let s = &dmx.streams()[0];
+    assert_eq!(s.params.pixel_format, Some(PixelFormat::Pal8));
+    assert_eq!(s.params.extradata, vec![0, 0, 0, 255, 0, 0, 0, 0, 255]);
+
+    let mut dec = make_decoder(&s.params).unwrap();
+    dec.send_packet(&pkt).unwrap();
+    let Frame::Video(v) = dec.receive_frame().unwrap() else {
+        panic!("expected a video frame");
+    };
+    assert_eq!(v.palette_alpha(), Some(&[255u8, 0, 255][..]));
+    assert_eq!(v.palette_rgba(1), Some([255, 0, 0, 0]));
+    assert_eq!(v.palette_rgba(0), Some([0, 0, 0, 255]));
+    // Mask plane (masking 1) keeps composing Rgba on the registry path.
+    let masked = encode(
+        &img,
+        &EncodeOptions::default().with_masking(oxideav_iff::ilbm::Masking::HasMask),
+    )
+    .unwrap();
+    assert_eq!(oxideav_iff::info(&masked).unwrap().masking, 1);
+    let (dmx, _pkt) = demux(&masked);
+    assert_eq!(
+        dmx.streams()[0].params.pixel_format,
+        Some(PixelFormat::Rgba)
+    );
+}
+
+#[test]
+fn registry_encoder_maps_the_alpha_record_back_to_a_masking_mode() {
+    use oxideav_core::{VideoFrame, VideoPlane};
+    let mut params = oxideav_core::CodecParameters::video(CodecId::new(CODEC_ID_STR));
+    params.width = Some(4);
+    params.height = Some(1);
+    params.pixel_format = Some(PixelFormat::Pal8);
+    let frame = |alpha: Vec<u8>| {
+        let mut f = VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane {
+                stride: 4,
+                data: vec![0, 1, 2, 3],
+            }],
+        };
+        f.set_palette(vec![0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3]);
+        f.set_palette_alpha(alpha);
+        f
+    };
+    let encode_via_registry = |f: VideoFrame| {
+        let mut enc = oxideav_iff::make_encoder(&params).unwrap();
+        enc.send_frame(&Frame::Video(f)).unwrap();
+        enc.receive_packet().unwrap().data
+    };
+    // One transparent entry → transparent colour (masking 2), Pal8 back.
+    let one = encode_via_registry(frame(vec![255, 255, 0, 255]));
+    let info = oxideav_iff::info(&one).unwrap();
+    assert_eq!((info.masking, info.format), (2, IffPixelFormat::Pal8));
+    assert_eq!(
+        oxideav_iff::decode(&one).unwrap().palette.unwrap().entries[2],
+        [2, 2, 2, 0]
+    );
+    // Several (alpha below 128) → mask plane (masking 1), Rgba back.
+    let two = encode_via_registry(frame(vec![255, 127, 0, 255]));
+    let info = oxideav_iff::info(&two).unwrap();
+    assert_eq!((info.masking, info.format), (1, IffPixelFormat::Rgba));
+    assert_eq!(
+        oxideav_iff::decode(&two).unwrap().to_rgba8(),
+        vec![0, 0, 0, 255, 1, 1, 1, 0, 2, 2, 2, 0, 3, 3, 3, 255]
+    );
+    // No record → masking 0.
+    let none = encode_via_registry(frame(Vec::new()));
+    assert_eq!(oxideav_iff::info(&none).unwrap().masking, 0);
+}

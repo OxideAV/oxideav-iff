@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Palette alpha on the registry path (core 0.1.40): the `ilbm` decoder
+  attaches the frame's palette-alpha record for a `BMHD` transparent
+  colour key (that entry 0, every other 255; no record for an opaque
+  palette), `IffImage::from_video_frame` reads it back (absent or short
+  = opaque), and the encoder maps it to a masking mode by one documented
+  rule shared with `encode` / `encode_all`: one transparent entry
+  (alpha below `Palette::TRANSPARENT_BELOW` = 128) → transparent colour
+  (masking 2, round-trips as `Pal8`), several → mask plane (masking 1,
+  decodes as `Rgba`), none → masking 0. A mask-plane picture keeps
+  decoding to composed `Rgba`.
+- `Palette::TRANSPARENT_BELOW`, `is_transparent`, `transparent_indices`,
+  `alpha_bytes`.
+- `encode` accepts `masking = HasMask` for `Pal8` input (plane from the
+  palette alpha, all-opaque when it has none); `Lasso` on `Pal8` input
+  is a typed `Unsupported` (the lasso region is a decoder-side seed
+  fill). `PBM ` refuses a derived mask plane (chunky, no plane) instead
+  of writing one.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-iff/compare/v0.0.10...v0.0.11) - 2026-10-04
 
 ### Other

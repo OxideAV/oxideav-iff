@@ -71,10 +71,12 @@ With the default-on `registry` feature the crate depends on
 - The **`ilbm` image codec** — `make_decoder` / `make_encoder`
   (`CODEC_ID_STR = "ilbm"`): one packet holding a whole raster `FORM`
   in, one frame in the native layout out (`Pal8` with the palette on the
-  frame's palette side-channel, `Rgb24`, or `Rgba`); the encoder writes
-  a `FORM ILBM` from `Pal8` (index-for-index), `Rgb24` / `Rgba` /
-  `Bgr24` / `Bgra` (24-bit literal RGB, alpha dropped). Both are thin
-  adapters over `decode` / `encode`.
+  frame's palette side-channel plus the palette-alpha record for a
+  transparent colour key, `Rgb24`, or `Rgba`); the encoder writes a
+  `FORM ILBM` from `Pal8` (index-for-index, the alpha record mapped back
+  to a masking mode — see *Palette alpha*), `Rgb24` / `Rgba` / `Bgr24` /
+  `Bgra` (24-bit literal RGB, alpha dropped). Both are thin adapters
+  over `decode` / `encode`.
 - The frame bridge: `From<IffImage> for VideoFrame`,
   `IffImage::from_video_frame(&VideoFrame, &CodecParameters)` and
   `TryFrom<(&VideoFrame, &CodecParameters)>`. IFF carries no colour
@@ -127,8 +129,8 @@ image's own, `ILBM` for caller-built images):
 
 | Input | Target | Written as |
 |---|---|---|
-| `Pal8` | `ILBM` / `ACBM` | index-for-index bitplanes (`n_planes` from the palette or the option), `CMAP`, `HasTransparentColor` from a palette entry with alpha 0, `CAMG` from `viewmode` (EHB: 6 planes, 32-entry `CMAP`) — lossless |
-| `Pal8` | `PBM ` | chunky 8 bpp — lossless |
+| `Pal8` | `ILBM` / `ACBM` | index-for-index bitplanes (`n_planes` from the palette or the option), `CMAP`, the masking mode from the palette alpha (see *Palette alpha* below), `CAMG` from `viewmode` (EHB: 6 planes, 32-entry `CMAP`) — lossless |
+| `Pal8` | `PBM ` | chunky 8 bpp — lossless; no mask plane (several transparent entries need `masking = HasTransparentColor` or ILBM / ACBM) |
 | `Rgb24` / `Rgba` | `ILBM` (default) | 24-bit literal RGB; alpha is `Error::Unsupported` unless `drop_alpha` |
 | `Rgb24` / `Rgba` | `ILBM` / `ACBM` / `PBM ` with `indexed` | first 256 distinct colours in scan order form the `CMAP`, later colours map to the nearest entry (squared RGB distance); alpha < 128 becomes a `HasMask` plane (not on `PBM `) |
 | `Rgb24` / `Rgba` | `ILBM` / `ACBM` with a HAM / EHB `viewmode` | the HAM6 / HAM8 / EHB encoders against a 16 / 64 / 32-entry palette |
@@ -173,6 +175,35 @@ full range, RGB (identity matrix), primaries and transfer unspecified
 faithful file: `form`, `n_planes` (`BMHD.nPlanes`, or the `DPEL` bit
 total), `viewmode` (`CAMG`), `aspect` (`BMHD` x/y aspect). `ImageInfo`
 adds `compression`, `masking`, `palette_len`, `ham`, `ehb`.
+
+### Palette alpha
+
+ILBM transparency is one bit per pixel, carried by `BMHD.masking`: a
+transparent colour key (`2`, every pixel of one palette entry) or a mask
+plane (`1`, one extra bitplane per row). On the palette this is alpha
+`0` on the key's entry, `255` elsewhere; an entry counts as *transparent*
+for the encoder when its alpha is below `Palette::TRANSPARENT_BELOW`
+(128). The rule, the same for `encode`, `encode_all` and the registry
+encoder:
+
+| `Pal8` palette | `masking` option | Written as | Decodes as |
+|---|---|---|---|
+| no transparent entry | derived | `None` (0) | `Pal8`, opaque |
+| exactly one transparent entry | derived | `HasTransparentColor` (2), that index as `transparentColor` | `Pal8`, that entry alpha 0 — lossless |
+| several transparent entries | derived | `HasMask` (1), pixels of those entries masked out | `Rgba` (a mask plane cannot ride on `Pal8`) |
+| any | `HasTransparentColor` | key = first transparent entry (0 when none) | `Pal8` |
+| any | `HasMask` | plane from the palette alpha (all-opaque when it has none) | `Rgba` |
+| any | `Lasso` | `Error::Unsupported` — the lasso region is a decoder-side seed fill | — |
+
+Through the framework (`registry`) the palette rides the frame's palette
+side-channel and its alpha the **palette-alpha record** of core 0.1.40
+(`VideoFrame::palette_alpha` / `palette_rgba`): the `ilbm` decoder
+attaches the record for a transparent-colour picture (that entry 0, the
+others 255) and attaches none for an opaque palette; a mask-plane picture
+keeps decoding to composed `Rgba`. The encoder reads the record back
+(absent = opaque, shorter than the palette = uncovered entries opaque)
+and applies the table above, so a `Pal8` frame with one transparent
+entry round-trips through the registry as `Pal8` + record.
 
 ## Limits
 

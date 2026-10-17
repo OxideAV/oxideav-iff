@@ -643,3 +643,94 @@ fn encode_rejects_oversized_and_empty_geometry() {
         Err(IffError::InvalidData(_))
     ));
 }
+
+#[test]
+fn pal8_masking_rule_from_the_palette_alpha() {
+    use oxideav_iff::IffPixelFormat;
+    let indices = vec![0, 1, 2, 3];
+    let pal = |alphas: [u8; 4]| {
+        Palette::new(
+            alphas
+                .iter()
+                .enumerate()
+                .map(|(i, &a)| [i as u8, i as u8, i as u8, a])
+                .collect(),
+        )
+    };
+    // Exactly one transparent entry: the transparent colour key.
+    let img = IffImage::new_indexed(4, 1, indices.clone(), pal([255, 0, 255, 255])).unwrap();
+    let bytes = encode(&img, &EncodeOptions::default()).unwrap();
+    let i = info(&bytes).unwrap();
+    assert_eq!(
+        (i.masking, i.format, i.has_alpha),
+        (2, IffPixelFormat::Pal8, true)
+    );
+    let back = decode(&bytes).unwrap();
+    assert_eq!(
+        back.palette.as_ref().unwrap().transparent_indices(),
+        vec![1]
+    );
+    assert_eq!(back.planes, img.planes);
+
+    // Several transparent entries (alpha below 128): a mask plane;
+    // the file decodes as Rgba with those pixels cleared.
+    let img = IffImage::new_indexed(4, 1, indices.clone(), pal([255, 0, 100, 128])).unwrap();
+    assert_eq!(
+        img.palette.as_ref().unwrap().transparent_indices(),
+        vec![1, 2]
+    );
+    let bytes = encode(&img, &EncodeOptions::default()).unwrap();
+    assert_eq!(info(&bytes).unwrap().masking, 1);
+    let back = decode(&bytes).unwrap();
+    assert_eq!(back.format, IffPixelFormat::Rgba);
+    assert_eq!(
+        back.to_rgba8(),
+        vec![0, 0, 0, 255, 1, 1, 1, 0, 2, 2, 2, 0, 3, 3, 3, 255]
+    );
+    // The same picture into ACBM keeps the mask plane; PBM has none.
+    let acbm = encode(&img, &EncodeOptions::default().with_form(IffForm::Acbm)).unwrap();
+    assert_eq!(decode(&acbm).unwrap().to_rgba8(), back.to_rgba8());
+    assert!(matches!(
+        encode(&img, &EncodeOptions::default().with_form(IffForm::Pbm)),
+        Err(IffError::Unsupported(_))
+    ));
+    // An explicit transparent-colour request keeps PBM indexed with the
+    // first transparent entry as the key.
+    let pbm = encode(
+        &img,
+        &EncodeOptions::default()
+            .with_form(IffForm::Pbm)
+            .with_masking(Masking::HasTransparentColor),
+    )
+    .unwrap();
+    let i = info(&pbm).unwrap();
+    assert_eq!((i.masking, i.format), (2, IffPixelFormat::Pal8));
+    assert_eq!(
+        decode(&pbm).unwrap().palette.unwrap().transparent_indices(),
+        vec![1]
+    );
+
+    // An explicit mask plane on an opaque palette is all-opaque; lasso
+    // is refused for Pal8 input.
+    let opaque = IffImage::new_indexed(4, 1, indices, pal([255; 4])).unwrap();
+    let bytes = encode(
+        &opaque,
+        &EncodeOptions::default().with_masking(Masking::HasMask),
+    )
+    .unwrap();
+    assert_eq!(info(&bytes).unwrap().masking, 1);
+    assert!(decode(&bytes)
+        .unwrap()
+        .to_rgba8()
+        .iter()
+        .skip(3)
+        .step_by(4)
+        .all(|&a| a == 255));
+    assert!(matches!(
+        encode(
+            &opaque,
+            &EncodeOptions::default().with_masking(Masking::Lasso)
+        ),
+        Err(IffError::Unsupported(_))
+    ));
+}

@@ -914,6 +914,43 @@ fn deep_dpel(with_alpha: bool) -> Dpel {
     Dpel { elements }
 }
 
+/// The masking mode a `Pal8` picture is written with, from its palette
+/// alpha (the documented rule, shared by [`encode`], [`encode_all`] and
+/// the registry encoder):
+///
+/// * `masking` given — that mode; the key is the first transparent entry
+///   (alpha below [`Palette::TRANSPARENT_BELOW`]), `0` when there is none.
+///   `Lasso` is refused (its transparency is a seed fill the decoder
+///   derives, not something a palette can express); `HasMask` derives
+///   the plane from the palette alpha (all-opaque when it has none).
+/// * derived — no transparent entry: `None`; exactly one: the
+///   transparent colour key (`HasTransparentColor`, the picture round
+///   trips as `Pal8` with that entry's alpha `0`); several: a mask plane
+///   (`HasMask`, pixels of those entries masked out; the file decodes as
+///   `Rgba`).
+fn pal8_masking(
+    palette: &Palette,
+    requested: Option<Masking>,
+    label: &str,
+) -> Result<(Masking, u16)> {
+    let transparent = palette.transparent_indices();
+    let key = transparent.first().map(|&i| u16::from(i)).unwrap_or(0);
+    Ok(match requested {
+        Some(Masking::Lasso) => {
+            return Err(IffError::unsupported(format!(
+                "{label} encode: mskLasso is a decoder-side seed fill; Pal8 input takes \
+                 masking None, HasMask or HasTransparentColor"
+            )))
+        }
+        Some(m) => (m, key),
+        None => match transparent.len() {
+            0 => (Masking::None, 0),
+            1 => (Masking::HasTransparentColor, key),
+            _ => (Masking::HasMask, 0),
+        },
+    })
+}
+
 fn planes_for(palette_len: usize) -> u8 {
     let mut n = 1u8;
     while (1usize << n) < palette_len && n < 8 {
@@ -970,18 +1007,13 @@ fn encode_planar_family(image: &IffImage, form: IffForm, opts: &EncodeOptions) -
                 "{label} encode: a HAM viewmode needs RGB input (indices are not HAM codes)"
             )));
         }
-        if matches!(opts.masking, Some(Masking::HasMask) | Some(Masking::Lasso)) {
-            return Err(IffError::unsupported(format!(
-                "{label} encode: Pal8 input has no per-pixel alpha for a mask plane / lasso"
-            )));
+        let (masking, key) = pal8_masking(palette, opts.masking, label)?;
+        if form == IffForm::Pbm && masking == Masking::HasMask {
+            return Err(IffError::unsupported(
+                "PBM encode: the chunky form has no mask plane; a palette with several \
+                 transparent entries needs ILBM / ACBM (or masking = HasTransparentColor)",
+            ));
         }
-        let (masking, key) = match opts.masking {
-            Some(m) => (m, palette.transparent_index().unwrap_or(0)),
-            None => match palette.transparent_index() {
-                Some(i) => (Masking::HasTransparentColor, i),
-                None => (Masking::None, 0),
-            },
-        };
         let mut cmap = palette.to_rgb_triples();
         let n_planes = if form == IffForm::Pbm {
             8
@@ -1032,6 +1064,14 @@ fn encode_planar_family(image: &IffImage, form: IffForm, opts: &EncodeOptions) -
         let w = image.width as usize;
         let stride = image.stride();
         let data = image.data();
+        // A mask plane from the palette alpha: a pixel is opaque unless
+        // its entry is transparent (alpha below `TRANSPARENT_BELOW`).
+        let mask: Option<Vec<u8>> = (masking == Masking::HasMask).then(|| {
+            (0..image.height as usize)
+                .flat_map(|y| data[y * stride..y * stride + w].iter())
+                .map(|&i| u8::from(!palette.is_transparent(i)))
+                .collect()
+        });
         return Ok(match form {
             IffForm::Pbm => {
                 let row_stride = (w + 1) & !1;
@@ -1046,11 +1086,25 @@ fn encode_planar_family(image: &IffImage, form: IffForm, opts: &EncodeOptions) -
                 assemble_ilbm_form(&shell, &body, resolved)
             }
             IffForm::Acbm => {
-                let rows = indices_rows(data, w, stride, image.height as usize, &bmhd, None);
+                let rows = indices_rows(
+                    data,
+                    w,
+                    stride,
+                    image.height as usize,
+                    &bmhd,
+                    mask.as_deref(),
+                );
                 assemble_acbm_form(&shell, &rows)
             }
             _ => {
-                let rows = indices_rows(data, w, stride, image.height as usize, &bmhd, None);
+                let rows = indices_rows(
+                    data,
+                    w,
+                    stride,
+                    image.height as usize,
+                    &bmhd,
+                    mask.as_deref(),
+                );
                 let (body, resolved) = pack_body_resolving(rows, opts.compression);
                 assemble_ilbm_form(&shell, &body, resolved)
             }
@@ -1358,8 +1412,13 @@ fn encode_anim(frames: &[Frame], w: u16, h: u16, opts: &EncodeOptions) -> Result
     }
     // One CMAP for the whole animation.
     let first_rgba = first.to_rgba8();
-    let (palette, key) = match (&first.format, &first.palette) {
-        (PixelFormat::Pal8, Some(p)) => (p.to_rgb_triples(), p.transparent_index()),
+    // A `Pal8` seed frame fixes the masking mode by the palette rule
+    // (`pal8_masking`); an RGB seed derives it from the pixels' alpha.
+    let (palette, pal8_mode) = match (&first.format, &first.palette) {
+        (PixelFormat::Pal8, Some(p)) => (
+            p.to_rgb_triples(),
+            Some(pal8_masking(p, opts.masking, "ANIM")?),
+        ),
         _ => (build_palette(&first_rgba).0, None),
     };
     if palette.len() > 256 {
@@ -1387,13 +1446,11 @@ fn encode_anim(frames: &[Frame], w: u16, h: u16, opts: &EncodeOptions) -> Result
         f.image.format == PixelFormat::Rgba
             && f.image.data().iter().skip(3).step_by(4).any(|&a| a != 255)
     });
-    let (masking, key) = match opts.masking {
-        Some(m) => (m, key.unwrap_or(0)),
-        None => match key {
-            Some(k) => (Masking::HasTransparentColor, k),
-            None if any_alpha => (Masking::HasMask, 0),
-            None => (Masking::None, 0),
-        },
+    let (masking, key) = match (pal8_mode, opts.masking) {
+        (Some(mode), _) => mode,
+        (None, Some(m)) => (m, 0),
+        (None, None) if any_alpha => (Masking::HasMask, 0),
+        (None, None) => (Masking::None, 0),
     };
     let bmhd = Bmhd {
         width: w,

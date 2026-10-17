@@ -388,6 +388,38 @@ impl Palette {
             .position(|e| e[3] == 0)
             .map(|i| i as u16)
     }
+
+    /// Alpha below this value makes a palette entry *transparent* for
+    /// the ILBM masking mechanisms, which are 1-bit: a transparent
+    /// colour key (`BMHD.masking` 2) or a mask plane (`masking` 1).
+    pub const TRANSPARENT_BELOW: u8 = 128;
+
+    /// `true` when entry `index` exists and its alpha is below
+    /// [`TRANSPARENT_BELOW`](Self::TRANSPARENT_BELOW).
+    pub fn is_transparent(&self, index: u8) -> bool {
+        self.get(index)
+            .is_some_and(|e| e[3] < Self::TRANSPARENT_BELOW)
+    }
+
+    /// Every entry index whose alpha is below
+    /// [`TRANSPARENT_BELOW`](Self::TRANSPARENT_BELOW), in index order —
+    /// the set the encoder maps onto a masking mode (see
+    /// [`crate::encode`]: one such entry is written as the transparent
+    /// colour key, several as a mask plane).
+    pub fn transparent_indices(&self) -> Vec<u8> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e[3] < Self::TRANSPARENT_BELOW)
+            .map(|(i, _)| i as u8)
+            .collect()
+    }
+
+    /// Alpha bytes in entry order — the palette-alpha record the
+    /// framework frame carries next to the RGB triples.
+    pub fn alpha_bytes(&self) -> Vec<u8> {
+        self.entries.iter().map(|e| e[3]).collect()
+    }
 }
 
 /// A decoded (or to-be-encoded) IFF picture in its native layout.
