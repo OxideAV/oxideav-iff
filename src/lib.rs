@@ -76,8 +76,8 @@ pub use api::{
 };
 pub use error::{Error, IffError, Result};
 pub use image::{
-    ColorInfo, ColorRange, Frame, IffForm, IffImage, IffPixelFormat, ImageInfo, Metadata, Palette,
-    PixelFormat, Plane, RgbImage, RgbaImage,
+    ColorInfo, ColorRange, Frame, IffChunk, IffForm, IffImage, IffPixelFormat, ImageInfo, Metadata,
+    Palette, PixelFormat, Plane, RgbImage, RgbaImage, CARRIED_CHUNKS,
 };
 pub use options::{AnimOp, DecodeOptions, EncodeOptions};
 
@@ -87,6 +87,7 @@ pub use options::{AnimOp, DecodeOptions, EncodeOptions};
 pub use registry::__oxideav_entry;
 #[cfg(feature = "registry")]
 pub use registry::{
-    make_decoder, make_encoder, register, register_codecs, register_containers,
-    register_registries, IlbmEncoderOptions, CODEC_ID_STR, ENCODER_PIXEL_FORMATS,
+    apply_blobs, image_blobs, make_decoder, make_encoder, merged_blobs, register, register_codecs,
+    register_containers, register_registries, IlbmEncoderOptions, BLOB_KIND_ASPECT, BLOB_KIND_CAMG,
+    CODEC_ID_STR, ENCODER_PIXEL_FORMATS,
 };

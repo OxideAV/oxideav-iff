@@ -74,6 +74,11 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     params.width = Some(anim.width);
     params.height = Some(anim.height);
     params.pixel_format = Some(PixelFormat::Rgba);
+    // Stream-level metadata from the seed frame (its carried chunks,
+    // CAMG and aspect as blobs), as `decode` would report it.
+    if let Ok(seed) = crate::decode(&full) {
+        params.blobs = crate::registry::image_blobs(&seed);
+    }
     // Build the cumulative playback timeline so packet PTS/duration carry
     // the real per-frame jiffy delays from ANHD rather than a flat 1/frame.
     let playback = anim.playback();

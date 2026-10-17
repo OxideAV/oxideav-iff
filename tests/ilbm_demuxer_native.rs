@@ -240,3 +240,122 @@ fn registry_encoder_maps_the_alpha_record_back_to_a_masking_mode() {
     let none = encode_via_registry(frame(Vec::new()));
     assert_eq!(oxideav_iff::info(&none).unwrap().masking, 0);
 }
+
+#[test]
+fn native_chunks_ride_the_registry_as_blobs_and_come_back() {
+    use oxideav_core::{BlobKind, MetadataBlob};
+    use oxideav_iff::{IffChunk, BLOB_KIND_ASPECT, BLOB_KIND_CAMG};
+    let pal = Palette::from_rgb_triples(&[[0, 0, 0], [255, 255, 255]]);
+    let img = IffImage::new_indexed(2, 1, vec![0, 1], pal)
+        .unwrap()
+        .with_chunk(IffChunk::text_chunk(*b"ANNO", "hello"))
+        .with_chunk(IffChunk::new(*b"DPI ", [0, 72, 0, 96]))
+        .with_viewmode(0x0000_8000u32)
+        .with_aspect((10, 11));
+    let bytes = encode(&img, &EncodeOptions::default()).unwrap();
+    let (dmx, pkt) = demux(&bytes);
+    let s = &dmx.streams()[0];
+    // Stream level: one blob per carried chunk + CAMG + aspect.
+    let kinds: Vec<&str> = s.params.blobs.iter().map(|b| b.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["iff-anno", "iff-dpi", BLOB_KIND_CAMG, BLOB_KIND_ASPECT]
+    );
+    assert_eq!(s.params.blobs[0].data, b"hello");
+    assert_eq!(s.params.blobs[2].data, 0x8000u32.to_be_bytes());
+    assert_eq!(s.params.blobs[3].data, [10, 11]);
+    // Frame level: the decoder attaches the same set.
+    let mut dec = make_decoder(&s.params).unwrap();
+    dec.send_packet(&pkt).unwrap();
+    let Frame::Video(v) = dec.receive_frame().unwrap() else {
+        panic!("expected a video frame");
+    };
+    assert_eq!(v.blobs(), s.params.blobs);
+    assert_eq!(
+        v.blob(&BlobKind::custom("iff-anno")).map(|b| b.data),
+        Some(b"hello".to_vec())
+    );
+    // Back through the frame bridge and the encoder: chunks, CAMG and
+    // aspect are written again; a frame blob outranks the stream's.
+    let back = IffImage::from_video_frame(&v, &s.params).unwrap();
+    assert_eq!(back.chunks, img.chunks);
+    assert_eq!((back.viewmode, back.aspect), (Some(0x8000), Some((10, 11))));
+
+    let mut params = s.params.clone();
+    params
+        .blobs
+        .push(MetadataBlob::new(BlobKind::ICC, vec![1, 2, 3])); // no IFF chunk
+    let mut frame = v.clone();
+    frame.set_blobs(vec![MetadataBlob::new(
+        BlobKind::custom("iff-anno"),
+        b"frame wins".to_vec(),
+    )]);
+    let mut enc = oxideav_iff::make_encoder(&params).unwrap();
+    enc.send_frame(&Frame::Video(frame)).unwrap();
+    let out = enc.receive_packet().unwrap().data;
+    let re = oxideav_iff::decode_with(
+        &out,
+        &oxideav_iff::DecodeOptions::default().with_strict(true),
+    )
+    .unwrap();
+    assert_eq!(re.chunk_text(b"ANNO").as_deref(), Some("frame wins"));
+    assert_eq!(
+        re.chunk(b"DPI ").map(|c| c.data.clone()),
+        Some(vec![0, 72, 0, 96])
+    );
+    assert_eq!((re.viewmode, re.aspect), (Some(0x8000), Some((10, 11))));
+    assert_eq!(oxideav_iff::info(&out).unwrap().chunks.len(), 2);
+
+    // The `viewmode` option outranks the CAMG blob.
+    let mut params = s.params.clone();
+    params.options.insert("viewmode", "4");
+    let mut enc = oxideav_iff::make_encoder(&params).unwrap();
+    enc.send_frame(&Frame::Video(v.clone())).unwrap();
+    let out = enc.receive_packet().unwrap().data;
+    assert_eq!(oxideav_iff::decode(&out).unwrap().viewmode, Some(4));
+}
+
+#[test]
+fn rawvideo_muxer_writes_the_stream_blobs_as_chunks() {
+    use oxideav_core::{BlobKind, CodecParameters, MetadataBlob, StreamInfo, TimeBase};
+    let mut params = CodecParameters::video(CodecId::new("rawvideo"));
+    params.width = Some(2);
+    params.height = Some(1);
+    params.pixel_format = Some(PixelFormat::Rgb24);
+    params.blobs = vec![
+        MetadataBlob::new(BlobKind::custom("iff-auth"), b"muxer test".to_vec()),
+        MetadataBlob::new(BlobKind::custom("iff-aspect"), vec![5, 6]),
+        MetadataBlob::new(BlobKind::XMP, b"<x/>".to_vec()),
+    ];
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 1),
+        duration: Some(1),
+        start_time: Some(0),
+        params,
+    };
+    let reg = registry();
+    let path =
+        std::env::temp_dir().join(format!("oxideav-iff-ilbm-blobs-{}.lbm", std::process::id()));
+    {
+        let ws: Box<dyn WriteSeek> = Box::new(std::fs::File::create(&path).unwrap());
+        let mut mux = reg
+            .open_muxer("iff_ilbm", ws, std::slice::from_ref(&stream))
+            .unwrap();
+        mux.write_header().unwrap();
+        let pkt = oxideav_core::Packet::new(0, TimeBase::new(1, 1), vec![1, 2, 3, 4, 5, 6]);
+        mux.write_packet(&pkt).unwrap();
+        mux.write_trailer().unwrap();
+    }
+    let out = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let img = oxideav_iff::decode_with(
+        &out,
+        &oxideav_iff::DecodeOptions::default().with_strict(true),
+    )
+    .unwrap();
+    assert_eq!(img.chunk_text(b"AUTH").as_deref(), Some("muxer test"));
+    assert_eq!(img.aspect, Some((5, 6)));
+    assert_eq!(img.chunks.len(), 1, "XMP has no IFF chunk");
+    assert_eq!(img.to_rgb8(), vec![1, 2, 3, 4, 5, 6]);
+}

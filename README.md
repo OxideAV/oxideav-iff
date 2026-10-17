@@ -206,7 +206,42 @@ IFF raster FORMs define no ICC / Exif / XMP chunk and no colorimetry
 (`CAMG` is a display-mode word), so `Metadata` is always empty and
 `ColorInfo` is the documented convention `ColorInfo::iff_default()`:
 full range, RGB (identity matrix), primaries and transfer unspecified
-(`2`). `Metadata.gamma` is `None`. Nothing is stamped on registry frames.
+(`2`). `Metadata.gamma` is `None`. No colour signal is stamped on
+registry frames.
+
+What IFF does carry is its own chunks. `decode` keeps the
+**carried chunks** (`CARRIED_CHUNKS`) verbatim on `IffImage::chunks`
+(`IffChunk { id, data }`, file order; `chunk(id)`, `chunk_text(id)`,
+`IffChunk::text_chunk`), `info` lists them (`ImageInfo::chunks`,
+`has_text`), and every encoder writes them back ahead of the body
+chunk with the FORM size patched (strict decode holds). On the
+registry path they are core 0.1.40 **metadata blobs** of custom kinds
+(`image_blobs` / `apply_blobs` / `merged_blobs`): the demuxers declare
+them on `CodecParameters::blobs`, the `ilbm` decoder attaches the same
+set to every frame, the encoder and the `rawvideo` muxer write the
+stream's blobs with the frame's laid over them (a frame blob of a kind
+replaces the stream's blobs of that kind):
+
+| Chunk | Meaning (spec) | `IffImage` | Blob kind | Payload |
+|---|---|---|---|---|
+| `ANNO` | EA IFF 85 generic annotation | `chunks` | `iff-anno` | the text bytes (ISO-8859-1, `LF` line breaks) |
+| `AUTH` | generic author | `chunks` | `iff-auth` | text |
+| `(c) ` | generic copyright | `chunks` | `iff-copyright` | text |
+| `NAME` | generic name of the work | `chunks` | `iff-name` | text |
+| `TEXT` | generic unformatted text | `chunks` | `iff-text` | text |
+| `DPI ` | ILBM.DPI dots per inch | `chunks` | `iff-dpi` | `UWORD dpi_x, dpi_y` (big-endian, as stored) |
+| `GRAB` | ILBM hotspot `Point2D` | `chunks` | `iff-grab` | 4 bytes as stored |
+| `DEST` | ILBM `DestMerge` | `chunks` | `iff-dest` | 8 bytes as stored |
+| `CAMG` | Amiga viewport mode | `viewmode` | `iff-camg` | big-endian `u32` |
+| `BMHD` x / y aspect | pixel aspect | `aspect` | `iff-aspect` | `[x, y]` |
+
+Blobs of the well-known kinds (`icc`, `exif`, `xmp`, `iptc`) have no
+IFF chunk and are not written; a consumer that needs them keeps them on
+its own side. The `viewmode` encoder option outranks an `iff-camg` blob;
+a HAM / EHB muxer mode outranks it in the `iff_ilbm` muxer. ANIM
+sequences carry the first frame's chunks in the seed `FORM ILBM`
+(`decode_all` reports them on frame 0; `iff_anim` declares them on the
+stream); a multi-`DBOD` DEEP shares its chunks across every frame.
 
 `IffImage` carries the IFF-specific facts an encoder needs to write a
 faithful file: `form`, `n_planes` (`BMHD.nPlanes`, or the `DPEL` bit

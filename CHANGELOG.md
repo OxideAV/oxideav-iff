@@ -19,6 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (masking 2, round-trips as `Pal8`), several → mask plane (masking 1,
   decodes as `Rgba`), none → masking 0. A mask-plane picture keeps
   decoding to composed `Rgba`.
+- Format-native metadata: `IffImage::chunks` (`IffChunk`,
+  `CARRIED_CHUNKS` = `ANNO` / `AUTH` / `(c) ` / `NAME` / `TEXT` / `DPI `
+  / `GRAB` / `DEST`) is filled by `decode` / `decode_all` and written
+  back by every encoder ahead of the body chunk (FORM size patched);
+  `ImageInfo::chunks` / `has_text`; `IffChunk::text`, `text_chunk`,
+  `blob_kind_name`, `id_for_blob_kind_name`; `IffImage::with_chunk(s)`,
+  `chunk`, `chunk_text`.
+- Metadata blobs on the registry path (core 0.1.40): `image_blobs` /
+  `apply_blobs` / `merged_blobs`, kinds `iff-anno` … `iff-dest` plus
+  `iff-camg` (`BLOB_KIND_CAMG`, the viewmode) and `iff-aspect`
+  (`BLOB_KIND_ASPECT`); the `iff_ilbm` / `iff_acbm` / `iff_anim`
+  demuxers declare them on `CodecParameters::blobs`, the `ilbm`
+  decoder attaches them to every frame, the encoder and the
+  `rawvideo` path of the `iff_ilbm` muxer write them back (frame blobs
+  over stream blobs); well-known kinds (ICC / Exif / XMP) have no IFF
+  chunk and are not written.
 - `Palette::TRANSPARENT_BELOW`, `is_transparent`, `transparent_indices`,
   `alpha_bytes`.
 - The registry encoder declares its input layouts

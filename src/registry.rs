@@ -32,15 +32,17 @@
 //! frames; `iff_8svx` / `aiff` emit PCM.
 
 use oxideav_core::{
-    parse_options, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
-    CodecRegistry, ColorPrimaries, ColorSignal, ContainerRegistry, Decoder, Encoder, Frame,
-    MatrixCoefficients, OptionField, OptionKind, OptionValue, Packet, PixelFormat, RuntimeContext,
-    TimeBase, TransferCharacteristics, VideoFrame, VideoPlane,
+    parse_options, BlobKind, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct,
+    CodecParameters, CodecRegistry, ColorPrimaries, ColorSignal, ContainerRegistry, Decoder,
+    Encoder, Frame, MatrixCoefficients, MetadataBlob, OptionField, OptionKind, OptionValue, Packet,
+    PixelFormat, RuntimeContext, TimeBase, TransferCharacteristics, VideoFrame, VideoPlane,
 };
 
 use crate::error::IffError;
 use crate::ilbm::{Camg, Compression, Masking};
-use crate::image::{ColorInfo, ColorRange, IffForm, IffImage, IffPixelFormat, Palette, Plane};
+use crate::image::{
+    ColorInfo, ColorRange, IffChunk, IffForm, IffImage, IffPixelFormat, Palette, Plane,
+};
 use crate::options::EncodeOptions;
 
 /// Codec id of the IFF raster image codec (`make_decoder` /
@@ -126,9 +128,90 @@ pub fn from_color_signal(s: &ColorSignal) -> ColorInfo {
     ColorInfo::new(range, s.primaries.0, s.transfer.0, s.matrix.0)
 }
 
+// ---- Metadata blobs ----
+
+/// Blob kind of the `CAMG` viewmode longword (`IffImage::viewmode`),
+/// big-endian `u32` payload.
+pub const BLOB_KIND_CAMG: &str = "iff-camg";
+/// Blob kind of the `BMHD` pixel-aspect pair (`IffImage::aspect`),
+/// payload `[x_aspect, y_aspect]`.
+pub const BLOB_KIND_ASPECT: &str = "iff-aspect";
+
+/// The metadata blobs an [`IffImage`] travels with on the registry
+/// path (core 0.1.40 `MetadataBlob`s, all of custom kinds — IFF defines
+/// no ICC / Exif / XMP chunk): one blob per carried chunk
+/// ([`IffImage::chunks`]) of kind [`IffChunk::blob_kind_name`]
+/// (`iff-anno`, `iff-auth`, `iff-copyright`, `iff-name`, `iff-text`,
+/// `iff-dpi`, `iff-grab`, `iff-dest`; payload = the chunk body), plus
+/// [`BLOB_KIND_CAMG`] for `viewmode` and [`BLOB_KIND_ASPECT`] for
+/// `aspect` when set. The `ilbm` decoder attaches them to every frame
+/// and the demuxers declare them on the stream.
+pub fn image_blobs(image: &IffImage) -> Vec<MetadataBlob> {
+    let mut out: Vec<MetadataBlob> = image
+        .chunks
+        .iter()
+        .map(|c| MetadataBlob::new(BlobKind::custom(c.blob_kind_name()), c.data.clone()))
+        .collect();
+    if let Some(v) = image.viewmode {
+        out.push(MetadataBlob::new(
+            BlobKind::custom(BLOB_KIND_CAMG),
+            v.to_be_bytes().to_vec(),
+        ));
+    }
+    if let Some((x, y)) = image.aspect {
+        out.push(MetadataBlob::new(
+            BlobKind::custom(BLOB_KIND_ASPECT),
+            vec![x, y],
+        ));
+    }
+    out
+}
+
+/// The inverse of [`image_blobs`]: apply `blobs` to `image` — carried
+/// chunks replace [`IffImage::chunks`] (in blob order), [`BLOB_KIND_CAMG`]
+/// sets `viewmode` (a 4-byte payload), [`BLOB_KIND_ASPECT`] sets
+/// `aspect` (2 bytes). Blobs of any other kind are ignored: IFF has no
+/// chunk for an ICC profile, Exif or XMP. A malformed payload is
+/// ignored too.
+pub fn apply_blobs(image: &mut IffImage, blobs: &[MetadataBlob]) {
+    let mut chunks = Vec::new();
+    for b in blobs {
+        let name = b.kind.as_str();
+        if name == BLOB_KIND_CAMG {
+            if let Ok(raw) = <[u8; 4]>::try_from(b.data.as_slice()) {
+                image.viewmode = Some(u32::from_be_bytes(raw));
+            }
+        } else if name == BLOB_KIND_ASPECT {
+            if let [x, y] = b.data.as_slice() {
+                image.aspect = Some((*x, *y));
+            }
+        } else if let Some(id) = IffChunk::id_for_blob_kind_name(name) {
+            chunks.push(IffChunk::new(id, b.data.clone()));
+        }
+    }
+    if !chunks.is_empty() {
+        image.chunks = chunks;
+    }
+}
+
+/// Stream blobs with the frame's blobs laid over them: a frame blob of
+/// some kind replaces every stream blob of that kind (the framework's
+/// precedence rule), so one picture's own `ANNO` wins over the
+/// stream's.
+pub fn merged_blobs(stream: &[MetadataBlob], frame: &[MetadataBlob]) -> Vec<MetadataBlob> {
+    let mut out: Vec<MetadataBlob> = stream
+        .iter()
+        .filter(|s| !frame.iter().any(|f| f.kind == s.kind))
+        .cloned()
+        .collect();
+    out.extend_from_slice(frame);
+    out
+}
+
 // ---- Frame bridge ----
 
 fn stamp_frame_side_channels(frame: &mut VideoFrame, image: &IffImage) {
+    frame.set_blobs(image_blobs(image));
     if let (IffPixelFormat::Pal8, Some(p)) = (image.format, &image.palette) {
         frame.set_palette(p.to_rgb());
         // The palette-alpha record (core 0.1.40) carries a transparent
@@ -150,8 +233,9 @@ fn stamp_frame_side_channels(frame: &mut VideoFrame, image: &IffImage) {
 /// plane, the palette side-channel for `Pal8` plus the palette-alpha
 /// record when the palette is not fully opaque (a `BMHD` transparent
 /// colour key arrives as that entry's alpha `0`, every other entry
-/// `255`), and the colour-signal side-channel only when the image
-/// signals more than the IFF default.
+/// `255`), the metadata-blobs record ([`image_blobs`]: carried chunks,
+/// `CAMG`, aspect), and the colour-signal side-channel only when the
+/// image signals more than the IFF default.
 pub fn image_into_video_frame(mut image: IffImage, pts: Option<i64>) -> VideoFrame {
     let stride = image.stride();
     let data = if image.planes.is_empty() {
@@ -187,7 +271,9 @@ impl IffImage {
     /// defaults to `Rgba`). For `Pal8` the palette comes from the frame's
     /// palette side-channel, its alpha from the palette-alpha record
     /// (opaque when absent); the frame's colour-signal side-channel,
-    /// when attached, becomes `color`. The geometry is validated.
+    /// when attached, becomes `color`; the stream's `params.blobs` with
+    /// the frame's blobs laid over them become `chunks` / `viewmode` /
+    /// `aspect` ([`apply_blobs`]). The geometry is validated.
     pub fn from_video_frame(frame: &VideoFrame, params: &CodecParameters) -> crate::Result<Self> {
         let width = params
             .width
@@ -234,6 +320,7 @@ impl IffImage {
         if let Some(sig) = frame.color_signal() {
             img.color = from_color_signal(&sig);
         }
+        apply_blobs(&mut img, &merged_blobs(&params.blobs, &frame.blobs()));
         Ok(img)
     }
 }
@@ -552,6 +639,13 @@ fn output_label(input: PixelFormat, opts: &IlbmEncoderOptions) -> Option<PixelFo
 /// `output_params().pixel_format` is the layout the written file
 /// decodes to (`Pal8` + palette `extradata`, `Rgb24`, `Rgba`), refined
 /// after the first frame from the file itself.
+///
+/// Metadata: the stream's `params.blobs` with the frame's blobs laid
+/// over them ([`merged_blobs`]) are written back — carried chunks
+/// (`iff-anno` … `iff-dest`) ahead of the body, `iff-camg` as `CAMG`
+/// (the `viewmode` option outranks it), `iff-aspect` into `BMHD`;
+/// blobs of other kinds (ICC / Exif / XMP) have no IFF chunk and are
+/// not written ([`apply_blobs`]).
 pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
     let opts: IlbmEncoderOptions = parse_options(&params.options)?;
     if let Some(pf) = params.pixel_format {
@@ -572,6 +666,7 @@ pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn En
     Ok(Box::new(IffEncoder {
         codec_id: CodecId::new(CODEC_ID_STR),
         input_format: params.pixel_format,
+        stream_blobs: params.blobs.clone(),
         out_params,
         opts,
         pending: None,
@@ -582,6 +677,9 @@ pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn En
 struct IffEncoder {
     codec_id: CodecId,
     input_format: Option<PixelFormat>,
+    /// The stream's blobs (`params.blobs` at construction), the base a
+    /// frame's own blobs are laid over.
+    stream_blobs: Vec<MetadataBlob>,
     out_params: CodecParameters,
     opts: IlbmEncoderOptions,
     pending: Option<Vec<u8>>,
@@ -665,12 +763,22 @@ fn frame_to_image(
                 )))
             }
         };
+    let mut image = image;
+    apply_blobs(&mut image, &merged_blobs(&params.blobs, &vf.blobs()));
+    // An explicit `viewmode` option outranks the frame's `CAMG` blob.
+    if opts.viewmode.is_some() {
+        image.viewmode = None;
+    }
     let image = if image.format == IffPixelFormat::Rgba {
         let opaque = image.data().iter().skip(3).step_by(4).all(|&a| a == 255);
         if opaque {
             // Alpha carries nothing: the 24-bit (or RGB DPEL / genlock)
             // form is exact.
-            IffImage::from_rgb8(width, height, image.to_rgb8())?
+            let mut rgb = IffImage::from_rgb8(width, height, image.to_rgb8())?;
+            rgb.chunks = image.chunks;
+            rgb.viewmode = image.viewmode;
+            rgb.aspect = image.aspect;
+            rgb
         } else {
             let planar = matches!(enc.form, Some(IffForm::Ilbm | IffForm::Pbm | IffForm::Acbm));
             let ham_or_ehb = enc
@@ -716,6 +824,7 @@ impl Encoder for IffEncoder {
         };
         let mut in_params = self.out_params.clone();
         in_params.pixel_format = self.input_format;
+        in_params.blobs.clone_from(&self.stream_blobs);
         let (image, enc) = frame_to_image(vf, &in_params, &self.opts)?;
         let bytes = crate::encode(&image, &enc)?;
         // Truthful label: what the written FORM decodes to.

@@ -148,7 +148,8 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
 /// Stream description of a whole raster `FORM` handed to the `ilbm`
 /// codec: the layout [`crate::decode`] produces (validating the picture
 /// on the way), with the palette's RGB triples in `extradata` for `Pal8`
-/// so stream-level consumers see it before the first frame.
+/// so stream-level consumers see it before the first frame, and the
+/// picture's metadata blobs ([`crate::image_blobs`]) on `params.blobs`.
 fn native_form_stream(full: &[u8]) -> Result<StreamInfo> {
     let image = crate::decode(full)?;
     let mut params = CodecParameters::video(CodecId::new(crate::registry::CODEC_ID_STR));
@@ -159,6 +160,9 @@ fn native_form_stream(full: &[u8]) -> Result<StreamInfo> {
     if let (crate::IffPixelFormat::Pal8, Some(p)) = (image.format, &image.palette) {
         params.extradata = p.to_rgb();
     }
+    // Stream-level metadata: the carried chunks, CAMG and aspect as
+    // blobs (the decoder attaches the same set to the frame).
+    params.blobs = crate::registry::image_blobs(&image);
     Ok(StreamInfo {
         index: 0,
         time_base: TimeBase::new(1, 1),
@@ -305,6 +309,9 @@ pub struct IlbmMuxer {
     width: u32,
     height: u32,
     input: MuxInput,
+    /// The stream's metadata blobs, written back as chunks / `CAMG` /
+    /// aspect on the `rawvideo` path ([`crate::apply_blobs`]).
+    blobs: Vec<oxideav_core::MetadataBlob>,
     compression: Compression,
     mode: MuxerMode,
     masking: Masking,
@@ -426,6 +433,7 @@ impl IlbmMuxer {
             width,
             height,
             input,
+            blobs: s.params.blobs.clone(),
             compression: Compression::Auto,
             mode: MuxerMode::IndexedAuto,
             masking: Masking::None,
@@ -508,6 +516,9 @@ impl Muxer for IlbmMuxer {
         }
 
         // Plane count, palette, CAMG flags + form type are mode-driven.
+        // Stream blobs: CAMG / aspect / carried chunks.
+        let mut meta = crate::IffImage::unchecked(0, 0, crate::IffPixelFormat::Rgb24, Vec::new());
+        crate::apply_blobs(&mut meta, &self.blobs);
         let (palette, n_planes, camg, form_type) = match self.mode {
             MuxerMode::IndexedAuto | MuxerMode::Acbm => {
                 let (pal, _) = build_palette(&self.pending);
@@ -553,6 +564,15 @@ impl Muxer for IlbmMuxer {
                 (Vec::new(), 24u8, Camg::default(), *b"ILBM")
             }
         };
+        // A mode's own CAMG (HAM / EHB) wins; otherwise the stream's.
+        let camg = if camg.raw == 0 {
+            Camg {
+                raw: meta.viewmode.unwrap_or(0),
+            }
+        } else {
+            camg
+        };
+        let (x_aspect, y_aspect) = meta.aspect.unwrap_or((1, 1));
 
         if palette.is_empty() && self.mode != MuxerMode::TrueColor24 {
             return Err(Error::invalid("ILBM muxer: empty input palette"));
@@ -585,8 +605,8 @@ impl Muxer for IlbmMuxer {
             compression,
             pad: 0,
             transparent_color: self.transparent_color,
-            x_aspect: 1,
-            y_aspect: 1,
+            x_aspect,
+            y_aspect,
             page_width: self.width as i16,
             page_height: self.height as i16,
         };
@@ -600,11 +620,12 @@ impl Muxer for IlbmMuxer {
             rgba: std::mem::take(&mut self.pending),
             ..IlbmImage::default()
         };
-        let bytes = if self.mode == MuxerMode::Acbm {
+        let mut bytes = if self.mode == MuxerMode::Acbm {
             encode_acbm(&img)?
         } else {
             encode_ilbm(&img)?
         };
+        crate::api::splice_chunks(&mut bytes, &meta.chunks);
         self.output.write_all(&bytes)?;
         self.output.flush()?;
         self.written = true;

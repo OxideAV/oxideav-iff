@@ -38,7 +38,7 @@ use crate::ilbm::{
     DpelElement, GenlockPolicy, IlbmImage, IndexedView, InferredFormat, Masking, Pchg,
 };
 use crate::image::{
-    Frame, IffForm, IffImage, ImageInfo, Palette, PixelFormat, Plane, RgbImage, RgbaImage,
+    Frame, IffChunk, IffForm, IffImage, ImageInfo, Palette, PixelFormat, Plane, RgbImage, RgbaImage,
 };
 use crate::options::{AnimOp, DecodeOptions, EncodeOptions};
 
@@ -123,6 +123,75 @@ fn chunk_walk<'a>(bytes: &'a [u8], label: &str) -> Result<Vec<([u8; 4], &'a [u8]
         cursor = start + size + (size & 1);
     }
     Ok(out)
+}
+
+/// The carried chunks ([`crate::CARRIED_CHUNKS`]) of a raster `FORM`,
+/// in file order. Empty when the FORM cannot be walked (the pixel
+/// parsers report that).
+pub(crate) fn carried_chunks(bytes: &[u8]) -> Vec<IffChunk> {
+    chunk_walk(bytes, "IFF")
+        .map(|children| {
+            children
+                .into_iter()
+                .filter(|(id, _)| IffChunk::is_carried(id))
+                .map(|(id, payload)| IffChunk::new(id, payload))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Insert `chunks` into a finished raster `FORM` ahead of its body
+/// chunk (`BODY` / `ABIT` / `DBOD`; at the end when there is none),
+/// patching the FORM size. A `FORM ANIM` takes them in its first nested
+/// `FORM ILBM`, patching both sizes.
+pub(crate) fn splice_chunks(form: &mut Vec<u8>, chunks: &[IffChunk]) {
+    if chunks.is_empty() || form.len() < 12 {
+        return;
+    }
+    let mut extra = Vec::new();
+    for c in chunks {
+        extra.extend_from_slice(&c.id);
+        extra.extend_from_slice(&(c.data.len() as u32).to_be_bytes());
+        extra.extend_from_slice(&c.data);
+        if c.data.len() & 1 == 1 {
+            extra.push(0);
+        }
+    }
+    let total = u32::from_be_bytes([form[4], form[5], form[6], form[7]]) as usize;
+    let end = total.saturating_add(8).min(form.len());
+    let mut cursor = 12usize;
+    let mut at = end;
+    while cursor + 8 <= end {
+        let id = &form[cursor..cursor + 4];
+        let size = u32::from_be_bytes([
+            form[cursor + 4],
+            form[cursor + 5],
+            form[cursor + 6],
+            form[cursor + 7],
+        ]) as usize;
+        if &form[8..12] == b"ANIM" && id == b"FORM" {
+            // The seed frame: splice into the nested FORM and grow the
+            // outer size by the same amount.
+            let inner_end = (cursor + 8 + size).min(end);
+            let mut inner = form[cursor..inner_end].to_vec();
+            let before = inner.len();
+            splice_chunks(&mut inner, chunks);
+            let grown = inner.len() - before;
+            form.splice(cursor..inner_end, inner);
+            let new_total = (total + grown) as u32;
+            form[4..8].copy_from_slice(&new_total.to_be_bytes());
+            return;
+        }
+        if matches!(id, b"BODY" | b"ABIT" | b"DBOD") {
+            at = cursor;
+            break;
+        }
+        cursor = cursor + 8 + size + (size & 1);
+    }
+    let grown = extra.len();
+    form.splice(at..at, extra);
+    let new_total = (total + grown) as u32;
+    form[4..8].copy_from_slice(&new_total.to_be_bytes());
 }
 
 fn raster_header(bytes: &[u8], form: IffForm) -> Result<RasterHeader> {
@@ -438,6 +507,14 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo> {
 }
 
 fn raster_info(bytes: &[u8], form: IffForm, frames: u32) -> Result<ImageInfo> {
+    let mut i = raster_info_inner(bytes, form, frames)?;
+    let chunks = carried_chunks(bytes);
+    i.has_text = chunks.iter().any(IffChunk::is_text);
+    i.chunks = chunks.into_iter().map(|c| c.id).collect();
+    Ok(i)
+}
+
+fn raster_info_inner(bytes: &[u8], form: IffForm, frames: u32) -> Result<ImageInfo> {
     match form {
         IffForm::Ilbm | IffForm::Pbm | IffForm::Acbm => {
             let h = raster_header(bytes, form)?;
@@ -548,6 +625,12 @@ fn check_limits(width: u32, height: u32, opts: &DecodeOptions) -> Result<()> {
 }
 
 fn decode_raster(bytes: &[u8], form: IffForm, opts: &DecodeOptions) -> Result<IffImage> {
+    let mut img = decode_raster_inner(bytes, form, opts)?;
+    img.chunks = carried_chunks(bytes);
+    Ok(img)
+}
+
+fn decode_raster_inner(bytes: &[u8], form: IffForm, opts: &DecodeOptions) -> Result<IffImage> {
     match form {
         IffForm::Ilbm | IffForm::Pbm | IffForm::Acbm => {
             let h = raster_header(bytes, form)?;
@@ -724,16 +807,16 @@ pub fn decode_all_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<Frame>>
                 .and_then(Dchg::delay_millis)
                 .map(|ms| Duration::from_millis(u64::from(ms)));
             let dpel = movie.dpel;
+            let chunks = carried_chunks(bytes);
             Ok(movie
                 .frames
                 .into_iter()
                 .enumerate()
                 .map(|(i, f)| {
-                    Frame::new(
-                        deep_frame_to_image(u32::from(f.width), u32::from(f.height), f.rgba, &dpel),
-                        delay,
-                        i as u32,
-                    )
+                    let mut image =
+                        deep_frame_to_image(u32::from(f.width), u32::from(f.height), f.rgba, &dpel);
+                    image.chunks.clone_from(&chunks);
+                    Frame::new(image, delay, i as u32)
                 })
                 .collect())
         }
@@ -758,7 +841,10 @@ pub fn decode_all_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<Frame>>
             let mut out = Vec::with_capacity(anim.frames.len());
             for (i, (img, idx)) in anim.frames.into_iter().zip(indices).enumerate() {
                 let view = idx.map(|v| (v, effective.clone()));
-                let image = ilbm_to_image(img, view, IffForm::Ilbm, &layout);
+                let mut image = ilbm_to_image(img, view, IffForm::Ilbm, &layout);
+                if let Some(child) = children.get(i) {
+                    image.chunks = carried_chunks(child);
+                }
                 let delay = playback
                     .frames
                     .get(i)
@@ -807,7 +893,18 @@ pub fn decode_all_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<Frame>>
 ///
 /// An `Rgba` input whose alpha the target cannot carry is
 /// `Error::Unsupported` unless [`EncodeOptions::drop_alpha`] is set.
+///
+/// [`IffImage::chunks`] (the carried `ANNO` / `AUTH` / `(c) ` / `NAME`
+/// / `TEXT` / `DPI ` / `GRAB` / `DEST` chunks) are written back
+/// verbatim ahead of the body chunk, in their order; `viewmode` becomes
+/// `CAMG` and `aspect` the `BMHD` aspect pair.
 pub fn encode(image: &IffImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    let mut bytes = encode_inner(image, opts)?;
+    splice_chunks(&mut bytes, &image.chunks);
+    Ok(bytes)
+}
+
+fn encode_inner(image: &IffImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     image.validate()?;
     let form = opts.form.unwrap_or(image.form);
     let (w, h) = dims16(image)?;
@@ -1351,6 +1448,14 @@ pub fn encode_to<W: Write>(image: &IffImage, opts: &EncodeOptions, mut w: W) -> 
 ///
 /// Other forms hold one picture and are `Error::Unsupported`.
 pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
+    let mut bytes = encode_all_inner(frames, opts)?;
+    if let Some(first) = frames.first() {
+        splice_chunks(&mut bytes, &first.image.chunks);
+    }
+    Ok(bytes)
+}
+
+fn encode_all_inner(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>> {
     let first = frames
         .first()
         .ok_or_else(|| IffError::invalid("IFF encode_all: no frames"))?;

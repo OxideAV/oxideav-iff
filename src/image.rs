@@ -315,6 +315,113 @@ impl Metadata {
     }
 }
 
+/// A format-native property chunk carried verbatim through the
+/// contract (`IffImage::chunks`) and the registry (as a metadata blob
+/// of kind `iff-<id>`): the EA IFF 85 generic text chunks `ANNO`
+/// (annotation), `AUTH` (author), `(c) ` (copyright), `NAME`, `TEXT`,
+/// and the ILBM properties the encoder writes back unchanged — `DPI `
+/// (dots per inch, two `UWORD`s), `GRAB` (hotspot `Point2D`), `DEST`
+/// (`DestMerge`). `data` is the chunk body exactly as on disk (no
+/// header, no pad byte).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IffChunk {
+    /// The four-character chunk id.
+    pub id: [u8; 4],
+    /// The chunk body as stored.
+    pub data: Vec<u8>,
+}
+
+/// The chunk ids [`crate::decode`] carries on [`IffImage::chunks`] and
+/// [`crate::encode`] writes back, in the order they are listed here.
+pub const CARRIED_CHUNKS: [[u8; 4]; 8] = [
+    *b"ANNO", *b"AUTH", *b"(c) ", *b"NAME", *b"TEXT", *b"DPI ", *b"GRAB", *b"DEST",
+];
+
+impl IffChunk {
+    /// A chunk from its id and body.
+    pub fn new(id: [u8; 4], data: impl Into<Vec<u8>>) -> Self {
+        Self {
+            id,
+            data: data.into(),
+        }
+    }
+
+    /// A text chunk (`ANNO` / `AUTH` / `(c) ` / `NAME` / `TEXT`) from a
+    /// string; characters outside ISO-8859-1 become `?`.
+    pub fn text_chunk(id: [u8; 4], text: &str) -> Self {
+        let data = text
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
+            .collect();
+        Self { id, data }
+    }
+
+    /// `true` for an id in [`CARRIED_CHUNKS`].
+    pub fn is_carried(id: &[u8; 4]) -> bool {
+        CARRIED_CHUNKS.contains(id)
+    }
+
+    /// `true` for one of the EA IFF 85 generic text chunks.
+    pub fn is_text(&self) -> bool {
+        matches!(&self.id, b"ANNO" | b"AUTH" | b"(c) " | b"NAME" | b"TEXT")
+    }
+
+    /// The id as printable text (`?` for non-ASCII bytes).
+    pub fn id_str(&self) -> String {
+        self.id
+            .iter()
+            .map(|&b| {
+                if b.is_ascii_graphic() || b == b' ' {
+                    b as char
+                } else {
+                    '?'
+                }
+            })
+            .collect()
+    }
+
+    /// The body read as ISO-8859-1 text with trailing NULs removed —
+    /// what the text chunks hold (EA IFF 85: ASCII, `LF` line breaks,
+    /// a property string may end in a NUL).
+    pub fn text(&self) -> String {
+        let end = self.data.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        self.data[..end].iter().map(|&b| b as char).collect()
+    }
+
+    /// The metadata-blob kind name this chunk travels under on a
+    /// registry frame / stream: `iff-` plus the id in lower case
+    /// without its padding (`ANNO` → `iff-anno`, `DPI ` → `iff-dpi`);
+    /// `(c) ` is `iff-copyright`.
+    pub fn blob_kind_name(&self) -> String {
+        Self::blob_kind_name_of(&self.id)
+    }
+
+    /// [`blob_kind_name`](Self::blob_kind_name) for an id.
+    pub fn blob_kind_name_of(id: &[u8; 4]) -> String {
+        if id == b"(c) " {
+            return "iff-copyright".to_string();
+        }
+        let mut name = String::from("iff-");
+        name.extend(
+            id.iter()
+                .filter(|&&b| b != b' ')
+                .map(|&b| b.to_ascii_lowercase() as char),
+        );
+        name
+    }
+
+    /// The carried chunk id a blob kind name maps back to, `None` for
+    /// any other name (an `iff-` kind that is not a carried chunk, or a
+    /// well-known kind such as `icc` — IFF has no chunk for those).
+    pub fn id_for_blob_kind_name(name: &str) -> Option<[u8; 4]> {
+        CARRIED_CHUNKS
+            .iter()
+            .copied()
+            .find(|id| Self::blob_kind_name_of(id) == name)
+    }
+}
+
 /// An RGBA palette: the `CMAP` triples (EHB-expanded to 64 entries when
 /// the viewmode says so) with alpha 255, except a `HasTransparentColor`
 /// key whose entry carries alpha 0.
@@ -436,7 +543,9 @@ pub struct IffImage {
     pub planes: Vec<Plane>,
     /// Colour signalling ([`ColorInfo::iff_default`] on decode).
     pub color: ColorInfo,
-    /// Embedded metadata (always empty on decode; IFF defines none).
+    /// Embedded metadata (always empty on decode: IFF defines no ICC /
+    /// Exif / XMP chunk; the format-native text and property chunks are
+    /// on [`chunks`](Self::chunks)).
     pub metadata: Metadata,
     /// The palette of a `Pal8` picture; `None` for RGB layouts.
     pub palette: Option<Palette>,
@@ -454,6 +563,10 @@ pub struct IffImage {
     /// `BMHD` pixel aspect `(x, y)` when the file carried a non-zero
     /// pair.
     pub aspect: Option<(u8, u8)>,
+    /// Format-native chunks carried verbatim ([`CARRIED_CHUNKS`]: the
+    /// EA IFF 85 text chunks and `DPI ` / `GRAB` / `DEST`), in file
+    /// order; [`crate::encode`] writes them back ahead of the body.
+    pub chunks: Vec<IffChunk>,
 }
 
 impl IffImage {
@@ -504,6 +617,7 @@ impl IffImage {
             n_planes: 0,
             viewmode: None,
             aspect: None,
+            chunks: Vec::new(),
         }
     }
 
@@ -565,6 +679,30 @@ impl IffImage {
     pub fn with_aspect(mut self, aspect: impl Into<Option<(u8, u8)>>) -> Self {
         self.aspect = aspect.into();
         self
+    }
+
+    /// Builder: replace the carried chunks.
+    pub fn with_chunks(mut self, chunks: Vec<IffChunk>) -> Self {
+        self.chunks = chunks;
+        self
+    }
+
+    /// Builder: append one carried chunk (an `ANNO` annotation, a
+    /// `DPI ` pair, …).
+    pub fn with_chunk(mut self, chunk: IffChunk) -> Self {
+        self.chunks.push(chunk);
+        self
+    }
+
+    /// The first carried chunk with `id`.
+    pub fn chunk(&self, id: &[u8; 4]) -> Option<&IffChunk> {
+        self.chunks.iter().find(|c| &c.id == id)
+    }
+
+    /// The text of the first carried chunk with `id` (`ANNO`, `AUTH`,
+    /// `(c) `, `NAME`, `TEXT`), see [`IffChunk::text`].
+    pub fn chunk_text(&self, id: &[u8; 4]) -> Option<String> {
+        self.chunk(id).map(IffChunk::text)
     }
 
     /// Width in pixels.
@@ -901,6 +1039,13 @@ pub struct ImageInfo {
     pub ham: bool,
     /// `true` when the picture uses Extra-Half-Brite.
     pub ehb: bool,
+    /// The ids of the carried chunks ([`CARRIED_CHUNKS`]) present, in
+    /// file order — `has_text` is `true` when any of them is one of the
+    /// EA IFF 85 text chunks.
+    pub chunks: Vec<[u8; 4]>,
+    /// `true` when an `ANNO` / `AUTH` / `(c) ` / `NAME` / `TEXT` chunk
+    /// is present.
+    pub has_text: bool,
 }
 
 impl ImageInfo {
@@ -931,6 +1076,8 @@ impl ImageInfo {
             palette_len: 0,
             ham: false,
             ehb: false,
+            chunks: Vec::new(),
+            has_text: false,
         }
     }
 }
