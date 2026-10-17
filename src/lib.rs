@@ -87,7 +87,7 @@ pub use options::{AnimOp, DecodeOptions, EncodeOptions};
 pub use registry::__oxideav_entry;
 #[cfg(feature = "registry")]
 pub use registry::{
-    apply_blobs, image_blobs, make_decoder, make_encoder, merged_blobs, register, register_codecs,
-    register_containers, register_registries, IlbmEncoderOptions, BLOB_KIND_ASPECT, BLOB_KIND_CAMG,
-    CODEC_ID_STR, ENCODER_PIXEL_FORMATS,
+    apply_blobs, blob_chunks, chunk_blobs, image_blobs, make_decoder, make_encoder, merged_blobs,
+    register, register_codecs, register_containers, register_registries, IlbmEncoderOptions,
+    BLOB_KIND_ASPECT, BLOB_KIND_CAMG, CODEC_ID_STR, ENCODER_PIXEL_FORMATS,
 };

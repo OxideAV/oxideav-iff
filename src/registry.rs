@@ -147,11 +147,7 @@ pub const BLOB_KIND_ASPECT: &str = "iff-aspect";
 /// `aspect` when set. The `ilbm` decoder attaches them to every frame
 /// and the demuxers declare them on the stream.
 pub fn image_blobs(image: &IffImage) -> Vec<MetadataBlob> {
-    let mut out: Vec<MetadataBlob> = image
-        .chunks
-        .iter()
-        .map(|c| MetadataBlob::new(BlobKind::custom(c.blob_kind_name()), c.data.clone()))
-        .collect();
+    let mut out = chunk_blobs(&image.chunks);
     if let Some(v) = image.viewmode {
         out.push(MetadataBlob::new(
             BlobKind::custom(BLOB_KIND_CAMG),
@@ -167,6 +163,30 @@ pub fn image_blobs(image: &IffImage) -> Vec<MetadataBlob> {
     out
 }
 
+/// One blob per carried chunk (kind [`IffChunk::blob_kind_name`],
+/// payload the chunk body) — the chunk half of [`image_blobs`], what
+/// the true-colour demuxers (`iff_deep` / `iff_tvpp` / `iff_rgb8` /
+/// `iff_rgbn`) declare on their `rawvideo` stream.
+pub fn chunk_blobs(chunks: &[IffChunk]) -> Vec<MetadataBlob> {
+    chunks
+        .iter()
+        .map(|c| MetadataBlob::new(BlobKind::custom(c.blob_kind_name()), c.data.clone()))
+        .collect()
+}
+
+/// The carried chunks among `blobs` (kinds `iff-anno` … `iff-dest`), in
+/// blob order — the chunk half of [`apply_blobs`], what the true-colour
+/// muxers write back ahead of the body.
+pub fn blob_chunks(blobs: &[MetadataBlob]) -> Vec<IffChunk> {
+    blobs
+        .iter()
+        .filter_map(|b| {
+            IffChunk::id_for_blob_kind_name(b.kind.as_str())
+                .map(|id| IffChunk::new(id, b.data.clone()))
+        })
+        .collect()
+}
+
 /// The inverse of [`image_blobs`]: apply `blobs` to `image` — carried
 /// chunks replace [`IffImage::chunks`] (in blob order), [`BLOB_KIND_CAMG`]
 /// sets `viewmode` (a 4-byte payload), [`BLOB_KIND_ASPECT`] sets
@@ -174,7 +194,6 @@ pub fn image_blobs(image: &IffImage) -> Vec<MetadataBlob> {
 /// chunk for an ICC profile, Exif or XMP. A malformed payload is
 /// ignored too.
 pub fn apply_blobs(image: &mut IffImage, blobs: &[MetadataBlob]) {
-    let mut chunks = Vec::new();
     for b in blobs {
         let name = b.kind.as_str();
         if name == BLOB_KIND_CAMG {
@@ -185,10 +204,9 @@ pub fn apply_blobs(image: &mut IffImage, blobs: &[MetadataBlob]) {
             if let [x, y] = b.data.as_slice() {
                 image.aspect = Some((*x, *y));
             }
-        } else if let Some(id) = IffChunk::id_for_blob_kind_name(name) {
-            chunks.push(IffChunk::new(id, b.data.clone()));
         }
     }
+    let chunks = blob_chunks(blobs);
     if !chunks.is_empty() {
         image.chunks = chunks;
     }

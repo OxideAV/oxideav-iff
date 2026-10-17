@@ -231,11 +231,15 @@ What IFF does carry is its own chunks. `decode` keeps the
 `has_text`), and every encoder writes them back ahead of the body
 chunk with the FORM size patched (strict decode holds). On the
 registry path they are core 0.1.40 **metadata blobs** of custom kinds
-(`image_blobs` / `apply_blobs` / `merged_blobs`): the demuxers declare
-them on `CodecParameters::blobs`, the `ilbm` decoder attaches the same
-set to every frame, the encoder and the `rawvideo` muxer write the
-stream's blobs with the frame's laid over them (a frame blob of a kind
-replaces the stream's blobs of that kind):
+(`image_blobs` / `apply_blobs` / `merged_blobs`, `chunk_blobs` /
+`blob_chunks` for the chunk half): every raster demuxer (`iff_ilbm`,
+`iff_acbm`, `iff_anim`, `iff_deep`, `iff_tvpp`, `iff_rgb8`, `iff_rgbn`)
+declares them on `CodecParameters::blobs`, the `ilbm` decoder attaches
+the same set to every frame, and the `ilbm` encoder and the `rawvideo`
+muxers (`iff_ilbm`, `iff_deep`, `iff_rgb8`, `iff_rgbn`) write the
+stream's blobs — with the frame's laid over them where a frame exists
+(a frame blob of a kind replaces the stream's blobs of that kind) —
+back ahead of the body:
 
 | Chunk | Meaning (spec) | `IffImage` | Blob kind | Payload |
 |---|---|---|---|---|

@@ -754,6 +754,12 @@ fn read_true_color_form(
     Ok(full)
 }
 
+/// The carried chunks of a whole raster `FORM` as stream blobs
+/// ([`crate::chunk_blobs`]) — what the true-colour demuxers declare.
+fn form_chunk_blobs(full: &[u8]) -> Vec<oxideav_core::MetadataBlob> {
+    crate::chunk_blobs(&crate::api::carried_chunks(full))
+}
+
 /// `rawvideo` stream in the picture's native layout: `Rgba` when the
 /// decoded pixels carry alpha, else `Rgb24`.
 fn true_color_stream(width: u16, height: u16, has_alpha: bool) -> StreamInfo {
@@ -781,9 +787,11 @@ fn open_rgb8(
 ) -> Result<Box<dyn Demuxer>> {
     let full = read_true_color_form(&mut *input, "RGB8", b"RGB8")?;
     let image = parse_rgb8(&full, GenlockPolicy::default())?;
+    let mut stream = true_color_stream(image.width, image.height, false);
+    stream.params.blobs = form_chunk_blobs(&full);
     Ok(Box::new(RgbTrueColorDemuxer {
         format_name: "iff_rgb8",
-        streams: vec![true_color_stream(image.width, image.height, false)],
+        streams: vec![stream],
         rgba: Some(strip_alpha(image.rgba)),
     }))
 }
@@ -794,9 +802,11 @@ fn open_rgbn(
 ) -> Result<Box<dyn Demuxer>> {
     let full = read_true_color_form(&mut *input, "RGBN", b"RGBN")?;
     let image = parse_rgbn(&full, GenlockPolicy::default())?;
+    let mut stream = true_color_stream(image.width, image.height, false);
+    stream.params.blobs = form_chunk_blobs(&full);
     Ok(Box::new(RgbTrueColorDemuxer {
         format_name: "iff_rgbn",
-        streams: vec![true_color_stream(image.width, image.height, false)],
+        streams: vec![stream],
         rgba: Some(strip_alpha(image.rgba)),
     }))
 }
@@ -845,6 +855,9 @@ pub struct DeepMuxer {
     width: u16,
     height: u16,
     input: MuxInput,
+    /// Carried chunks from the stream's blobs, written ahead of the
+    /// first `DBOD`.
+    chunks: Vec<crate::IffChunk>,
     time_base: TimeBase,
     compression: DeepMuxerCompression,
     frames: Vec<Vec<u8>>,
@@ -860,6 +873,7 @@ impl DeepMuxer {
             width,
             height,
             input,
+            chunks: crate::blob_chunks(&streams[0].params.blobs),
             time_base,
             compression: DeepMuxerCompression::default(),
             frames: Vec::new(),
@@ -988,7 +1002,7 @@ impl Muxer for DeepMuxer {
                 &frame_refs,
             )
         };
-        let form = match self.compression {
+        let mut form = match self.compression {
             DeepMuxerCompression::None => encode(DeepCompression::None)?,
             DeepMuxerCompression::RunLength => encode(DeepCompression::RunLength)?,
             DeepMuxerCompression::Auto => {
@@ -1001,6 +1015,7 @@ impl Muxer for DeepMuxer {
                 }
             }
         };
+        crate::api::splice_chunks(&mut form, &self.chunks);
         self.output.write_all(&form)?;
         self.output.flush()?;
         self.written = true;
@@ -1022,6 +1037,8 @@ pub struct RgbTrueColorMuxer {
     width: u16,
     height: u16,
     input: MuxInput,
+    /// Carried chunks from the stream's blobs, written ahead of `BODY`.
+    chunks: Vec<crate::IffChunk>,
     pending: Vec<u8>,
     written: bool,
 }
@@ -1042,6 +1059,7 @@ impl RgbTrueColorMuxer {
             width,
             height,
             input,
+            chunks: crate::blob_chunks(&streams[0].params.blobs),
             pending: Vec::new(),
             written: false,
         })
@@ -1076,11 +1094,12 @@ impl Muxer for RgbTrueColorMuxer {
         if self.pending.is_empty() {
             return Err(Error::invalid("RGB8/RGBN muxer: no frame written"));
         }
-        let form = if self.is_rgb8 {
+        let mut form = if self.is_rgb8 {
             encode_rgb8(self.width, self.height, &self.pending)?
         } else {
             encode_rgbn(self.width, self.height, &self.pending)?
         };
+        crate::api::splice_chunks(&mut form, &self.chunks);
         self.output.write_all(&form)?;
         self.output.flush()?;
         self.written = true;
@@ -1199,6 +1218,7 @@ fn open_tvpp(
     let mut stream = true_color_stream(width, height, has_alpha);
     stream.time_base = time_base;
     stream.duration = Some(frame_duration.saturating_mul(frame_count));
+    stream.params.blobs = form_chunk_blobs(&full);
 
     let frames: std::collections::VecDeque<Vec<u8>> = img
         .layers
@@ -1308,6 +1328,7 @@ fn open_deep(
         let mut stream = deep_jpeg_stream(width, height);
         stream.time_base = time_base;
         stream.duration = Some(frame_duration.saturating_mul(frame_count));
+        stream.params.blobs = form_chunk_blobs(&full);
 
         let frames: std::collections::VecDeque<Vec<u8>> =
             movie.frames.into_iter().map(|f| f.jfif).collect();
@@ -1336,6 +1357,7 @@ fn open_deep(
     let mut stream = true_color_stream(width, height, has_alpha);
     stream.time_base = time_base;
     stream.duration = Some(frame_duration.saturating_mul(frame_count));
+    stream.params.blobs = form_chunk_blobs(&full);
 
     let frames: std::collections::VecDeque<Vec<u8>> = movie
         .frames

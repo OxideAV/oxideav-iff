@@ -53,6 +53,10 @@ name = "anim_timing_registry"
 required-features = ["registry"]
 
 [[test]]
+name = "truecolor_blobs"
+required-features = ["registry"]
+
+[[test]]
 name = "anim_muxer"
 required-features = ["registry"]
 

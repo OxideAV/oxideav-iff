@@ -29,10 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Metadata blobs on the registry path (core 0.1.40): `image_blobs` /
   `apply_blobs` / `merged_blobs`, kinds `iff-anno` … `iff-dest` plus
   `iff-camg` (`BLOB_KIND_CAMG`, the viewmode) and `iff-aspect`
-  (`BLOB_KIND_ASPECT`); the `iff_ilbm` / `iff_acbm` / `iff_anim`
-  demuxers declare them on `CodecParameters::blobs`, the `ilbm`
-  decoder attaches them to every frame, the encoder and the
-  `rawvideo` path of the `iff_ilbm` muxer write them back (frame blobs
+  (`BLOB_KIND_ASPECT`), `chunk_blobs` / `blob_chunks`; every raster
+  demuxer (`iff_ilbm` / `iff_acbm` / `iff_anim` / `iff_deep` /
+  `iff_tvpp` / `iff_rgb8` / `iff_rgbn`) declares them on
+  `CodecParameters::blobs`, the `ilbm` decoder attaches them to every
+  frame, the encoder and the `rawvideo` muxers (`iff_ilbm` /
+  `iff_deep` / `iff_rgb8` / `iff_rgbn`) write them back (frame blobs
   over stream blobs); well-known kinds (ICC / Exif / XMP) have no IFF
   chunk and are not written.
 - The `ilbm` decoder reports `Decoder::output_pixel_format` — the
