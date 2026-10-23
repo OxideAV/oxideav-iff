@@ -82,6 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - The registry encoder no longer discards the alpha of a non-opaque
   `Rgba` / `Bgra` frame by default (it was written as 24-bit with
   `drop_alpha`); set the `drop_alpha` option for the old behaviour.

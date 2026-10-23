@@ -309,7 +309,7 @@ fn encode_op5_body_pointer_table_correct() {
         assert_eq!(off, 0, "plane {slot} pointer should be 0");
     }
     // Decode the BODY and confirm the delta lands.
-    use oxideav_iff::anim::{apply_op5_for_test, Anhd};
+    use oxideav_iff::anim::{Anhd, apply_op5_for_test};
     let mut state = prev.clone();
     let anhd = Anhd {
         operation: 5,

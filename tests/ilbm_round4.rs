@@ -30,8 +30,8 @@ use oxideav_core::{
 };
 use oxideav_core::{Muxer, WriteSeek};
 use oxideav_iff::ilbm::{
-    encode_ilbm, parse_ilbm, Bmhd, Camg, Compression, IlbmImage, IlbmMuxer, Masking, MuxerMode,
-    CAMG_EHB, CAMG_HAM,
+    Bmhd, CAMG_EHB, CAMG_HAM, Camg, Compression, IlbmImage, IlbmMuxer, Masking, MuxerMode,
+    encode_ilbm, parse_ilbm,
 };
 
 static CTR: AtomicU64 = AtomicU64::new(0);
@@ -120,7 +120,12 @@ fn muxer_ham6_roundtrip() {
     // need a different (R, G) and only B got modified. The encoder
     // picks the cheapest single-channel op, so allow ≤32 LSB on the
     // worst channel.
-    for (orig, got) in rgba.chunks_exact(4).zip(img.rgba.chunks_exact(4)) {
+    for (orig, got) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(img.rgba.as_chunks::<4>().0)
+    {
         for c in 0..3 {
             let err = (orig[c] as i32 - got[c] as i32).abs();
             assert!(
@@ -150,7 +155,12 @@ fn muxer_ham8_roundtrip() {
     assert!(img.camg.is_ham());
     assert_eq!(img.bmhd.n_planes, 8);
     assert!(bytes.windows(4).any(|w| w == b"CAMG"));
-    for (orig, got) in rgba.chunks_exact(4).zip(img.rgba.chunks_exact(4)) {
+    for (orig, got) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(img.rgba.as_chunks::<4>().0)
+    {
         for c in 0..3 {
             let err = (orig[c] as i32 - got[c] as i32).abs();
             assert!(
@@ -199,8 +209,10 @@ fn muxer_ehb_roundtrip() {
     assert_eq!(img.bmhd.n_planes, 6);
     assert!(bytes.windows(4).any(|w| w == b"CAMG"));
     for (i, (orig, got)) in rgba
-        .chunks_exact(4)
-        .zip(img.rgba.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(img.rgba.as_chunks::<4>().0)
         .enumerate()
     {
         for c in 0..3 {
@@ -307,8 +319,10 @@ fn encoder_hasmask_plane_alpha_pattern() {
     let dec = parse_ilbm(&bytes).unwrap();
     assert_eq!(dec.bmhd.masking, Masking::HasMask);
     for (i, (orig, got)) in rgba
-        .chunks_exact(4)
-        .zip(dec.rgba.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dec.rgba.as_chunks::<4>().0)
         .enumerate()
     {
         assert_eq!(orig[3], got[3], "alpha pixel {i} must round-trip");
@@ -532,7 +546,13 @@ fn magick_cross_decode_indexed_byterun1() {
     assert_eq!(mh, h, "magick height must match ours");
     // Pixel-by-pixel compare against the source (drop alpha; magick's
     // PPM has no alpha channel).
-    for (i, (orig, got)) in rgba.chunks_exact(4).zip(mrgb.chunks_exact(3)).enumerate() {
+    for (i, (orig, got)) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(mrgb.as_chunks::<3>().0)
+        .enumerate()
+    {
         for c in 0..3 {
             assert_eq!(
                 orig[c], got[c],
@@ -618,7 +638,13 @@ fn magick_cross_decode_pbm_byterun1() {
     assert_eq!(mw, w);
     assert_eq!(mh, h);
     // PBM is lossless; cross-decoded pixels must match exactly.
-    for (i, (orig, got)) in rgba.chunks_exact(4).zip(mrgb.chunks_exact(3)).enumerate() {
+    for (i, (orig, got)) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(mrgb.as_chunks::<3>().0)
+        .enumerate()
+    {
         for c in 0..3 {
             assert_eq!(orig[c], got[c], "PBM magick px {i} ch {c}");
         }
@@ -647,8 +673,10 @@ fn muxer_ham6_colour_gradient() {
     let (_bytes, img) = mux_through_temp(w, h, rgba.clone(), MuxerMode::Ham6, Compression::Auto);
     assert!(img.camg.is_ham());
     for (i, (orig, got)) in rgba
-        .chunks_exact(4)
-        .zip(img.rgba.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(img.rgba.as_chunks::<4>().0)
         .enumerate()
     {
         for c in 0..3 {

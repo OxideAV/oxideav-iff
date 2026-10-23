@@ -5,8 +5,8 @@
 //! with the FORM size patched (strict decode holds). Framework-free.
 
 use oxideav_iff::{
-    decode, decode_all, decode_with, encode, encode_all, info, DecodeOptions, EncodeOptions, Frame,
-    IffChunk, IffForm, IffImage, Palette, PixelFormat, CARRIED_CHUNKS,
+    CARRIED_CHUNKS, DecodeOptions, EncodeOptions, Frame, IffChunk, IffForm, IffImage, Palette,
+    PixelFormat, decode, decode_all, decode_with, encode, encode_all, info,
 };
 
 fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
@@ -64,7 +64,9 @@ fn decode_carries_the_native_chunks_in_file_order() {
     let ids: Vec<[u8; 4]> = img.chunks.iter().map(|c| c.id).collect();
     assert_eq!(
         ids,
-        [*b"ANNO", *b"AUTH", *b"(c) ", *b"NAME", *b"TEXT", *b"DPI ", *b"GRAB", *b"DEST"]
+        [
+            *b"ANNO", *b"AUTH", *b"(c) ", *b"NAME", *b"TEXT", *b"DPI ", *b"GRAB", *b"DEST"
+        ]
     );
     assert!(ids.iter().all(IffChunk::is_carried));
     assert!(!IffChunk::is_carried(b"XYZW"));

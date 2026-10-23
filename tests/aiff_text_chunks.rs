@@ -8,7 +8,7 @@
 //! when building or interrogating a text chunk in isolation.
 
 use oxideav_iff::aiff::{
-    parse, parse_text_chunk, write_text_chunk, AiffError, TextChunk, TextKind,
+    AiffError, TextChunk, TextKind, parse, parse_text_chunk, write_text_chunk,
 };
 
 /// Tiny 80-bit IEEE-extended encoding helper for the 44100 Hz tests

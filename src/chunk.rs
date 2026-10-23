@@ -695,9 +695,11 @@ mod tests {
         // walking past it.
         assert!(probe_top_level_group(&[]).unwrap().is_none());
         assert!(probe_top_level_group(b"FORM").unwrap().is_none());
-        assert!(probe_top_level_group(b"FORM\x00\x00\x00\x10ILB")
-            .unwrap()
-            .is_none());
+        assert!(
+            probe_top_level_group(b"FORM\x00\x00\x00\x10ILB")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1124,9 +1126,11 @@ mod tests {
     fn parse_group_children_bounds_checks() {
         // Empty body: zero children is legal (the grammar's * admits
         // the empty sequence).
-        assert!(parse_group_children(GroupKind::List, &[])
-            .unwrap()
-            .is_empty());
+        assert!(
+            parse_group_children(GroupKind::List, &[])
+                .unwrap()
+                .is_empty()
+        );
         // Truncated child header.
         assert!(parse_group_children(GroupKind::Cat, b"FORM\x00\x00").is_err());
         // Child ckSize overruns the containing group.

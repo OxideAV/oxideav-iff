@@ -96,34 +96,34 @@ impl DecodeOptions {
     /// Check a header's geometry against the limits before anything is
     /// allocated. `bytes` is the decoded working-buffer size.
     pub(crate) fn check(&self, width: u32, height: u32, bytes: u64) -> Result<()> {
-        if let Some(m) = self.max_width {
-            if width > m {
-                return Err(IffError::limit(format!(
-                    "IFF: width {width} exceeds max_width {m}"
-                )));
-            }
+        if let Some(m) = self.max_width
+            && width > m
+        {
+            return Err(IffError::limit(format!(
+                "IFF: width {width} exceeds max_width {m}"
+            )));
         }
-        if let Some(m) = self.max_height {
-            if height > m {
-                return Err(IffError::limit(format!(
-                    "IFF: height {height} exceeds max_height {m}"
-                )));
-            }
+        if let Some(m) = self.max_height
+            && height > m
+        {
+            return Err(IffError::limit(format!(
+                "IFF: height {height} exceeds max_height {m}"
+            )));
         }
         let pixels = u64::from(width) * u64::from(height);
-        if let Some(m) = self.max_pixels {
-            if pixels > m {
-                return Err(IffError::limit(format!(
-                    "IFF: {pixels} pixels exceed max_pixels {m}"
-                )));
-            }
+        if let Some(m) = self.max_pixels
+            && pixels > m
+        {
+            return Err(IffError::limit(format!(
+                "IFF: {pixels} pixels exceed max_pixels {m}"
+            )));
         }
-        if let Some(m) = self.max_bytes {
-            if bytes > m {
-                return Err(IffError::limit(format!(
-                    "IFF: decoded buffer of {bytes} bytes exceeds max_bytes {m}"
-                )));
-            }
+        if let Some(m) = self.max_bytes
+            && bytes > m
+        {
+            return Err(IffError::limit(format!(
+                "IFF: decoded buffer of {bytes} bytes exceeds max_bytes {m}"
+            )));
         }
         Ok(())
     }

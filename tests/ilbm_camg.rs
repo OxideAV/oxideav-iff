@@ -7,12 +7,12 @@
 //! "bad CAMG" heuristic.
 
 use oxideav_iff::ilbm::{
-    encode_ilbm, parse_ilbm, Bmhd, Camg, Compression, IlbmImage, Masking, A2024_MONITOR_ID,
-    CAMG_DOUBLESCAN, CAMG_DUALPF, CAMG_EHB, CAMG_EXTENDED_MODE, CAMG_FORMAT_MASK,
-    CAMG_GENLOCK_AUDIO, CAMG_GENLOCK_VIDEO, CAMG_HAM, CAMG_HIRES, CAMG_JUNK_MASK, CAMG_LACE,
-    CAMG_PFBA, CAMG_SPRITES, CAMG_SUPERHIRES, CAMG_VP_HIDE, DBLPAL_MONITOR_ID,
-    EXTRAHALFBRITELACE_KEY, HAMLACE_KEY, HIRESLACE_KEY, MONITOR_ID_MASK, PAL_MONITOR_ID,
-    SUPER72HIRESDBL_KEY, SUPER_KEY, VGAHAM_KEY, VGAPRODUCT_KEY, VGA_MONITOR_ID,
+    A2024_MONITOR_ID, Bmhd, CAMG_DOUBLESCAN, CAMG_DUALPF, CAMG_EHB, CAMG_EXTENDED_MODE,
+    CAMG_FORMAT_MASK, CAMG_GENLOCK_AUDIO, CAMG_GENLOCK_VIDEO, CAMG_HAM, CAMG_HIRES, CAMG_JUNK_MASK,
+    CAMG_LACE, CAMG_PFBA, CAMG_SPRITES, CAMG_SUPERHIRES, CAMG_VP_HIDE, Camg, Compression,
+    DBLPAL_MONITOR_ID, EXTRAHALFBRITELACE_KEY, HAMLACE_KEY, HIRESLACE_KEY, IlbmImage,
+    MONITOR_ID_MASK, Masking, PAL_MONITOR_ID, SUPER_KEY, SUPER72HIRESDBL_KEY, VGA_MONITOR_ID,
+    VGAHAM_KEY, VGAPRODUCT_KEY, encode_ilbm, parse_ilbm,
 };
 
 fn camg(raw: u32) -> Camg {
@@ -250,7 +250,13 @@ fn ham_bit_in_mode_id_form_drives_ham_decode() {
     assert_eq!(decoded.camg.raw, PAL_MONITOR_ID | HAMLACE_KEY);
     assert!(decoded.camg.is_ham());
     // HAM6 reconstruction within the usual +/-16-per-gun tolerance.
-    for (ours, orig) in decoded.rgba.chunks_exact(4).zip(rgba.chunks_exact(4)) {
+    for (ours, orig) in decoded
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(rgba.as_chunks::<4>().0)
+    {
         for c in 0..3 {
             assert!(
                 (i16::from(ours[c]) - i16::from(orig[c])).abs() <= 16,

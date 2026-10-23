@@ -60,10 +60,10 @@ use crate::error::{IffError as Error, Result};
 mod framework;
 #[cfg(feature = "registry")]
 pub use framework::{
-    register, DeepMuxer, DeepMuxerCompression, IlbmMuxer, MuxerMode, RgbTrueColorMuxer,
+    DeepMuxer, DeepMuxerCompression, IlbmMuxer, MuxerMode, RgbTrueColorMuxer, register,
 };
 #[cfg(feature = "registry")]
-pub(crate) use framework::{true_color_muxer_stream_shape, MuxInput};
+pub(crate) use framework::{MuxInput, true_color_muxer_stream_shape};
 
 // ───────────────────── BMHD ─────────────────────
 
@@ -96,7 +96,7 @@ impl Masking {
             other => {
                 return Err(Error::invalid(format!(
                     "ILBM BMHD: invalid masking byte {other} (expected 0..=3)"
-                )))
+                )));
             }
         })
     }
@@ -138,7 +138,7 @@ impl Compression {
             other => {
                 return Err(Error::unsupported(format!(
                     "ILBM BMHD: compression {other} not supported (0=none, 1=ByteRun1)"
-                )))
+                )));
             }
         })
     }
@@ -1187,7 +1187,7 @@ impl Pchg {
             other => {
                 return Err(Error::unsupported(format!(
                     "ILBM PCHG: unknown Compression mode {other}"
-                )))
+                )));
             }
         };
 
@@ -1845,7 +1845,7 @@ fn pchg_huffman_expand(data: &[u8]) -> Result<Vec<u8>> {
     if original_size == 0 {
         return Ok(Vec::new());
     }
-    if comp_info_size < 2 || comp_info_size % 2 != 0 {
+    if comp_info_size < 2 || !comp_info_size.is_multiple_of(2) {
         return Err(Error::invalid(format!(
             "ILBM PCHG: CompInfoSize {comp_info_size} is not a positive even node count"
         )));
@@ -1860,7 +1860,9 @@ fn pchg_huffman_expand(data: &[u8]) -> Result<Vec<u8>> {
         )));
     }
     let nodes: Vec<i16> = data[8..tree_end]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_be_bytes([c[0], c[1]]))
         .collect();
     let n = nodes.len();
@@ -2837,7 +2839,7 @@ fn decode_truecolor24_into(bmhd: &Bmhd, body: &[u8], rgba: &mut [u8]) -> Result<
         Compression::Auto => {
             return Err(Error::unsupported(
                 "ILBM BMHD: compression byte 'Auto' is encoder-only, not a valid file value",
-            ))
+            ));
         }
     }
 
@@ -3189,7 +3191,9 @@ pub(crate) fn parse_ilbm_indexed(bytes: &[u8]) -> Result<(IlbmImage, IndexedView
             b"BMHD" => bmhd = Some(Bmhd::parse(payload)?),
             b"CMAP" => {
                 palette = payload
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|c| [c[0], c[1], c[2]])
                     .collect();
             }
@@ -3284,7 +3288,7 @@ pub(crate) fn parse_ilbm_indexed(bytes: &[u8]) -> Result<(IlbmImage, IndexedView
             Compression::Auto => {
                 return Err(Error::unsupported(
                     "ILBM BMHD: compression byte 'Auto' is encoder-only, not a valid file value",
-                ))
+                ));
             }
         }
         let effective_palette: Vec<[u8; 3]> = if camg.is_ehb() && palette.len() <= 32 {
@@ -3434,7 +3438,7 @@ pub(crate) fn parse_ilbm_indexed(bytes: &[u8]) -> Result<(IlbmImage, IndexedView
         Compression::Auto => {
             return Err(Error::unsupported(
                 "ILBM BMHD: compression byte 'Auto' is encoder-only, not a valid file value",
-            ))
+            ));
         }
     }
 
@@ -3689,7 +3693,7 @@ fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<(IlbmImage, Indexe
                 other => {
                     return Err(Error::unsupported(format!(
                         "ILBM HAM: unsupported plane count {other} (expected 6 or 8)"
-                    )))
+                    )));
                 }
             };
             expand_ham_row(&indices, row_palette, bits)
@@ -3873,7 +3877,9 @@ pub(crate) fn parse_acbm_indexed(bytes: &[u8]) -> Result<(IlbmImage, IndexedView
             b"BMHD" => bmhd = Some(Bmhd::parse(payload)?),
             b"CMAP" => {
                 palette = payload
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|c| [c[0], c[1], c[2]])
                     .collect();
             }
@@ -4572,7 +4578,7 @@ fn encode_ham_planar_rows(image: &IlbmImage) -> Result<Vec<Vec<u8>>> {
         other => {
             return Err(Error::invalid(format!(
                 "HAM encode: n_planes must be 6 (HAM6) or 8 (HAM8), got {other}"
-            )))
+            )));
         }
     };
     let value_mask: u8 = (1u8 << bits) - 1;
@@ -4757,7 +4763,7 @@ fn encode_truecolor24_body_resolving(image: &IlbmImage) -> Result<(Vec<u8>, Comp
 /// muxer paths where the palette size cap is prescribed (16/64/32/256).
 pub(crate) fn build_palette_capped(rgba: &[u8], cap: usize) -> Vec<[u8; 3]> {
     let mut palette: Vec<[u8; 3]> = Vec::new();
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         let triple = [px[0], px[1], px[2]];
         if !palette.contains(&triple) && palette.len() < cap {
             palette.push(triple);
@@ -4772,7 +4778,7 @@ pub(crate) fn build_palette_capped(rgba: &[u8], cap: usize) -> Vec<[u8; 3]> {
 pub(crate) fn build_palette(rgba: &[u8]) -> (Vec<[u8; 3]>, Vec<u8>) {
     let mut palette: Vec<[u8; 3]> = Vec::new();
     let mut indices = Vec::with_capacity(rgba.len() / 4);
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         let triple = [px[0], px[1], px[2]];
         let pos = palette.iter().position(|&p| p == triple);
         let idx = if let Some(p) = pos {
@@ -5250,7 +5256,7 @@ fn coalesce_rgba_runs(width: u16, height: u16, rgba: &[u8]) -> Result<Vec<([u8; 
         )));
     }
     let mut runs: Vec<([u8; 4], usize)> = Vec::new();
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         let quad = [px[0], px[1], px[2], px[3]];
         match runs.last_mut() {
             Some((prev, len)) if *prev == quad => *len += 1,
@@ -5369,7 +5375,7 @@ fn truecolor_bmhd(width: u16, height: u16, n_planes: u8) -> [u8; 20] {
     b[8] = n_planes;
     // masking (9) = 0 (none).
     b[10] = 4; // Turbo-Silver RLE — the §3 invariant.
-               // pad (11), transparent colour (12..14) = 0.
+    // pad (11), transparent colour (12..14) = 0.
     b[14] = 1; // x aspect
     b[15] = 1; // y aspect
     b[16..18].copy_from_slice(&width.to_be_bytes()); // page width
@@ -5462,7 +5468,7 @@ impl DeepCompression {
             other => {
                 return Err(Error::invalid(format!(
                     "DEEP DGBL: unknown Compression {other} (expected 0..=5)"
-                )))
+                )));
             }
         })
     }
@@ -5564,7 +5570,7 @@ impl DeepCType {
             other => {
                 return Err(Error::invalid(format!(
                     "DEEP DPEL: unknown cType {other} (expected 1..=13)"
-                )))
+                )));
             }
         })
     }
@@ -6107,7 +6113,7 @@ pub fn encode_deep_chunky(dpel: &Dpel, width: u16, height: u16, rgba: &[u8]) -> 
         )));
     }
     let mut out = Vec::with_capacity(total * dpel.elements.len());
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         for el in &dpel.elements {
             let byte = match el.c_type {
                 DeepCType::Red => px[0],
@@ -6267,7 +6273,7 @@ pub fn encode_deep(
             return Err(Error::invalid(format!(
                 "DEEP encode: Compression {} has no documented wire layout to emit",
                 other.to_u16()
-            )))
+            )));
         }
     };
     let dgbl = Dgbl {
@@ -6430,7 +6436,7 @@ pub fn assemble_deep_tvdc(
     }
     let mut rgba = vec![0u8; total * 4];
     // A pixel with no alpha-bearing component is fully opaque.
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         px[3] = 0xFF;
     }
 
@@ -7050,7 +7056,7 @@ pub fn encode_deep_frames(
                     "DEEP encode: Compression {} cannot be emitted in a multi-frame FORM \
                      (no round-trip wire layout)",
                     other.to_u16()
-                )))
+                )));
             }
         };
         push_chunk(&mut chunks, b"DBOD", &body);
@@ -7359,8 +7365,8 @@ mod tests {
         let body = rgbn_word(0x0, 0xF, 0x0, false, 7);
         let rgba = decode_rgbn_body(7, 1, &body, GenlockPolicy::default()).unwrap();
         assert_eq!(rgba.len(), 7 * 4);
-        for px in rgba.chunks_exact(4) {
-            assert_eq!(px, [0, 255, 0, 255]);
+        for px in rgba.as_chunks::<4>().0 {
+            assert_eq!(*px, [0, 255, 0, 255]);
         }
     }
 
@@ -7397,8 +7403,8 @@ mod tests {
         let body = rgbn_word(0x0, 0x0, 0xF, false, 4);
         let rgba = decode_rgbn_body(2, 2, &body, GenlockPolicy::default()).unwrap();
         assert_eq!(rgba.len(), 16);
-        for px in rgba.chunks_exact(4) {
-            assert_eq!(px, [0, 0, 255, 255]);
+        for px in rgba.as_chunks::<4>().0 {
+            assert_eq!(*px, [0, 0, 255, 255]);
         }
     }
 
@@ -7562,8 +7568,8 @@ mod tests {
         // A 7-bit count of 5 fills five consecutive pixels.
         let body = rgb8_long(0x00, 0x80, 0xFF, false, 5);
         let rgba = decode_rgb8_body(5, 1, &body, GenlockPolicy::default()).unwrap();
-        for px in rgba.chunks_exact(4) {
-            assert_eq!(px, &[0x00, 0x80, 0xFF, 0xFF]);
+        for px in rgba.as_chunks::<4>().0 {
+            assert_eq!(*px, [0x00, 0x80, 0xFF, 0xFF]);
         }
     }
 
@@ -7583,8 +7589,8 @@ mod tests {
         let body = rgb8_long(0xAB, 0xCD, 0xEF, false, 4);
         let rgba = decode_rgb8_body(2, 2, &body, GenlockPolicy::default()).unwrap();
         assert_eq!(rgba.len(), 4 * 4);
-        for px in rgba.chunks_exact(4) {
-            assert_eq!(px, &[0xAB, 0xCD, 0xEF, 0xFF]);
+        for px in rgba.as_chunks::<4>().0 {
+            assert_eq!(*px, [0xAB, 0xCD, 0xEF, 0xFF]);
         }
     }
 
@@ -7683,8 +7689,8 @@ mod tests {
         let img = parse_rgb8(&file, GenlockPolicy::default()).unwrap();
         assert!(img.is_rgb8);
         assert_eq!((img.width, img.height), (4, 1));
-        for px in img.rgba.chunks_exact(4) {
-            assert_eq!(px, &[0x11, 0x22, 0x33, 0xFF]);
+        for px in img.rgba.as_chunks::<4>().0 {
+            assert_eq!(*px, [0x11, 0x22, 0x33, 0xFF]);
         }
     }
 
@@ -7703,8 +7709,8 @@ mod tests {
         let img = parse_rgbn(&file, GenlockPolicy::default()).unwrap();
         assert!(!img.is_rgb8);
         assert_eq!((img.width, img.height), (3, 1));
-        for px in img.rgba.chunks_exact(4) {
-            assert_eq!(px, &[0xFF, 0x00, 0xAA, 0xFF]);
+        for px in img.rgba.as_chunks::<4>().0 {
+            assert_eq!(*px, [0xFF, 0x00, 0xAA, 0xFF]);
         }
     }
 
@@ -7731,8 +7737,7 @@ mod tests {
     /// and still reassemble exactly.
     #[test]
     fn encode_rgb8_splits_runs_over_127() {
-        let rgba: Vec<u8> = std::iter::repeat([0x01, 0x02, 0x03, 0xFF])
-            .take(300)
+        let rgba: Vec<u8> = std::iter::repeat_n([0x01, 0x02, 0x03, 0xFF], 300)
             .flatten()
             .collect();
         let file = encode_rgb8(300, 1, &rgba).unwrap();
@@ -7772,8 +7777,7 @@ mod tests {
     /// emits the 3-bit-0 + BYTE form and reassembles.
     #[test]
     fn encode_rgbn_byte_count_cascade_round_trips() {
-        let rgba: Vec<u8> = std::iter::repeat([0xFF, 0x00, 0x00, 0xFF])
-            .take(200)
+        let rgba: Vec<u8> = std::iter::repeat_n([0xFF, 0x00, 0x00, 0xFF], 200)
             .flatten()
             .collect();
         let file = encode_rgbn(200, 1, &rgba).unwrap();
@@ -7785,8 +7789,7 @@ mod tests {
     /// 3-bit-0 + BYTE-0 + WORD form.
     #[test]
     fn encode_rgbn_word_count_cascade_round_trips() {
-        let rgba: Vec<u8> = std::iter::repeat([0x00, 0xFF, 0x00, 0xFF])
-            .take(400)
+        let rgba: Vec<u8> = std::iter::repeat_n([0x00, 0xFF, 0x00, 0xFF], 400)
             .flatten()
             .collect();
         let file = encode_rgbn(400, 1, &rgba).unwrap();

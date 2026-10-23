@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use oxideav_core::{CodecId, ContainerRegistry, Error, Frame as CoreFrame, PixelFormat, ReadSeek};
 use oxideav_iff::{
-    decode_all, encode_all, make_decoder, EncodeOptions, Frame, IffImage, Palette, CODEC_ID_STR,
+    CODEC_ID_STR, EncodeOptions, Frame, IffImage, Palette, decode_all, encode_all, make_decoder,
 };
 
 fn frames() -> Vec<Frame> {
@@ -48,10 +48,11 @@ fn decode_all_and_the_anim_demuxer_agree_on_per_frame_timing() {
             Duration::from_millis(250)
         ]
     );
-    assert!(all
-        .iter()
-        .zip(&frames)
-        .all(|(a, b)| a.image.planes == b.image.planes));
+    assert!(
+        all.iter()
+            .zip(&frames)
+            .all(|(a, b)| a.image.planes == b.image.planes)
+    );
 
     // Registry: the demuxer's packets carry the same timeline in 1/60 s.
     let mut reg = ContainerRegistry::new();

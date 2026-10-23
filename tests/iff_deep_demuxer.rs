@@ -208,9 +208,10 @@ fn deep_demuxer_rejects_tvdc_body_from_form() {
     // in-FORM, so a from-FORM decode must error (same as `parse_deep`),
     // rather than mis-decode the body.
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(deep_file(5, vec![0u8; 8])));
-    assert!(reg
-        .open_demuxer("iff_deep", rs, &oxideav_core::NullCodecResolver)
-        .is_err());
+    assert!(
+        reg.open_demuxer("iff_deep", rs, &oxideav_core::NullCodecResolver)
+            .is_err()
+    );
 }
 
 #[test]
@@ -220,7 +221,8 @@ fn deep_demuxer_rejects_wrong_form_type() {
     // type mismatch.
     let rgb8 = iff_form(b"RGB8", &[(b"BMHD", vec![0u8; 20])]);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(rgb8));
-    assert!(reg
-        .open_demuxer("iff_deep", rs, &oxideav_core::NullCodecResolver)
-        .is_err());
+    assert!(
+        reg.open_demuxer("iff_deep", rs, &oxideav_core::NullCodecResolver)
+            .is_err()
+    );
 }

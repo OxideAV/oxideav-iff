@@ -12,8 +12,8 @@
 //! adjustment.
 
 use oxideav_iff::ilbm::{
-    encode_ilbm, parse_ilbm, Bmhd, Camg, Compression, IlbmImage, Masking, Pchg, PchgChange,
-    PchgKind, PchgLine, CAMG_LACE,
+    Bmhd, CAMG_LACE, Camg, Compression, IlbmImage, Masking, Pchg, PchgChange, PchgKind, PchgLine,
+    encode_ilbm, parse_ilbm,
 };
 
 fn bmhd(width: u16, height: u16) -> Bmhd {
@@ -101,8 +101,8 @@ fn unvalidatable_flagless_chunk() -> Vec<u8> {
     raw.extend_from_slice(&1u16.to_be_bytes()); // MaxChanges
     raw.extend_from_slice(&1u32.to_be_bytes()); // TotalChanges
     raw.extend_from_slice(&[0x80, 0, 0, 0]); // LineMask: line 0 set
-                                             // 3 trailing bytes: too short for a Small record's word list and
-                                             // for a Big record; registers would also overrun MaxReg = 0.
+    // 3 trailing bytes: too short for a Small record's word list and
+    // for a Big record; registers would also overrun MaxReg = 0.
     raw.extend_from_slice(&[0x01, 0x02, 0x03]);
     raw
 }

@@ -15,8 +15,8 @@ use oxideav_core::{
     CodecId, ContainerRegistry, Error, Frame, MediaType, PixelFormat, ReadSeek, WriteSeek,
 };
 use oxideav_iff::{
-    encode, make_decoder, EncodeOptions, IffForm, IffImage, IffPixelFormat, Palette, Plane,
-    CODEC_ID_STR,
+    CODEC_ID_STR, EncodeOptions, IffForm, IffImage, IffPixelFormat, Palette, Plane, encode,
+    make_decoder,
 };
 
 fn registry() -> ContainerRegistry {
@@ -244,7 +244,7 @@ fn registry_encoder_maps_the_alpha_record_back_to_a_masking_mode() {
 #[test]
 fn native_chunks_ride_the_registry_as_blobs_and_come_back() {
     use oxideav_core::{BlobKind, MetadataBlob};
-    use oxideav_iff::{IffChunk, BLOB_KIND_ASPECT, BLOB_KIND_CAMG};
+    use oxideav_iff::{BLOB_KIND_ASPECT, BLOB_KIND_CAMG, IffChunk};
     let pal = Palette::from_rgb_triples(&[[0, 0, 0], [255, 255, 255]]);
     let img = IffImage::new_indexed(2, 1, vec![0, 1], pal)
         .unwrap()

@@ -7,7 +7,7 @@
 use oxideav_core::{
     CodecId, CodecParameters, MediaType, Packet, PixelFormat, StreamInfo, TimeBase, WriteSeek,
 };
-use oxideav_iff::anim::{parse_anim, AnimMuxer, AnimMuxerOp};
+use oxideav_iff::anim::{AnimMuxer, AnimMuxerOp, parse_anim};
 
 fn video_stream(width: u32, height: u32) -> StreamInfo {
     let mut params = CodecParameters::video(CodecId::new("rawvideo"));

@@ -16,8 +16,8 @@
 //!   [`Drng::range_len`]) report the spec-documented values.
 
 use oxideav_iff::ilbm::{
-    encode_ilbm, parse_ilbm, Bmhd, Camg, Compression, Drng, DrngRegCell, DrngTrueCell, IlbmImage,
-    Masking,
+    Bmhd, Camg, Compression, Drng, DrngRegCell, DrngTrueCell, IlbmImage, Masking, encode_ilbm,
+    parse_ilbm,
 };
 
 fn make_16_color_image() -> IlbmImage {

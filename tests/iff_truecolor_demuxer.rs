@@ -195,7 +195,8 @@ fn rgb8_demuxer_rejects_wrong_form_type() {
     // An RGBN file opened through the RGB8 demuxer must error on the form
     // type mismatch, rather than mis-decode.
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(rgbn_file()));
-    assert!(reg
-        .open_demuxer("iff_rgb8", rs, &oxideav_core::NullCodecResolver)
-        .is_err());
+    assert!(
+        reg.open_demuxer("iff_rgb8", rs, &oxideav_core::NullCodecResolver)
+            .is_err()
+    );
 }

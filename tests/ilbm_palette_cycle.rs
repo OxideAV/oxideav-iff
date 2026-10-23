@@ -12,8 +12,8 @@
 //! palette.
 
 use oxideav_iff::ilbm::{
-    palette_for_line, Bmhd, Ccrt, Compression, Crng, Drng, DrngRegCell, DrngTrueCell, IlbmImage,
-    Masking, Pchg, PchgChange, PchgLine,
+    Bmhd, Ccrt, Compression, Crng, Drng, DrngRegCell, DrngTrueCell, IlbmImage, Masking, Pchg,
+    PchgChange, PchgLine, palette_for_line,
 };
 
 /// Build a small palette of 8 distinct RGB triples — easier to track

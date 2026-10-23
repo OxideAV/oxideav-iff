@@ -19,7 +19,7 @@
 //!    chunk.
 
 use oxideav_iff::ilbm::{
-    encode_ilbm, parse_ilbm, Bmhd, Camg, Compression, IlbmImage, Masking, Sprt,
+    Bmhd, Camg, Compression, IlbmImage, Masking, Sprt, encode_ilbm, parse_ilbm,
 };
 
 fn make_indexed_image(w: u16, h: u16, n_planes: u8) -> IlbmImage {

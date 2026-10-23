@@ -12,7 +12,7 @@
 //!
 //! Spec reference: `docs/image/iff/iff-truecolor-chunks.md` §1.2.
 
-use oxideav_iff::ilbm::{extract_deep_channel, DeepCType, Dpel, DpelElement};
+use oxideav_iff::ilbm::{DeepCType, Dpel, DpelElement, extract_deep_channel};
 
 fn dpel(elems: &[(DeepCType, u16)]) -> Dpel {
     Dpel {

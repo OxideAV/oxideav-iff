@@ -5,7 +5,7 @@
 //! `InstrumentChunk::resolve_sustain_loop`) surfaces here too.
 
 use oxideav_iff::aiff::{
-    parse, parse_instrument_chunk, AiffError, InstrumentChunk, Marker, MarkerChunk, PlayMode,
+    AiffError, InstrumentChunk, Marker, MarkerChunk, PlayMode, parse, parse_instrument_chunk,
 };
 
 /// Build a 10-byte 80-bit IEEE-extended encoding of `rate`. Mirrors

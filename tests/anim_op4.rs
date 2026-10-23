@@ -333,7 +333,7 @@ fn op4_encode_decode_body_short_roundtrip() {
     let cur = mk(&|x, y| ((x * 2 + y) % 4) as u8);
 
     for long_data in [false, true] {
-        if long_data && row_bytes % 4 != 0 {
+        if long_data && !row_bytes.is_multiple_of(4) {
             // row_bytes=2 can't hold a 4-byte word — encoder should
             // reject, which we assert and skip.
             assert!(encode_op4_body(&prev, &cur, &bmhd, true).is_err());

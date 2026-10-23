@@ -163,30 +163,30 @@ pub mod text;
 #[cfg(feature = "registry")]
 pub mod demuxer;
 
-pub use aesd::{parse_aesd_chunk, write_aesd_chunk, AesdChunk, Emphasis};
-pub use appl::{parse_appl_chunk, write_appl_chunk, ApplicationChunk, ApplicationDialect};
-pub use chunk::{frame_chunk, write_fver_chunk, Chunk, ChunkIter, AIFC_VERSION_1};
-pub use comment::{parse_comments_chunk, write_comments_chunk, Comment, CommentsChunk};
+pub use aesd::{AesdChunk, Emphasis, parse_aesd_chunk, write_aesd_chunk};
+pub use appl::{ApplicationChunk, ApplicationDialect, parse_appl_chunk, write_appl_chunk};
+pub use chunk::{AIFC_VERSION_1, Chunk, ChunkIter, frame_chunk, write_fver_chunk};
+pub use comment::{Comment, CommentsChunk, parse_comments_chunk, write_comments_chunk};
 pub use common::{
-    parse_common, write_common_chunk, CommonChunk, COMPRESSION_FL32, COMPRESSION_FL32_UC,
-    COMPRESSION_FL64, COMPRESSION_FL64_UC, COMPRESSION_NONE, COMPRESSION_RAW, COMPRESSION_SOWT,
-    COMPRESSION_TWOS,
+    COMPRESSION_FL32, COMPRESSION_FL32_UC, COMPRESSION_FL64, COMPRESSION_FL64_UC, COMPRESSION_NONE,
+    COMPRESSION_RAW, COMPRESSION_SOWT, COMPRESSION_TWOS, CommonChunk, parse_common,
+    write_common_chunk,
 };
 pub use error::{AiffError, Result};
 pub use extended::{decode_extended, decode_sample_rate, encode_extended, encode_sample_rate};
-pub use form::{parse, write_sound_data, Form, SoundData};
+pub use form::{Form, SoundData, parse, write_sound_data};
 pub use instrument::{
-    parse_instrument_chunk, write_instrument_chunk, InstrumentChunk, Loop, PlayMode, ResolvedLoop,
+    InstrumentChunk, Loop, PlayMode, ResolvedLoop, parse_instrument_chunk, write_instrument_chunk,
 };
-pub use marker::{parse_marker_chunk, write_marker_chunk, Marker, MarkerChunk};
-pub use midi::{parse_midi_chunk, write_midi_chunk, MidiDataChunk};
-pub use pcm::{decode_pcm, is_pcm_compression, PcmSamples};
+pub use marker::{Marker, MarkerChunk, parse_marker_chunk, write_marker_chunk};
+pub use midi::{MidiDataChunk, parse_midi_chunk, write_midi_chunk};
+pub use pcm::{PcmSamples, decode_pcm, is_pcm_compression};
 pub use precedence::ChunkClass;
-pub use saxel::{parse_saxel_chunk, write_saxel_chunk, Saxel, SaxelChunk};
-pub use text::{parse_text_chunk, write_text_chunk, TextChunk, TextKind};
+pub use saxel::{Saxel, SaxelChunk, parse_saxel_chunk, write_saxel_chunk};
+pub use text::{TextChunk, TextKind, parse_text_chunk, write_text_chunk};
 
 #[cfg(feature = "registry")]
-pub use demuxer::{make_demuxer, register, AiffDemuxer, FORMAT_NAME};
+pub use demuxer::{AiffDemuxer, FORMAT_NAME, make_demuxer, register};
 
 /// Codec id string under which the demuxer factory installs itself
 /// in `oxideav-core`'s `ContainerRegistry` (`"aiff"`).

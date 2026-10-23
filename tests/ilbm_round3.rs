@@ -4,7 +4,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use oxideav_iff::ilbm::{
-    encode_ilbm, parse_ilbm, Bmhd, Camg, Compression, IlbmImage, Masking, CAMG_EHB, CAMG_HAM,
+    Bmhd, CAMG_EHB, CAMG_HAM, Camg, Compression, IlbmImage, Masking, encode_ilbm, parse_ilbm,
 };
 
 // ───────────────────── helpers ─────────────────────
@@ -208,8 +208,10 @@ fn ham6_auto_compression_self_roundtrip() {
     assert_eq!(dec.bmhd.n_planes, 6);
 
     for (i, (orig, got)) in rgba
-        .chunks_exact(4)
-        .zip(dec.rgba.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dec.rgba.as_chunks::<4>().0)
         .enumerate()
     {
         for c in 0..3 {
@@ -250,8 +252,10 @@ fn ham8_auto_compression_self_roundtrip() {
     assert_eq!(dec.bmhd.n_planes, 8);
 
     for (i, (orig, got)) in rgba
-        .chunks_exact(4)
-        .zip(dec.rgba.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dec.rgba.as_chunks::<4>().0)
         .enumerate()
     {
         for c in 0..3 {
@@ -310,8 +314,10 @@ fn ehb_auto_compression_self_roundtrip() {
     // The decoder expands the palette; compare pixel-by-pixel within
     // 1 LSB (possible due to the half-brite >>1 being a floor divide).
     for (i, (orig, got)) in rgba
-        .chunks_exact(4)
-        .zip(dec.rgba.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dec.rgba.as_chunks::<4>().0)
         .enumerate()
     {
         for c in 0..3 {

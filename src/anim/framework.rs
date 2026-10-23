@@ -16,7 +16,7 @@ use oxideav_core::{
 };
 
 use super::*;
-use crate::chunk::{read_chunk_header, read_form_type, GROUP_FORM};
+use crate::chunk::{GROUP_FORM, read_chunk_header, read_form_type};
 
 /// Install the FORM/ANIM demuxer into a container registry. The
 /// registered codec id matches the seed-frame's `rawvideo`+RGBA shape;
@@ -294,7 +294,7 @@ impl Muxer for AnimMuxer {
         // first-seen order over every frame, capped at 256 (8 bitplanes).
         let mut palette: Vec<[u8; 3]> = Vec::new();
         for frame in &self.frames {
-            for px in frame.chunks_exact(4) {
+            for px in frame.as_chunks::<4>().0 {
                 let triple = [px[0], px[1], px[2]];
                 if !palette.contains(&triple) {
                     if palette.len() >= 256 {

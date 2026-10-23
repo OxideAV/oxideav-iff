@@ -9,7 +9,7 @@
 //! `0` bit steps to the previous node and emits it if it carries the
 //! `0x0100` leaf tag.
 
-use oxideav_iff::ilbm::{Pchg, PchgChange, PchgKind, PchgLine, PCHG_COMP_HUFFMAN};
+use oxideav_iff::ilbm::{PCHG_COMP_HUFFMAN, Pchg, PchgChange, PchgKind, PchgLine};
 
 fn line(l: u32, changes: &[(u16, [u8; 3])]) -> PchgLine {
     PchgLine {

@@ -16,7 +16,7 @@ use oxideav_iff::svx::{Compression, SvxMuxer};
 fn sawtooth_200ms_8khz() -> Vec<u8> {
     let sr = 8000u32;
     let total = (sr as u64 * 200 / 1000) as usize; // 1600
-                                                   // Sawtooth: ramp -128..127 and wrap. Written as u8-encoded i8 bytes.
+    // Sawtooth: ramp -128..127 and wrap. Written as u8-encoded i8 bytes.
     (0..total)
         .map(|i| ((i as i32 * 5 - 128).rem_euclid(256) - 128) as i8 as u8)
         .collect()

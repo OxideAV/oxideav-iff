@@ -22,10 +22,10 @@ use std::io::Cursor;
 
 use oxideav_core::{CodecId, ContainerRegistry, MediaType, ReadSeek};
 use oxideav_iff::ilbm::{
-    encode_deep, encode_deep_frames_with_tvdc_table, encode_deep_jpeg_frames,
+    CAMG_DUALPF, CAMG_PFBA, Camg, Dchg, DeepCompression, Dloc, Dpel, LORESDPF_KEY, LORESDPF2_KEY,
+    PlayfieldPriority, encode_deep, encode_deep_frames_with_tvdc_table, encode_deep_jpeg_frames,
     extract_deep_jpeg_frames, parse_deep, parse_deep_frames, parse_deep_frames_with_tvdc_table,
-    parse_deep_with_tvdc_table, Camg, Dchg, DeepCompression, Dloc, Dpel, PlayfieldPriority,
-    CAMG_DUALPF, CAMG_PFBA, LORESDPF2_KEY, LORESDPF_KEY,
+    parse_deep_with_tvdc_table,
 };
 
 // ───────────────────────────── FORM builders ─────────────────────────────
@@ -368,9 +368,10 @@ fn deep_demuxer_rejects_hostile_jpeg_body() {
     );
     let reg = registry();
     let input: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
-    assert!(reg
-        .open_demuxer("iff_deep", input, &oxideav_core::NullCodecResolver)
-        .is_err());
+    assert!(
+        reg.open_demuxer("iff_deep", input, &oxideav_core::NullCodecResolver)
+            .is_err()
+    );
 }
 
 // ─────────────── HUFFMAN / DYNAMICHUFF §1.5b reject posture ───────────────
@@ -398,9 +399,10 @@ fn huffman_and_dynamichuff_are_rejected_with_named_diagnostics() {
         // And the demuxer surfaces the same rejection.
         let reg = registry();
         let input: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
-        assert!(reg
-            .open_demuxer("iff_deep", input, &oxideav_core::NullCodecResolver)
-            .is_err());
+        assert!(
+            reg.open_demuxer("iff_deep", input, &oxideav_core::NullCodecResolver)
+                .is_err()
+        );
     }
 }
 

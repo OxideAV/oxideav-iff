@@ -9,7 +9,7 @@
 //! them in document order, mirroring how §10.0 MIDI and §12.0 APPL
 //! handle the "any-number-per-FORM" rule.
 
-use oxideav_iff::aiff::{parse, write_saxel_chunk, Marker, MarkerChunk, Saxel, SaxelChunk};
+use oxideav_iff::aiff::{Marker, MarkerChunk, Saxel, SaxelChunk, parse, write_saxel_chunk};
 
 /// 80-bit IEEE extended encoding for a sample rate in Hz.
 fn ext(rate: f64) -> [u8; 10] {
@@ -211,15 +211,15 @@ fn saxl_resolve_marker_against_form_mark_chunk() {
     // against the FORM's MARK chunk.
     let mut mark_body = Vec::new();
     mark_body.extend_from_slice(&2_u16.to_be_bytes()); // numMarkers
-                                                       // Marker 1: id=3, position=1024, name="loop start"
-                                                       // pstring length(1) + 10 chars = 11 bytes, odd → pad byte.
+    // Marker 1: id=3, position=1024, name="loop start"
+    // pstring length(1) + 10 chars = 11 bytes, odd → pad byte.
     mark_body.extend_from_slice(&3i16.to_be_bytes());
     mark_body.extend_from_slice(&1024u32.to_be_bytes());
     mark_body.push(10);
     mark_body.extend_from_slice(b"loop start");
     mark_body.push(0); // pstring pad-to-even
-                       // Marker 2: id=7, position=2048, name="loop end"
-                       // pstring length(1) + 8 chars = 9 bytes, odd → pad byte.
+    // Marker 2: id=7, position=2048, name="loop end"
+    // pstring length(1) + 8 chars = 9 bytes, odd → pad byte.
     mark_body.extend_from_slice(&7i16.to_be_bytes());
     mark_body.extend_from_slice(&2048u32.to_be_bytes());
     mark_body.push(8);

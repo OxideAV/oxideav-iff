@@ -3,7 +3,7 @@
 //! Doc reference: `docs/audio/aiff/aiff-c.txt` §14 ("Chunk
 //! Precedence"), lines 1209–1259 of the staged spec text.
 
-use oxideav_iff::aiff::{parse, ChunkClass};
+use oxideav_iff::aiff::{ChunkClass, parse};
 
 /// Pack a chunk: ckID + ckSize + data + (pad byte if odd-sized).
 fn pack(id: &[u8; 4], data: &[u8]) -> Vec<u8> {

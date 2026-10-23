@@ -32,10 +32,10 @@
 //! frames; `iff_8svx` / `aiff` emit PCM.
 
 use oxideav_core::{
-    parse_options, BlobKind, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct,
-    CodecParameters, CodecRegistry, ColorPrimaries, ColorSignal, ContainerRegistry, Decoder,
-    Encoder, Frame, MatrixCoefficients, MetadataBlob, OptionField, OptionKind, OptionValue, Packet,
-    PixelFormat, RuntimeContext, TimeBase, TransferCharacteristics, VideoFrame, VideoPlane,
+    BlobKind, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
+    CodecRegistry, ColorPrimaries, ColorSignal, ContainerRegistry, Decoder, Encoder, Frame,
+    MatrixCoefficients, MetadataBlob, OptionField, OptionKind, OptionValue, Packet, PixelFormat,
+    RuntimeContext, TimeBase, TransferCharacteristics, VideoFrame, VideoPlane, parse_options,
 };
 
 use crate::error::IffError;
@@ -75,7 +75,7 @@ pub fn from_core_pixel_format(pf: PixelFormat) -> oxideav_core::Result<IffPixelF
         other => {
             return Err(oxideav_core::Error::unsupported(format!(
                 "IFF: pixel format {other:?} not supported"
-            )))
+            )));
         }
     })
 }
@@ -200,10 +200,10 @@ pub fn apply_blobs(image: &mut IffImage, blobs: &[MetadataBlob]) {
             if let Ok(raw) = <[u8; 4]>::try_from(b.data.as_slice()) {
                 image.viewmode = Some(u32::from_be_bytes(raw));
             }
-        } else if name == BLOB_KIND_ASPECT {
-            if let [x, y] = b.data.as_slice() {
-                image.aspect = Some((*x, *y));
-            }
+        } else if name == BLOB_KIND_ASPECT
+            && let [x, y] = b.data.as_slice()
+        {
+            image.aspect = Some((*x, *y));
         }
     }
     let chunks = blob_chunks(blobs);
@@ -549,7 +549,7 @@ impl CodecOptionsStruct for IlbmEncoderOptions {
                     other => {
                         return Err(oxideav_core::Error::invalid(format!(
                             "ilbm encoder: unknown form {other:?}"
-                        )))
+                        )));
                     }
                 }
             }
@@ -561,7 +561,7 @@ impl CodecOptionsStruct for IlbmEncoderOptions {
                     other => {
                         return Err(oxideav_core::Error::invalid(format!(
                             "ilbm encoder: unknown compression {other:?}"
-                        )))
+                        )));
                     }
                 }
             }
@@ -574,7 +574,7 @@ impl CodecOptionsStruct for IlbmEncoderOptions {
                     other => {
                         return Err(oxideav_core::Error::invalid(format!(
                             "ilbm encoder: unknown masking {other:?}"
-                        )))
+                        )));
                     }
                 }
             }
@@ -587,7 +587,7 @@ impl CodecOptionsStruct for IlbmEncoderOptions {
                     _ => {
                         return Err(oxideav_core::Error::invalid(format!(
                             "ilbm encoder: n_planes {n} outside 1..=8"
-                        )))
+                        )));
                     }
                 };
             }
@@ -676,13 +676,13 @@ fn output_label(input: PixelFormat, opts: &IlbmEncoderOptions) -> Option<PixelFo
 /// not written ([`apply_blobs`]).
 pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
     let opts: IlbmEncoderOptions = parse_options(&params.options)?;
-    if let Some(pf) = params.pixel_format {
-        if !ENCODER_PIXEL_FORMATS.contains(&pf) {
-            return Err(oxideav_core::Error::unsupported(format!(
-                "IFF encoder: {pf:?} is not an accepted input layout \
+    if let Some(pf) = params.pixel_format
+        && !ENCODER_PIXEL_FORMATS.contains(&pf)
+    {
+        return Err(oxideav_core::Error::unsupported(format!(
+            "IFF encoder: {pf:?} is not an accepted input layout \
                  (Pal8, Rgb24, Rgba, Bgr24, Bgra, Gray8); convert upstream"
-            )));
-        }
+        )));
     }
     let mut out_params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
     out_params.width = params.width;
@@ -718,7 +718,7 @@ struct IffEncoder {
 /// `limit + 1`.
 fn distinct_colours(rgba: &[u8], limit: usize) -> usize {
     let mut seen: Vec<[u8; 3]> = Vec::new();
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         let t = [px[0], px[1], px[2]];
         if !seen.contains(&t) {
             seen.push(t);
@@ -764,13 +764,17 @@ fn frame_to_image(
                 let tight = tighten_packed(plane, width as usize, height as usize, bpp)?;
                 if bpp == 3 {
                     let rgb: Vec<u8> = tight
-                        .chunks_exact(3)
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
                         .flat_map(|c| [c[2], c[1], c[0]])
                         .collect();
                     IffImage::from_rgb8(width, height, rgb)?
                 } else {
                     let rgba: Vec<u8> = tight
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .flat_map(|c| [c[2], c[1], c[0], c[3]])
                         .collect();
                     IffImage::from_rgba8(width, height, rgba)?
@@ -788,7 +792,7 @@ fn frame_to_image(
                 return Err(oxideav_core::Error::unsupported(format!(
                     "IFF encoder: {other:?} is not an accepted input layout \
                  (Pal8, Rgb24, Rgba, Bgr24, Bgra, Gray8); convert upstream"
-                )))
+                )));
             }
         };
     let mut image = image;
@@ -847,7 +851,7 @@ impl Encoder for IffEncoder {
             _ => {
                 return Err(oxideav_core::Error::invalid(
                     "IFF encoder: expected video frame",
-                ))
+                ));
             }
         };
         let mut in_params = self.out_params.clone();
@@ -1284,7 +1288,9 @@ mod tests {
         assert_eq!(back.data(), &[0, 128, 255, 7, 200, 1]);
         assert_eq!(
             back.to_rgb8(),
-            vec![0, 0, 0, 128, 128, 128, 255, 255, 255, 7, 7, 7, 200, 200, 200, 1, 1, 1]
+            vec![
+                0, 0, 0, 128, 128, 128, 255, 255, 255, 7, 7, 7, 200, 200, 200, 1, 1, 1
+            ]
         );
     }
 

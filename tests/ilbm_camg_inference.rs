@@ -11,8 +11,8 @@
 //! only *flags* ambiguity, never overrides the vendor default.
 
 use oxideav_iff::ilbm::{
-    encode_ilbm, parse_ilbm, Bmhd, Camg, Compression, FormatResolution, IlbmImage, InferredFormat,
-    Masking, CAMG_EHB, CAMG_GENLOCK_VIDEO, CAMG_HAM, CAMG_VP_HIDE,
+    Bmhd, CAMG_EHB, CAMG_GENLOCK_VIDEO, CAMG_HAM, CAMG_VP_HIDE, Camg, Compression,
+    FormatResolution, IlbmImage, InferredFormat, Masking, encode_ilbm, parse_ilbm,
 };
 
 fn bmhd(w: u16, h: u16, planes: u8) -> Bmhd {

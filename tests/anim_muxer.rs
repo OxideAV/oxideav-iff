@@ -14,7 +14,7 @@ use oxideav_core::{
     StreamInfo, TimeBase, WriteSeek,
 };
 
-use oxideav_iff::anim::{encode_anim_op5_timed, parse_anim, FrameTiming};
+use oxideav_iff::anim::{FrameTiming, encode_anim_op5_timed, parse_anim};
 use oxideav_iff::ilbm::{Bmhd, Compression, IlbmImage, Masking};
 
 fn registry() -> ContainerRegistry {
@@ -173,9 +173,10 @@ fn anim_mux_single_frame_and_bad_input() {
     let mut bad_stream = video_stream(2, 2);
     bad_stream.params.pixel_format = None;
     let out: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
-    assert!(reg
-        .open_muxer("iff_anim", out, std::slice::from_ref(&bad_stream))
-        .is_err());
+    assert!(
+        reg.open_muxer("iff_anim", out, std::slice::from_ref(&bad_stream))
+            .is_err()
+    );
 }
 
 #[test]

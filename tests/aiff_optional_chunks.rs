@@ -9,8 +9,8 @@
 //! the parser.
 
 use oxideav_iff::aiff::{
-    parse, AesdChunk, ApplicationChunk, ApplicationDialect, Comment, CommentsChunk,
-    InstrumentChunk, Loop, Marker, MarkerChunk, MidiDataChunk, PlayMode,
+    AesdChunk, ApplicationChunk, ApplicationDialect, Comment, CommentsChunk, InstrumentChunk, Loop,
+    Marker, MarkerChunk, MidiDataChunk, PlayMode, parse,
 };
 
 /// 80-bit IEEE extended encoding for a sample rate in Hz. Mirrors
@@ -87,13 +87,13 @@ fn form_aiff(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
 fn surfaces_comt_chunk() {
     let mut body = Vec::new();
     body.extend_from_slice(&2_u16.to_be_bytes()); // numComments
-                                                  // Comment 1: timestamp=0, marker=0, text="hello"
+    // Comment 1: timestamp=0, marker=0, text="hello"
     body.extend_from_slice(&0_u32.to_be_bytes());
     body.extend_from_slice(&0_i16.to_be_bytes());
     body.extend_from_slice(&5_u16.to_be_bytes());
     body.extend_from_slice(b"hello");
     body.push(0); // pad (count=5 odd)
-                  // Comment 2: timestamp=100, marker=2, text="ok"
+    // Comment 2: timestamp=100, marker=2, text="ok"
     body.extend_from_slice(&100_u32.to_be_bytes());
     body.extend_from_slice(&2_i16.to_be_bytes());
     body.extend_from_slice(&2_u16.to_be_bytes());

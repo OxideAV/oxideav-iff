@@ -8,8 +8,8 @@
 //! A, R, B, G component order plus the opt-in alpha flag.
 
 use oxideav_iff::ilbm::{
-    encode_ilbm, parse_ilbm, Bmhd, Camg, Compression, IlbmImage, Masking, Pchg, PchgChange,
-    PchgKind, PchgLine, Sham, PCHGF_32BIT, PCHGF_USE_ALPHA,
+    Bmhd, Camg, Compression, IlbmImage, Masking, PCHGF_32BIT, PCHGF_USE_ALPHA, Pchg, PchgChange,
+    PchgKind, PchgLine, Sham, encode_ilbm, parse_ilbm,
 };
 
 fn line(l: u32, changes: &[(u16, [u8; 3])]) -> PchgLine {
@@ -140,7 +140,7 @@ fn negative_start_line_changes_apply_before_first_row() {
     raw.extend_from_slice(&1u16.to_be_bytes()); // MaxChanges
     raw.extend_from_slice(&2u32.to_be_bytes()); // TotalChanges
     raw.extend_from_slice(&[0xA0, 0, 0, 0]); // lines -2 and 0 set
-                                             // Line -2: reg 1 → 0xF00 (red).
+    // Line -2: reg 1 → 0xF00 (red).
     raw.extend_from_slice(&[1, 0, 0x1F, 0x00]);
     // Line 0: reg 2 → 0x0F0 (green).
     raw.extend_from_slice(&[1, 0, 0x20, 0xF0]);

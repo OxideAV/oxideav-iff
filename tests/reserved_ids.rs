@@ -9,8 +9,8 @@
 //! lines 524–531).
 
 use oxideav_iff::chunk::{
-    read_chunk_header, skip_chunk_body, ChunkHeader, GroupKind, ReservedId, FILLER_ID, GROUP_CAT,
-    GROUP_FORM, GROUP_LIST, PROP_ID,
+    ChunkHeader, FILLER_ID, GROUP_CAT, GROUP_FORM, GROUP_LIST, GroupKind, PROP_ID, ReservedId,
+    read_chunk_header, skip_chunk_body,
 };
 use std::io::Cursor;
 

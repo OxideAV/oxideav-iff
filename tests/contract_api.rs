@@ -7,12 +7,12 @@
 use std::time::Duration;
 
 use oxideav_iff::ilbm::{
-    encode_ilbm, parse_ilbm, Bmhd, Camg, Compression, IlbmImage, Masking, CAMG_EHB, CAMG_HAM,
+    Bmhd, CAMG_EHB, CAMG_HAM, Camg, Compression, IlbmImage, Masking, encode_ilbm, parse_ilbm,
 };
 use oxideav_iff::{
+    AnimOp, DecodeOptions, EncodeOptions, Frame, IffError, IffForm, IffImage, Palette, PixelFormat,
     decode, decode_all, decode_from, decode_rgb8, decode_rgba8, decode_with, encode, encode_all,
-    encode_rgb8, encode_rgba8, encode_to, info, probe, AnimOp, DecodeOptions, EncodeOptions, Frame,
-    IffError, IffForm, IffImage, Palette, PixelFormat,
+    encode_rgb8, encode_rgba8, encode_to, info, probe,
 };
 
 fn bmhd(w: u16, h: u16, n_planes: u8, masking: Masking, key: u16) -> Bmhd {
@@ -719,13 +719,15 @@ fn pal8_masking_rule_from_the_palette_alpha() {
     )
     .unwrap();
     assert_eq!(info(&bytes).unwrap().masking, 1);
-    assert!(decode(&bytes)
-        .unwrap()
-        .to_rgba8()
-        .iter()
-        .skip(3)
-        .step_by(4)
-        .all(|&a| a == 255));
+    assert!(
+        decode(&bytes)
+            .unwrap()
+            .to_rgba8()
+            .iter()
+            .skip(3)
+            .step_by(4)
+            .all(|&a| a == 255)
+    );
     assert!(matches!(
         encode(
             &opaque,

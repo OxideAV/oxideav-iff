@@ -7,10 +7,10 @@
 // scanline/column relationship.
 #![allow(clippy::needless_range_loop)]
 
-use oxideav_iff::anim::{apply_op5_for_test, parse_anim, Anhd, AnimImage};
+use oxideav_iff::anim::{Anhd, AnimImage, apply_op5_for_test, parse_anim};
 use oxideav_iff::ilbm::{
-    encode_ilbm, expand_ehb_palette, parse_ilbm, Bmhd, Camg, Compression, Grab, IlbmImage, Masking,
-    PchgChange, PchgLine, Sham, CAMG_EHB, CAMG_HAM,
+    Bmhd, CAMG_EHB, CAMG_HAM, Camg, Compression, Grab, IlbmImage, Masking, PchgChange, PchgLine,
+    Sham, encode_ilbm, expand_ehb_palette, parse_ilbm,
 };
 
 // ───────────────────── PBM ─────────────────────
@@ -453,8 +453,10 @@ fn ham6_encode_decode_smooth_gradient() {
     assert!(dec.camg.is_ham(), "CAMG HAM bit preserved");
     // Allow up to 16 LSB error per channel (HAM6 quantises to 4-bit).
     for (i, (orig, got)) in rgba
-        .chunks_exact(4)
-        .zip(dec.rgba.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dec.rgba.as_chunks::<4>().0)
         .enumerate()
     {
         for c in 0..3 {
@@ -513,8 +515,10 @@ fn ham8_encode_decode_smooth_gradient() {
     assert_eq!(dec.width, 64);
     assert!(dec.camg.is_ham());
     for (i, (orig, got)) in rgba
-        .chunks_exact(4)
-        .zip(dec.rgba.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dec.rgba.as_chunks::<4>().0)
         .enumerate()
     {
         for c in 0..3 {

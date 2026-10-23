@@ -4,7 +4,7 @@
 //! than the internal module path used by the unit tests) so a
 //! regression that breaks the re-exports surfaces here too.
 
-use oxideav_iff::aiff::{parse, parse_marker_chunk, AiffError, MarkerChunk};
+use oxideav_iff::aiff::{AiffError, MarkerChunk, parse, parse_marker_chunk};
 
 /// Build a 10-byte 80-bit IEEE-extended encoding of `rate`. Mirrors
 /// the helper used in the in-crate unit tests (`form::tests::ext`).

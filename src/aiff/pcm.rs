@@ -24,7 +24,7 @@
 //! caller doesn't have to remember the original bit depth. Float
 //! flavours return their native precision.
 
-use crate::aiff::common::{CommonChunk, COMPRESSION_NONE};
+use crate::aiff::common::{COMPRESSION_NONE, CommonChunk};
 use crate::aiff::error::{AiffError, Result};
 
 /// PCM sample data deinterleaved into per-channel planes.
@@ -125,7 +125,7 @@ fn frame_count(common: &CommonChunk, payload: &[u8], bytes_per_sample: usize) ->
         return Ok(declared);
     }
     // Otherwise, derive the count from the payload itself.
-    if payload.len() % frame_size != 0 {
+    if !payload.len().is_multiple_of(frame_size) {
         return Err(AiffError::SsndUnaligned {
             payload: payload.len(),
             frame_size,
@@ -151,7 +151,7 @@ fn read_be_sample(buf: &[u8], bits: u16) -> i32 {
     let total_bits = bytes * 8;
     let sign_shift = 32 - total_bits as i32;
     let signed = (acc << sign_shift) >> sign_shift; // sign-extend
-                                                    // Left-justify so the sample's MSB occupies bit 31.
+    // Left-justify so the sample's MSB occupies bit 31.
     let left_shift = (8 - (bits as i32 % 8)) % 8; // pad bits inside the byte
     let _ = left_shift; // reserved for the in-byte sub-bit case
     signed << (32 - total_bits as i32)

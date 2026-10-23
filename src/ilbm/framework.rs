@@ -30,7 +30,7 @@ use oxideav_core::{
 use oxideav_core::{Muxer, ReadSeek};
 
 use super::*;
-use crate::chunk::{read_chunk_header, read_form_type, GROUP_FORM};
+use crate::chunk::{GROUP_FORM, read_chunk_header, read_form_type};
 
 pub fn register(reg: &mut ContainerRegistry) {
     reg.register_demuxer("iff_ilbm", open);
@@ -361,7 +361,7 @@ impl MuxInput {
             Some(PixelFormat::Rgba) => Ok(Self::Rgba),
             Some(PixelFormat::Rgb24) => Ok(Self::Rgb24),
             Some(PixelFormat::Pal8) => {
-                if params.extradata.is_empty() || params.extradata.len() % 3 != 0 {
+                if params.extradata.is_empty() || !params.extradata.len().is_multiple_of(3) {
                     return Err(Error::invalid(format!(
                         "{label} muxer: Pal8 stream needs its palette as RGB triples in extradata"
                     )));
@@ -369,7 +369,9 @@ impl MuxInput {
                 Ok(Self::Pal8(
                     params
                         .extradata
-                        .chunks_exact(3)
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
                         .map(|c| [c[0], c[1], c[2]])
                         .collect(),
                 ))
@@ -413,7 +415,9 @@ impl MuxInput {
             Self::Form => Vec::new(),
             Self::Rgba => data.to_vec(),
             Self::Rgb24 => data
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .flat_map(|p| [p[0], p[1], p[2], 0xFF])
                 .collect(),
             Self::Pal8(pal) => data
@@ -666,7 +670,9 @@ fn probe_rgb_form(buf: &[u8], form_type: &[u8; 4]) -> u8 {
 /// Drop the alpha byte of a packed RGBA buffer (the `Rgb24` packet of an
 /// opaque picture).
 fn strip_alpha(rgba: Vec<u8>) -> Vec<u8> {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect()
 }
@@ -952,7 +958,7 @@ impl Muxer for DeepMuxer {
         let opaque = self
             .frames
             .iter()
-            .all(|f| f.chunks_exact(4).all(|px| px[3] == 0xFF));
+            .all(|f| f.as_chunks::<4>().0.iter().all(|px| px[3] == 0xFF));
         let mut elements = vec![
             DpelElement {
                 c_type: DeepCType::Red,
@@ -1008,11 +1014,7 @@ impl Muxer for DeepMuxer {
             DeepMuxerCompression::Auto => {
                 let raw = encode(DeepCompression::None)?;
                 let rle = encode(DeepCompression::RunLength)?;
-                if rle.len() < raw.len() {
-                    rle
-                } else {
-                    raw
-                }
+                if rle.len() < raw.len() { rle } else { raw }
             }
         };
         crate::api::splice_chunks(&mut form, &self.chunks);

@@ -53,7 +53,7 @@ use oxideav_core::{
 use oxideav_core::{ContainerRegistry, Demuxer, Muxer, ReadSeek, WriteSeek};
 
 use crate::chunk::{
-    read_body, read_chunk_header, read_form_type, skip_chunk_body, ChunkHeader, GROUP_FORM,
+    ChunkHeader, GROUP_FORM, read_body, read_chunk_header, read_form_type, skip_chunk_body,
 };
 
 pub fn register(reg: &mut ContainerRegistry) {
@@ -270,7 +270,7 @@ fn decode_body(
                 Ok(samples[..take].iter().map(|&s| s as u8).collect())
             } else {
                 // Stereo: the two halves are equal length.
-                if body.len() % 2 != 0 {
+                if !body.len().is_multiple_of(2) {
                     return Err(Error::invalid(
                         "8SVX Fibonacci stereo BODY: odd length can't split into equal halves",
                     ));
@@ -586,14 +586,16 @@ impl Envelope {
     /// both big-endian). A body that is not a whole number of points
     /// is rejected.
     pub fn parse(body: &[u8]) -> Result<Self> {
-        if body.len() % 6 != 0 {
+        if !body.len().is_multiple_of(6) {
             return Err(Error::invalid(format!(
                 "8SVX envelope: body of {} bytes is not a whole number of 6-byte EGPoints",
                 body.len()
             )));
         }
         let points = body
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|c| EgPoint {
                 duration_ms: u16::from_be_bytes([c[0], c[1]]),
                 dest: i32::from_be_bytes([c[2], c[3], c[4], c[5]]),
@@ -684,14 +686,16 @@ impl Seqn {
     /// (`u32` start + `u32` end, big-endian). A body that is not a
     /// whole number of segments is rejected.
     pub fn parse(body: &[u8]) -> Result<Self> {
-        if body.len() % 8 != 0 {
+        if !body.len().is_multiple_of(8) {
             return Err(Error::invalid(format!(
                 "8SVX SEQN: body of {} bytes is not a whole number of 8-byte segments",
                 body.len()
             )));
         }
         let segments = body
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|c| SeqnSegment {
                 start: u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
                 end: u32::from_be_bytes([c[4], c[5], c[6], c[7]]),
@@ -1594,13 +1598,13 @@ impl SvxMuxer {
                 s.params.codec_id
             )));
         }
-        if let Some(fmt) = s.params.sample_format {
-            if fmt != SampleFormat::S8 {
-                return Err(Error::unsupported(format!(
-                    "8SVX muxer requires SampleFormat::S8 (got {:?})",
-                    fmt
-                )));
-            }
+        if let Some(fmt) = s.params.sample_format
+            && fmt != SampleFormat::S8
+        {
+            return Err(Error::unsupported(format!(
+                "8SVX muxer requires SampleFormat::S8 (got {:?})",
+                fmt
+            )));
         }
         let ch_count = s
             .params
@@ -1613,7 +1617,7 @@ impl SvxMuxer {
                 return Err(Error::unsupported(format!(
                     "8SVX muxer: only mono or stereo is supported (got {} channels)",
                     n
-                )))
+                )));
             }
         };
         let sample_rate = s
@@ -1898,7 +1902,7 @@ impl Muxer for SvxMuxer {
 
         // Build the on-disk BODY bytes from buffered interleaved pcm_s8.
         let ch_count = self.channels.count();
-        if self.pending.len() % ch_count as usize != 0 {
+        if !self.pending.len().is_multiple_of(ch_count as usize) {
             return Err(Error::invalid(
                 "8SVX muxer: packet total not a multiple of channel count",
             ));
@@ -1920,7 +1924,7 @@ impl Muxer for SvxMuxer {
             (Channels::Stereo, Compression::Fibonacci) => {
                 let mut left: Vec<i8> = Vec::with_capacity(frames_per_channel);
                 let mut right: Vec<i8> = Vec::with_capacity(frames_per_channel);
-                for frame in self.pending.chunks_exact(2) {
+                for frame in self.pending.as_chunks::<2>().0 {
                     left.push(frame[0] as i8);
                     right.push(frame[1] as i8);
                 }

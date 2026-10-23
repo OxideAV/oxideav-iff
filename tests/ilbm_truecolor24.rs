@@ -29,8 +29,8 @@ use oxideav_core::{
 };
 use oxideav_core::{Muxer, WriteSeek};
 use oxideav_iff::ilbm::{
-    encode_ilbm, parse_ilbm, Bmhd, Camg, Compression, IlbmImage, IlbmMuxer, Masking, MuxerMode,
-    CAMG_EHB, CAMG_HAM,
+    Bmhd, CAMG_EHB, CAMG_HAM, Camg, Compression, IlbmImage, IlbmMuxer, Masking, MuxerMode,
+    encode_ilbm, parse_ilbm,
 };
 
 static CTR: AtomicU64 = AtomicU64::new(0);
@@ -271,11 +271,11 @@ fn muxer_truecolor24_drops_alpha_to_opaque() {
     let img = tc24_image(w, h, Compression::None, rgba.clone());
     let bytes = encode_ilbm(&img).expect("encode tc24 drop alpha");
     let parsed = parse_ilbm(&bytes).expect("parse tc24 drop alpha");
-    for px in parsed.rgba.chunks_exact(4) {
+    for px in parsed.rgba.as_chunks::<4>().0 {
         assert_eq!(px[3], 0xFF);
     }
     // RGB bytes survive.
-    for (i, px) in parsed.rgba.chunks_exact(4).enumerate() {
+    for (i, px) in parsed.rgba.as_chunks::<4>().0.iter().enumerate() {
         assert_eq!(&px[..3], &rgba[i * 4..i * 4 + 3]);
     }
 }

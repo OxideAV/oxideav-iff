@@ -9,8 +9,8 @@
 //! when the form has no encoder yet) so a regression in the probe
 //! immediately shows up here regardless of which form it broke.
 
-use oxideav_iff::chunk::{probe_top_level_group, read_top_level_group, GroupKind};
-use oxideav_iff::ilbm::{encode_ilbm, Bmhd, Camg, Compression, IlbmImage, Masking};
+use oxideav_iff::chunk::{GroupKind, probe_top_level_group, read_top_level_group};
+use oxideav_iff::ilbm::{Bmhd, Camg, Compression, IlbmImage, Masking, encode_ilbm};
 
 // ───────────────────── helpers ─────────────────────
 

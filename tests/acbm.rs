@@ -32,8 +32,8 @@ use oxideav_core::{
     PixelFormat, ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
 use oxideav_iff::ilbm::{
-    encode_acbm, encode_ilbm, indices_to_planar_row, parse_acbm, parse_ilbm, Bmhd, Camg,
-    Compression, Grab, IlbmImage, IlbmMuxer, Masking, MuxerMode, CAMG_EHB, CAMG_HAM,
+    Bmhd, CAMG_EHB, CAMG_HAM, Camg, Compression, Grab, IlbmImage, IlbmMuxer, Masking, MuxerMode,
+    encode_acbm, encode_ilbm, indices_to_planar_row, parse_acbm, parse_ilbm,
 };
 
 fn bmhd(w: u16, h: u16, n_planes: u8, masking: Masking) -> Bmhd {
@@ -292,7 +292,7 @@ fn acbm_hasmask_roundtrip() {
     };
     let dec = parse_acbm(&encode_acbm(&img).unwrap()).unwrap();
     // Compare alpha channel survives the contiguous mask plane.
-    for (i, chunk) in dec.rgba.chunks_exact(4).enumerate() {
+    for (i, chunk) in dec.rgba.as_chunks::<4>().0.iter().enumerate() {
         assert_eq!(
             chunk[3],
             rgba[i * 4 + 3],

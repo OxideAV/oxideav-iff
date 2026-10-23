@@ -7,10 +7,9 @@
 //! unaffected, and the untimed wrappers keep the default 1-jiffy pace.
 
 use oxideav_iff::anim::{
-    encode_anim_op1, encode_anim_op1_timed, encode_anim_op2, encode_anim_op2_timed,
+    FrameTiming, encode_anim_op1, encode_anim_op1_timed, encode_anim_op2, encode_anim_op2_timed,
     encode_anim_op3, encode_anim_op3_timed, encode_anim_op4, encode_anim_op4_timed,
     encode_anim_op7, encode_anim_op7_timed, encode_anim_op8, encode_anim_op8_timed, parse_anim,
-    FrameTiming,
 };
 use oxideav_iff::ilbm::{Bmhd, Compression, IlbmImage, Masking};
 

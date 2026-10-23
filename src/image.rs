@@ -441,7 +441,9 @@ impl Palette {
     /// A palette from packed RGB bytes (alpha 255).
     pub fn from_rgb(rgb: &[u8]) -> Self {
         let entries = rgb
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|e| [e[0], e[1], e[2], 255])
             .collect();
         Self { entries }
@@ -897,12 +899,22 @@ impl IffImage {
             let dst = &mut out[y * w * out_bpp..(y + 1) * w * out_bpp];
             match self.format {
                 PixelFormat::Rgba => {
-                    for (s, d) in row.chunks_exact(4).zip(dst.chunks_exact_mut(out_bpp)) {
+                    for (s, d) in row
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(dst.chunks_exact_mut(out_bpp))
+                    {
                         d.copy_from_slice(&s[..out_bpp]);
                     }
                 }
                 PixelFormat::Rgb24 => {
-                    for (s, d) in row.chunks_exact(3).zip(dst.chunks_exact_mut(out_bpp)) {
+                    for (s, d) in row
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .zip(dst.chunks_exact_mut(out_bpp))
+                    {
                         d[..3].copy_from_slice(s);
                     }
                 }

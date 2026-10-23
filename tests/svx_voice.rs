@@ -204,8 +204,8 @@ fn voice_header_hostile_inputs() {
 // ── parse_voice / encode_voice — the structural surface ──────────────
 
 use oxideav_iff::svx::{
-    encode_voice, parse_voice, ChannelAssignment, ChannelSamples, EgPoint, Envelope, Fade, Pan,
-    Seqn, SeqnSegment, Voice,
+    ChannelAssignment, ChannelSamples, EgPoint, Envelope, Fade, Pan, Seqn, SeqnSegment, Voice,
+    encode_voice, parse_voice,
 };
 
 fn voice_of(header: VoiceHeader, channels: Vec<ChannelSamples>) -> Voice {
@@ -415,7 +415,7 @@ fn envelope_level_evaluation() {
     assert_eq!(env.level_at_ms(0, 150), 0xC000); // halfway down
     assert_eq!(env.level_at_ms(0, 200), 0x8000); // settled
     assert_eq!(env.level_at_ms(0, 10_000), 0x8000); // holds
-                                                    // Empty envelope: identity.
+    // Empty envelope: identity.
     assert_eq!(Envelope::default().level_at_ms(1234, 42), 1234);
     // Zero-duration point: immediate jump.
     let jump = Envelope {
@@ -480,7 +480,7 @@ fn typed_chunk_hostile_inputs() {
 #[test]
 fn parse_voice_hostile_forms() {
     let h = vhdr(4, 0, 2); // needs 4 + 8 = 12 samples
-                           // BODY too short for the announced octave series.
+    // BODY too short for the announced octave series.
     let short = build_svx(&h, &[], &[0u8; 5]);
     assert!(parse_voice(&short).is_err());
     // Duplicate VHDR.
@@ -749,9 +749,11 @@ fn demux_forged_chunk_size_is_truncation_not_allocation() {
     let mut containers = oxideav_core::ContainerRegistry::new();
     oxideav_iff::register_containers(&mut containers);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
-    assert!(containers
-        .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
-        .is_err());
+    assert!(
+        containers
+            .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
+            .is_err()
+    );
 
     // Same class through the whole-FORM demuxers: a BODY / FORM size
     // past the stream end errors instead of allocating.
@@ -760,9 +762,11 @@ fn demux_forged_chunk_size_is_truncation_not_allocation() {
     let l = svx.len();
     svx[l - 12..l - 8].copy_from_slice(&0x7FFF_FFF0u32.to_be_bytes()); // BODY size
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(svx));
-    assert!(containers
-        .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
-        .is_err());
+    assert!(
+        containers
+            .open_demuxer("iff_8svx", rs, &oxideav_core::NullCodecResolver)
+            .is_err()
+    );
 }
 
 /// Loop-split accessors: octave k's one-shot/repeat parts follow the

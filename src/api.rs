@@ -23,19 +23,19 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use crate::anim::{
-    encode_anim_op0_timed, encode_anim_op1_timed, encode_anim_op2_timed, encode_anim_op3_timed,
-    encode_anim_op4_timed, encode_anim_op5_timed, encode_anim_op7_timed, encode_anim_op8_timed,
-    parse_anim_indexed, FrameTiming,
+    FrameTiming, encode_anim_op0_timed, encode_anim_op1_timed, encode_anim_op2_timed,
+    encode_anim_op3_timed, encode_anim_op4_timed, encode_anim_op5_timed, encode_anim_op7_timed,
+    encode_anim_op8_timed, parse_anim_indexed,
 };
-use crate::chunk::{parse_group_children, probe_top_level_group, GroupChild, GroupKind};
+use crate::chunk::{GroupChild, GroupKind, parse_group_children, probe_top_level_group};
 use crate::error::{IffError, Result};
 use crate::ilbm::{
-    assemble_acbm_form, assemble_ilbm_form, build_palette, build_palette_capped, encode_acbm,
-    encode_deep_frames, encode_ilbm, encode_rgb8 as encode_rgb8_form,
-    encode_rgbn as encode_rgbn_form, expand_ehb_palette, pack_body_resolving, parse_acbm_indexed,
-    parse_deep_frames, parse_deep_frames_with_tvdc_table, parse_ilbm_indexed, parse_rgb8,
-    parse_rgbn, push_planar_row, Bmhd, Camg, Compression, Dchg, DeepCType, DeepCompression, Dpel,
-    DpelElement, GenlockPolicy, IlbmImage, IndexedView, InferredFormat, Masking, Pchg,
+    Bmhd, Camg, Compression, Dchg, DeepCType, DeepCompression, Dpel, DpelElement, GenlockPolicy,
+    IlbmImage, IndexedView, InferredFormat, Masking, Pchg, assemble_acbm_form, assemble_ilbm_form,
+    build_palette, build_palette_capped, encode_acbm, encode_deep_frames, encode_ilbm,
+    encode_rgb8 as encode_rgb8_form, encode_rgbn as encode_rgbn_form, expand_ehb_palette,
+    pack_body_resolving, parse_acbm_indexed, parse_deep_frames, parse_deep_frames_with_tvdc_table,
+    parse_ilbm_indexed, parse_rgb8, parse_rgbn, push_planar_row,
 };
 use crate::image::{
     Frame, IffChunk, IffForm, IffImage, ImageInfo, Palette, PixelFormat, Plane, RgbImage, RgbaImage,
@@ -407,15 +407,14 @@ fn group_children(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
             inner_type,
             body,
         } = child
+            && (IffForm::from_form_type(&inner_type).is_some() || &inner_type == b"ANIM")
         {
-            if IffForm::from_form_type(&inner_type).is_some() || &inner_type == b"ANIM" {
-                let mut full = Vec::with_capacity(12 + body.len());
-                full.extend_from_slice(b"FORM");
-                full.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
-                full.extend_from_slice(&inner_type);
-                full.extend_from_slice(body);
-                out.push(full);
-            }
+            let mut full = Vec::with_capacity(12 + body.len());
+            full.extend_from_slice(b"FORM");
+            full.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+            full.extend_from_slice(&inner_type);
+            full.extend_from_slice(body);
+            out.push(full);
         }
     }
     Ok(out)
@@ -692,7 +691,9 @@ fn rgba_to_image(width: u32, height: u32, rgba: Vec<u8>, keep_alpha: bool) -> If
         )
     } else {
         let rgb: Vec<u8> = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2]])
             .collect();
         IffImage::unchecked(
@@ -731,10 +732,10 @@ fn ilbm_to_image(img: IlbmImage, indexed: IndexedView, form: IffForm, layout: &L
             if entries.len() < need.min(256) {
                 entries.resize(need.min(256), [0, 0, 0, 255]);
             }
-            if img.bmhd.masking == Masking::HasTransparentColor {
-                if let Some(e) = entries.get_mut(usize::from(img.bmhd.transparent_color)) {
-                    e[3] = 0;
-                }
+            if img.bmhd.masking == Masking::HasTransparentColor
+                && let Some(e) = entries.get_mut(usize::from(img.bmhd.transparent_color))
+            {
+                e[3] = 0;
             }
             IffImage::unchecked(
                 w,
@@ -1037,7 +1038,7 @@ fn pal8_masking(
             return Err(IffError::unsupported(format!(
                 "{label} encode: mskLasso is a decoder-side seed fill; Pal8 input takes \
                  masking None, HasMask or HasTransparentColor"
-            )))
+            )));
         }
         Some(m) => (m, key),
         None => match transparent.len() {

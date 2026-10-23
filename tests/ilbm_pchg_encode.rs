@@ -13,8 +13,8 @@
 //!   to the same per-line palette overrides via `parse_ilbm`.
 
 use oxideav_iff::ilbm::{
-    encode_ilbm, parse_ilbm, Bmhd, Camg, Compression, IlbmImage, Masking, Pchg, PchgChange,
-    PchgHeader, PchgKind, PchgLine,
+    Bmhd, Camg, Compression, IlbmImage, Masking, Pchg, PchgChange, PchgHeader, PchgKind, PchgLine,
+    encode_ilbm, parse_ilbm,
 };
 
 fn line(l: u32, changes: &[(u16, [u8; 3])]) -> PchgLine {

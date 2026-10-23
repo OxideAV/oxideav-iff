@@ -13,7 +13,7 @@
 //! [`encode_anim_op0_timed`], decode them back through [`parse_anim`],
 //! and assert the per-frame timing and derived timeline match.
 
-use oxideav_iff::anim::{encode_anim_op0, encode_anim_op0_timed, parse_anim, FrameTiming};
+use oxideav_iff::anim::{FrameTiming, encode_anim_op0, encode_anim_op0_timed, parse_anim};
 use oxideav_iff::ilbm::{Bmhd, Camg, Compression, IlbmImage, Masking};
 
 fn make_frame(
@@ -263,7 +263,7 @@ fn looping_lookup_wraps_modulo_total() {
     assert_eq!(pb.frame_at_jiffies_looping(70), Some(1)); // 70 % 60 = 10 -> f1
     assert_eq!(pb.frame_at_jiffies_looping(95), Some(2)); // 95 % 60 = 35 -> f2
     assert_eq!(pb.frame_at_jiffies_looping(120), Some(0)); // 120 % 60 = 0 -> f0
-                                                           // Micros loop mirror: 60 jiffies = 1 s; t = 1.0 s wraps to frame 0.
+    // Micros loop mirror: 60 jiffies = 1 s; t = 1.0 s wraps to frame 0.
     assert_eq!(pb.frame_at_micros_looping(1_000_000), Some(0));
     // 1.2 s = 72 jiffies; 72 % 60 = 12 jiffies into the loop -> frame 1.
     assert_eq!(pb.frame_at_micros_looping(1_200_000), Some(1));

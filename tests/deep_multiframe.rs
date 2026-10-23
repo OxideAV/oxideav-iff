@@ -7,8 +7,8 @@
 //! Source: docs/image/iff/iff-truecolor-chunks.md §1.
 
 use oxideav_iff::ilbm::{
-    encode_deep_frames, parse_deep, parse_deep_frames, Dchg, DeepCType, DeepCompression,
-    DpelElement,
+    Dchg, DeepCType, DeepCompression, DpelElement, encode_deep_frames, parse_deep,
+    parse_deep_frames,
 };
 use oxideav_iff::ilbm::{Dloc, Dpel};
 

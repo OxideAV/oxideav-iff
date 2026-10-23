@@ -12,17 +12,17 @@
 //! and `(c) ` are §13.0 at-most-one-per-FORM singletons and surfaced
 //! as such.
 
-use crate::aiff::aesd::{parse_aesd_chunk, AesdChunk};
-use crate::aiff::appl::{parse_appl_chunk, ApplicationChunk};
+use crate::aiff::aesd::{AesdChunk, parse_aesd_chunk};
+use crate::aiff::appl::{ApplicationChunk, parse_appl_chunk};
 use crate::aiff::chunk::ChunkIter;
-use crate::aiff::comment::{parse_comments_chunk, CommentsChunk};
-use crate::aiff::common::{parse_common, CommonChunk};
+use crate::aiff::comment::{CommentsChunk, parse_comments_chunk};
+use crate::aiff::common::{CommonChunk, parse_common};
 use crate::aiff::error::{AiffError, Result};
-use crate::aiff::instrument::{parse_instrument_chunk, InstrumentChunk};
-use crate::aiff::marker::{parse_marker_chunk, MarkerChunk};
-use crate::aiff::midi::{parse_midi_chunk, MidiDataChunk};
-use crate::aiff::saxel::{parse_saxel_chunk, SaxelChunk};
-use crate::aiff::text::{parse_text_chunk, TextChunk, TextKind};
+use crate::aiff::instrument::{InstrumentChunk, parse_instrument_chunk};
+use crate::aiff::marker::{MarkerChunk, parse_marker_chunk};
+use crate::aiff::midi::{MidiDataChunk, parse_midi_chunk};
+use crate::aiff::saxel::{SaxelChunk, parse_saxel_chunk};
+use crate::aiff::text::{TextChunk, TextKind, parse_text_chunk};
 
 /// Parsed SSND (Sound Data) chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1246,7 +1246,7 @@ mod tests {
     fn write_sound_data_pairs_with_frame_chunk() {
         // frame_chunk(b"SSND", write_sound_data(..)) must be the exact
         // inverse of the ChunkIter walk: header + body + odd-length pad.
-        use crate::aiff::chunk::{frame_chunk, ChunkIter};
+        use crate::aiff::chunk::{ChunkIter, frame_chunk};
         let pcm: &[u8] = &[1, 2, 3]; // odd sample length → forces the pad byte
         let sd = SoundData {
             offset: 0,

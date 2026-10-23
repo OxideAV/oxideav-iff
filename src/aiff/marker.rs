@@ -192,11 +192,7 @@ fn parse_marker_pstring(data: &[u8]) -> Result<(String, usize)> {
     // skipped the trailing pad on the very last marker still parse.
     let raw = 1 + len;
     let consumed = if raw % 2 == 1 {
-        if raw < data.len() {
-            raw + 1
-        } else {
-            raw
-        }
+        if raw < data.len() { raw + 1 } else { raw }
     } else {
         raw
     };

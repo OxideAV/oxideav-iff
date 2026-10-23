@@ -11,7 +11,7 @@
 //! partial-rectangle / plane-masked variant is rejected (its BODY
 //! layout is undocumented).
 
-use oxideav_iff::anim::{apply_op1_for_test, encode_anim_op1, encode_op1_body, parse_anim, Anhd};
+use oxideav_iff::anim::{Anhd, apply_op1_for_test, encode_anim_op1, encode_op1_body, parse_anim};
 use oxideav_iff::ilbm::{Bmhd, Camg, Compression, IlbmImage, Masking};
 
 fn make_frame_planes(
@@ -91,11 +91,7 @@ fn op1_roundtrip_sparse_delta() {
     let pal = vec![[0u8, 0, 0], [255u8, 0, 0]];
     let frame0 = make_frame_planes(16, 16, 1, Compression::ByteRun1, &pal, |_x, _y| 0);
     let frame1 = make_frame_planes(16, 16, 1, Compression::ByteRun1, &pal, |x, y| {
-        if x < 4 && y < 4 {
-            1
-        } else {
-            0
-        }
+        if x < 4 && y < 4 { 1 } else { 0 }
     });
     let frames = vec![frame0.clone(), frame1.clone()];
     let bytes = encode_anim_op1(&frames).unwrap();
@@ -129,11 +125,7 @@ fn op1_roundtrip_multi_frame_sequence() {
     let frames: Vec<IlbmImage> = (0..4)
         .map(|f| {
             make_frame_planes(16, 8, 1, Compression::ByteRun1, &pal, move |x, y| {
-                if x == f && y == f % 8 {
-                    1
-                } else {
-                    0
-                }
+                if x == f && y == f % 8 { 1 } else { 0 }
             })
         })
         .collect();

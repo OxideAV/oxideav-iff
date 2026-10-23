@@ -9,7 +9,7 @@ use oxideav_core::{
     BlobKind, CodecId, CodecParameters, ContainerRegistry, MetadataBlob, PixelFormat, ReadSeek,
     StreamInfo, TimeBase, WriteSeek,
 };
-use oxideav_iff::{encode, DecodeOptions, EncodeOptions, IffChunk, IffForm, IffImage};
+use oxideav_iff::{DecodeOptions, EncodeOptions, IffChunk, IffForm, IffImage, encode};
 
 fn registry() -> ContainerRegistry {
     let mut reg = ContainerRegistry::new();

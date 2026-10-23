@@ -12,8 +12,8 @@
 //!   §3 (RGB8 §3.2 / RGBN §3.1 Turbo-Silver genlock-RLE bodies, §3.3 genlock).
 
 use oxideav_iff::ilbm::{
-    assemble_deep_tvdc, encode_deep, encode_rgb8, encode_rgbn, parse_deep, parse_rgb8, parse_rgbn,
-    DeepCompression, Dpel, GenlockPolicy,
+    DeepCompression, Dpel, GenlockPolicy, assemble_deep_tvdc, encode_deep, encode_rgb8,
+    encode_rgbn, parse_deep, parse_rgb8, parse_rgbn,
 };
 
 /// Wrap a list of `(id, payload)` chunks in an even-padded IFF FORM.
@@ -276,8 +276,7 @@ fn rgb8_encode_decode_round_trip_multi_row() {
 /// public encode → decode round-trip (the encoder splits, the decoder rejoins).
 #[test]
 fn rgb8_encode_decode_round_trip_long_run() {
-    let rgba: Vec<u8> = std::iter::repeat([0x7F, 0x00, 0x7F, 0xFF])
-        .take(200)
+    let rgba: Vec<u8> = std::iter::repeat_n([0x7F, 0x00, 0x7F, 0xFF], 200)
         .flatten()
         .collect();
     let file = encode_rgb8(200, 1, &rgba).unwrap();

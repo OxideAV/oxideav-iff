@@ -66,9 +66,9 @@
 
 use crate::error::{IffError as Error, Result};
 use crate::ilbm::{
-    byterun1_decode_row, byterun1_encode_row, expand_ehb_palette, expand_ham_row,
-    indices_to_planar_row, parse_ilbm_indexed, planar_row_to_indices, Bmhd, Camg, Compression,
-    IlbmImage, Masking,
+    Bmhd, Camg, Compression, IlbmImage, Masking, byterun1_decode_row, byterun1_encode_row,
+    expand_ehb_palette, expand_ham_row, indices_to_planar_row, parse_ilbm_indexed,
+    planar_row_to_indices,
 };
 
 /// Framework (`oxideav-core`) adapters: the `iff_anim` container demuxer,
@@ -78,7 +78,7 @@ use crate::ilbm::{
 #[cfg(feature = "registry")]
 mod framework;
 #[cfg(feature = "registry")]
-pub use framework::{register, AnimMuxer, AnimMuxerOp};
+pub use framework::{AnimMuxer, AnimMuxerOp, register};
 
 /// `ANHD` — Animation Header. 40-byte chunk per spec, but only a few
 /// fields drive decoding.
@@ -740,7 +740,7 @@ fn planar_to_rgba(
                 other => {
                     return Err(Error::unsupported(format!(
                         "ANIM HAM: unsupported plane count {other}"
-                    )))
+                    )));
                 }
             };
             expand_ham_row(&indices, &pal, bits)
@@ -749,11 +749,7 @@ fn planar_to_rgba(
                 .iter()
                 .map(|&i| {
                     let i = i as usize;
-                    if i < pal.len() {
-                        pal[i]
-                    } else {
-                        [0, 0, 0]
-                    }
+                    if i < pal.len() { pal[i] } else { [0, 0, 0] }
                 })
                 .collect()
         };
@@ -1172,7 +1168,7 @@ fn apply_op7(planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd, long_data: bool)
     let height = bmhd.height as usize;
     let data_size = if long_data { 4 } else { 2 };
 
-    if row_bytes % data_size != 0 {
+    if !row_bytes.is_multiple_of(data_size) {
         return Err(Error::invalid(format!(
             "ANIM op 7: row_bytes {row_bytes} not a multiple of data size {data_size}"
         )));
@@ -1314,7 +1310,7 @@ pub fn apply_op7_for_test(
 /// whole number of words (odd byte count) — op-8 columns are always at
 /// least word-aligned.
 fn op8_column_widths(row_bytes: usize, long_data: bool) -> Option<Vec<usize>> {
-    if row_bytes % 2 != 0 {
+    if !row_bytes.is_multiple_of(2) {
         return None;
     }
     if !long_data {
@@ -1325,7 +1321,7 @@ fn op8_column_widths(row_bytes: usize, long_data: bool) -> Option<Vec<usize>> {
     // column when the width is an odd number of words (half a long over).
     let full_longs = row_bytes / 4;
     let mut widths = vec![4usize; full_longs];
-    if row_bytes % 4 != 0 {
+    if !row_bytes.is_multiple_of(4) {
         // The trailing half-long (one WORD) column.
         widths.push(2);
     }
@@ -1628,7 +1624,7 @@ fn apply_op4(anhd: &Anhd, planar: &mut [Vec<u8>], delta: &[u8], bmhd: &Bmhd) -> 
     let word_size = if opts.long_data { 4 } else { 2 };
     let off_size = if opts.long_offsets { 4 } else { 2 };
 
-    if row_bytes % word_size != 0 {
+    if !row_bytes.is_multiple_of(word_size) {
         return Err(Error::invalid(format!(
             "ANIM op 4: row_bytes {row_bytes} not a multiple of data-word size {word_size}"
         )));
@@ -2478,7 +2474,7 @@ pub fn encode_op7_body(
             "ANIM op 7 encode: requires ≤ 8 colour planes (got {n_planes})"
         )));
     }
-    if row_bytes % data_size != 0 {
+    if !row_bytes.is_multiple_of(data_size) {
         return Err(Error::invalid(format!(
             "ANIM op 7 encode: row_bytes {row_bytes} not a multiple of data size {data_size}"
         )));
@@ -3168,7 +3164,7 @@ pub fn encode_op4_body(
             "ANIM op 4 encode: requires ≤ 8 colour planes (got {n_planes})"
         )));
     }
-    if row_bytes % word_size != 0 {
+    if !row_bytes.is_multiple_of(word_size) {
         return Err(Error::unsupported(format!(
             "ANIM op 4 encode: row_bytes {row_bytes} not a multiple of word size {word_size}"
         )));
@@ -3307,7 +3303,10 @@ pub fn encode_op4_body(
         if !plane_dirty[slot] {
             continue;
         }
-        debug_assert!(out.len() % 2 == 0, "op list must start word-aligned");
+        debug_assert!(
+            out.len().is_multiple_of(2),
+            "op list must start word-aligned"
+        );
         op_word_offsets[slot] = (out.len() / 2) as u32;
         out.append(list);
     }
@@ -3317,7 +3316,10 @@ pub fn encode_op4_body(
         if !plane_dirty[slot] {
             continue;
         }
-        debug_assert!(out.len() % 2 == 0, "data list must start word-aligned");
+        debug_assert!(
+            out.len().is_multiple_of(2),
+            "data list must start word-aligned"
+        );
         data_word_offsets[slot] = (out.len() / 2) as u32;
         out.append(list);
     }
@@ -3487,7 +3489,7 @@ pub fn encode_op23_body(
         )));
     }
     let plane_bytes = height * row_bytes;
-    if plane_bytes % word_size != 0 {
+    if !plane_bytes.is_multiple_of(word_size) {
         return Err(Error::unsupported(format!(
             "ANIM op 2/3 encode: plane size {plane_bytes} not a multiple of word size {word_size}"
         )));

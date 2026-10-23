@@ -10,7 +10,7 @@
 use std::io::Cursor;
 
 use oxideav_iff::chunk::{
-    self, parse_group_children, probe_top_level_group, prop_for_form_type, GroupChild, GroupKind,
+    self, GroupChild, GroupKind, parse_group_children, probe_top_level_group, prop_for_form_type,
 };
 
 /// `id + ckSize + body (+ pad)` — one wire chunk.

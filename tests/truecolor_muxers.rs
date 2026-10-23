@@ -15,7 +15,7 @@ use oxideav_core::{
     StreamInfo, TimeBase, WriteSeek,
 };
 
-use oxideav_iff::ilbm::{parse_deep_frames, DeepCompression, DeepMuxer, DeepMuxerCompression};
+use oxideav_iff::ilbm::{DeepCompression, DeepMuxer, DeepMuxerCompression, parse_deep_frames};
 
 fn registry() -> ContainerRegistry {
     let mut reg = ContainerRegistry::new();
@@ -169,8 +169,7 @@ fn deep_mux_auto_picks_runlength_for_flat_frames() {
     // A solid-colour frame compresses massively under ByteRun1; Auto must
     // pick the RUNLENGTH FORM.
     let stream = video_stream(64, 4, TimeBase::new(1, 1));
-    let rgba: Vec<u8> = std::iter::repeat([9u8, 9, 9, 255])
-        .take(64 * 4)
+    let rgba: Vec<u8> = std::iter::repeat_n([9u8, 9, 9, 255], 64 * 4)
         .flatten()
         .collect();
     let bytes = mux_frames("iff_deep", &stream, &[(rgba.clone(), 0, None)]);
@@ -218,9 +217,10 @@ fn deep_mux_rejects_bad_input() {
         .open_muxer("iff_deep", out, std::slice::from_ref(&stream))
         .unwrap();
     mux.write_header().unwrap();
-    assert!(mux
-        .write_packet(&rgba_packet(&stream, vec![0u8; 3], 0, None))
-        .is_err());
+    assert!(
+        mux.write_packet(&rgba_packet(&stream, vec![0u8; 3], 0, None))
+            .is_err()
+    );
 
     // Trailer with no frames.
     let out: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
@@ -234,16 +234,18 @@ fn deep_mux_rejects_bad_input() {
     let mut bad = video_stream(2, 2, TimeBase::new(1, 1));
     bad.params.pixel_format = None;
     let out: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
-    assert!(reg
-        .open_muxer("iff_deep", out, std::slice::from_ref(&bad))
-        .is_err());
+    assert!(
+        reg.open_muxer("iff_deep", out, std::slice::from_ref(&bad))
+            .is_err()
+    );
 
     // Oversized dimensions (IFF raster headers are 16-bit).
     let big = video_stream(70_000, 2, TimeBase::new(1, 1));
     let out: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
-    assert!(reg
-        .open_muxer("iff_deep", out, std::slice::from_ref(&big))
-        .is_err());
+    assert!(
+        reg.open_muxer("iff_deep", out, std::slice::from_ref(&big))
+            .is_err()
+    );
 }
 
 // ─────────────────────────── iff_rgb8 / iff_rgbn ───────────────────────────
@@ -300,7 +302,9 @@ fn rgbn_mux_roundtrips_nibble_replicated_colours() {
 /// The `Rgb24` bytes of an opaque RGBA buffer (what the native-layout
 /// demuxers emit for alpha-less pictures).
 fn strip_alpha(rgba: &[u8]) -> Vec<u8> {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect()
 }
@@ -333,9 +337,10 @@ fn muxers_accept_rgb24_and_pal8_rawvideo_streams() {
     bare.params.pixel_format = Some(PixelFormat::Pal8);
     let reg = registry();
     let ws: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
-    assert!(reg
-        .open_muxer("iff_rgb8", ws, std::slice::from_ref(&bare))
-        .is_err());
+    assert!(
+        reg.open_muxer("iff_rgb8", ws, std::slice::from_ref(&bare))
+            .is_err()
+    );
 }
 
 #[test]
@@ -349,7 +354,8 @@ fn rgb8_mux_is_single_frame() {
     mux.write_header().unwrap();
     mux.write_packet(&rgba_packet(&stream, vec![1, 2, 3, 255], 0, None))
         .unwrap();
-    assert!(mux
-        .write_packet(&rgba_packet(&stream, vec![4, 5, 6, 255], 1, None))
-        .is_err());
+    assert!(
+        mux.write_packet(&rgba_packet(&stream, vec![4, 5, 6, 255], 1, None))
+            .is_err()
+    );
 }

@@ -96,14 +96,14 @@ fn op8_short_skip_uniq_same_one_plane() {
     push_word(&mut ops, 0x0000); // Same sentinel
     push_word(&mut ops, 3); // count
     push_word(&mut ops, 0x1122); // value
-                                 // col 1
+    // col 1
     push_word(&mut ops, 1); // op_count
     push_word(&mut ops, 0x8002); // Uniq cnt=2
     push_word(&mut ops, 0x3344);
     push_word(&mut ops, 0x5566);
     // col 2
     push_word(&mut ops, 0); // op_count = 0
-                            // col 3
+    // col 3
     push_word(&mut ops, 2); // op_count = 2
     push_word(&mut ops, 0x0002); // Skip 2 rows
     push_word(&mut ops, 0x8001); // Uniq cnt=1

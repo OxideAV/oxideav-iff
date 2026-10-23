@@ -13,7 +13,7 @@
 //!   spec-documented values.
 
 use oxideav_iff::ilbm::{
-    encode_ilbm, parse_ilbm, Bmhd, Camg, Ccrt, Compression, Crng, IlbmImage, Masking,
+    Bmhd, Camg, Ccrt, Compression, Crng, IlbmImage, Masking, encode_ilbm, parse_ilbm,
 };
 
 fn make_indexed_image(palette: Vec<[u8; 3]>) -> IlbmImage {
