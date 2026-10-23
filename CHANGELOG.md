@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-iff/compare/v0.0.11...v0.0.12) - 2026-10-23
+
+### Other
+
+- edition 2024, MSRV 1.95
+- the true-colour containers carry the chunks too — iff_deep / iff_tvpp / iff_rgb8 / iff_rgbn declare iff-* stream blobs, the DEEP / RGB8 / RGBN muxers write them back
+- registry_path target + daily Fuzz workflow; hostile-input fixes it found — demuxer FORM-size underflow, RGBA working buffer sized before the BODY was checked, zero-plane / zero-width headers
+- the ilbm decoder labels the layout it emitted; ANIM per-frame timing pinned on decode_all and the iff_anim packets; ILBM mode → layout table
+- native chunks (ANNO / AUTH / (c) / NAME / TEXT / DPI / GRAB / DEST) carried on IffImage::chunks and as iff-* blobs through the registry; CAMG and aspect as blobs
+- the ilbm encoder declares its input layouts, takes an options schema, writes Gray8 as a grey palette and refuses undeclared layouts by type
+- palette alpha record (core 0.1.40) — transparent colour key rides the frame, encoder maps it back by one masking rule
+
 ### Added
 
 - Palette alpha on the registry path (core 0.1.40): the `ilbm` decoder
