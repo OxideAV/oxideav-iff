@@ -407,7 +407,11 @@ pub(crate) fn group_children(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     }
     let children = parse_group_children(group.kind, &bytes[12..end])?;
     let mut out = Vec::new();
-    collect_group_children(children, &[], 0, &mut out);
+    // Copying shared properties into every FORM multiplies them by the
+    // child count; a hostile LIST (one large PROP, many tiny FORMs) must
+    // not turn a small file into an unbounded allocation.
+    let mut budget = bytes.len().saturating_mul(8).max(1 << 20);
+    collect_group_children(children, &[], 0, &mut budget, &mut out)?;
     Ok(out)
 }
 
@@ -420,8 +424,9 @@ fn collect_group_children<'a>(
     children: Vec<GroupChild<'a>>,
     scope: &[([u8; 4], &'a [u8])],
     depth: usize,
+    budget: &mut usize,
     out: &mut Vec<Vec<u8>>,
-) {
+) -> Result<()> {
     // §5: a LIST's PROPs all come before its FORMs / LISTs / CATs and
     // apply to every one of them.
     let mut props = scope.to_vec();
@@ -442,7 +447,19 @@ fn collect_group_children<'a>(
             GroupKind::Form
                 if IffForm::from_form_type(&inner_type).is_some() || &inner_type == b"ANIM" =>
             {
-                let mut payload = inner_type.to_vec();
+                let shared_len: usize = props
+                    .iter()
+                    .filter(|(t, _)| *t == inner_type)
+                    .map(|(_, b)| b.len() + 1)
+                    .sum();
+                let need = 12 + shared_len + body.len();
+                *budget = budget.checked_sub(need).ok_or_else(|| {
+                    IffError::limit(
+                        "IFF: LIST shared properties would expand the group past 8x its size",
+                    )
+                })?;
+                let mut payload = Vec::with_capacity(need);
+                payload.extend_from_slice(&inner_type);
                 for (_, shared) in props.iter().filter(|(t, _)| *t == inner_type) {
                     payload.extend_from_slice(shared);
                     if shared.len() & 1 == 1 {
@@ -456,12 +473,13 @@ fn collect_group_children<'a>(
                 // A malformed nested group is skipped, like any other
                 // child that does not decode.
                 if let Ok(nested) = parse_group_children(kind, body) {
-                    collect_group_children(nested, &props, depth + 1, out);
+                    collect_group_children(nested, &props, depth + 1, budget, out)?;
                 }
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 enum TopLevel {

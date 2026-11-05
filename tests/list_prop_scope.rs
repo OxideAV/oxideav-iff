@@ -182,3 +182,21 @@ fn hostile_nesting_is_bounded() {
     }
     assert_eq!(indices(&decode(&g).unwrap()), indices(&a));
 }
+
+#[test]
+fn shared_property_amplification_is_bounded() {
+    // One 64 KiB PROP and 2000 empty FORMs: copying the PROP into every
+    // FORM would need ~128 MiB from an ~88 KiB file.
+    let prop = chunk(
+        b"PROP",
+        &[b"ILBM".to_vec(), chunk(b"ANNO", &vec![b'x'; 65_536])].concat(),
+    );
+    let kids: Vec<Vec<u8>> = std::iter::once(prop)
+        .chain(std::iter::repeat_n(form(b"ILBM", &[]), 2000))
+        .collect();
+    let list = group(b"LIST", b"ILBM", &kids);
+    assert!(matches!(
+        decode_all(&list),
+        Err(oxideav_iff::Error::LimitExceeded(_))
+    ));
+}

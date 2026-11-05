@@ -13,7 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   demuxer) apply a `LIST`'s `PROP` shared properties to the FORMs of
   their type in scope — copied in right after the FORM type id, outer
   scope first, so the FORM's own chunks override (EA IFF 85 §5) — and
-  descend into nested `LIST` / `CAT` groups (16 levels at most). A
+  descend into nested `LIST` / `CAT` groups (16 levels at most; the
+  copies are budgeted at 8× the group's size, `LimitExceeded` past it,
+  so one large `PROP` over many tiny FORMs cannot amplify). A
   `LIST` whose children carry only a `BODY` under a shared `PROP ILBM
   { BMHD CMAP }` used to decode nothing.
 - Dual-playfield compositing (`CAMG` `DUALPF` / `PFBA`, Amiga Hardware
