@@ -120,6 +120,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- ANIM: a `CMAP` in a delta frame now updates the master colormap for
+  that frame and every later one (anim.txt §1.1 / §1.3); it was skipped,
+  so palette-changing animations rendered every frame with the seed's
+  colours. `decode_all` reports each frame's own palette.
 - AIFF / AIFF-C stream codec id and sample format follow the sample
   point width (`ceil(sampleSize / 8)` bytes): 1–8-bit `NONE` / `twos`
   is `pcm_s8` / `S8` (was `pcm_s16be` / `S16`), 17–24-bit `pcm_s24be`,

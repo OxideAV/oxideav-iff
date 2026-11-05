@@ -894,16 +894,17 @@ pub fn decode_all_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<Frame>>
             let layout = planar_layout(&h);
             let (anim, indices) = parse_anim_indexed(bytes)?;
             let playback = anim.playback();
-            let effective: Vec<[u8; 3]> = match anim.frames.first() {
-                Some(seed) if layout.ehb && seed.palette.len() <= 32 => {
-                    expand_ehb_palette(&seed.palette)
-                }
-                Some(seed) => seed.palette.clone(),
-                None => Vec::new(),
-            };
             let mut out = Vec::with_capacity(anim.frames.len());
             for (i, (img, idx)) in anim.frames.into_iter().zip(indices).enumerate() {
-                let view = idx.map(|v| (v, effective.clone()));
+                // Each frame's own master colormap (a delta frame's CMAP
+                // replaces it from that frame on), EHB-expanded like the
+                // seed's.
+                let effective: Vec<[u8; 3]> = if layout.ehb && img.palette.len() <= 32 {
+                    expand_ehb_palette(&img.palette)
+                } else {
+                    img.palette.clone()
+                };
+                let view = idx.map(|v| (v, effective));
                 let mut image = ilbm_to_image(img, view, IffForm::Ilbm, &layout);
                 if let Some(child) = children.get(i) {
                     image.chunks = carried_chunks(child);

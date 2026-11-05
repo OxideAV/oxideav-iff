@@ -497,7 +497,6 @@ pub(crate) fn parse_anim_indexed(bytes: &[u8]) -> Result<(AnimImage, Vec<Option<
                     // ANHD + BODY.
                     let bmhd =
                         bmhd.ok_or_else(|| Error::invalid("ANIM: delta frame before any BMHD"))?;
-                    let palette = palette.clone();
                     let camg = camg;
                     let mut anhd: Option<Anhd> = None;
                     let mut delta_body: Option<Vec<u8>> = None;
@@ -525,7 +524,21 @@ pub(crate) fn parse_anim_indexed(bytes: &[u8]) -> Result<(AnimImage, Vec<Option<
                             b"BODY" | b"DLTA" => {
                                 delta_body = Some(bytes[cdata_start..cdata_end].to_vec())
                             }
-                            _ => {} // skip CMAP/DPI/etc on delta frames
+                            // §1.1 / §1.3: "A master colormap should be
+                            // kept for the entire ANIM … If a CMAP chunk
+                            // appears in one of the frames, then this
+                            // master colormap is updated and the new
+                            // colormap applies to all frames until the
+                            // occurrance of another CMAP chunk."
+                            b"CMAP" => {
+                                palette = bytes[cdata_start..cdata_end]
+                                    .as_chunks::<3>()
+                                    .0
+                                    .iter()
+                                    .map(|c| [c[0], c[1], c[2]])
+                                    .collect();
+                            }
+                            _ => {} // DPI etc. on delta frames are not frame state
                         }
                         sub = cdata_start + csize + (csize & 1);
                     }
