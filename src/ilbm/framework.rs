@@ -76,14 +76,32 @@ pub fn register(reg: &mut ContainerRegistry) {
 }
 
 pub(super) fn probe(p: &oxideav_core::ProbeData) -> u8 {
-    if p.buf.len() >= 12 && &p.buf[0..4] == b"FORM" {
-        match &p.buf[8..12] {
-            b"ILBM" | b"PBM " => 100,
-            _ => 0,
-        }
-    } else {
-        0
+    if p.buf.len() < 12 {
+        return 0;
     }
+    match (&p.buf[0..4], &p.buf[8..12]) {
+        (b"FORM", b"ILBM" | b"PBM ") => 100,
+        (b"CAT " | b"LIST", ct) if is_still_raster_type(ct) => 100,
+        // EA IFF 85 §5: a CAT's contents type is only a hint and may be
+        // four spaces for a mixed CAT — look at the first child instead.
+        (b"CAT ", b"    ")
+            if p.buf.len() >= 24
+                && &p.buf[12..16] == b"FORM"
+                && is_still_raster_type(&p.buf[20..24]) =>
+        {
+            100
+        }
+        _ => 0,
+    }
+}
+
+/// FORM types whose single picture the `ilbm` codec decodes (`ANIM` is
+/// a playback, demuxed by `iff_anim`).
+fn is_still_raster_type(ft: &[u8]) -> bool {
+    matches!(
+        ft,
+        b"ILBM" | b"PBM " | b"ACBM" | b"DEEP" | b"RGB8" | b"RGBN"
+    )
 }
 
 fn probe_acbm(p: &oxideav_core::ProbeData) -> u8 {
@@ -99,6 +117,9 @@ fn probe_acbm(p: &oxideav_core::ProbeData) -> u8 {
 fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     // Outer FORM.
     let hdr = read_chunk_header(&mut *input)?.ok_or_else(|| Error::invalid("ILBM: empty file"))?;
+    if &hdr.id == b"CAT " || &hdr.id == b"LIST" {
+        return open_group(input, hdr);
+    }
     if hdr.id != GROUP_FORM {
         return Err(Error::invalid(format!(
             "ILBM: expected FORM chunk, got {}",
@@ -150,6 +171,98 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
         form: Some(full),
         format: "iff_ilbm",
     }))
+}
+
+/// `CAT ` / `LIST` of raster pictures (EA IFF 85 §5): one `ilbm` packet
+/// per still raster `FORM` child (`ILBM` / `PBM ` / `ACBM` / `DEEP` /
+/// `RGB8` / `RGBN`), in document order, `pts` = child index in a
+/// one-per-picture time base. Children that do not decode are skipped
+/// (as in [`crate::decode_all`]), so every packet decodes. The stream
+/// parameters state the first picture's shape; children may differ in
+/// size and layout, which the `ilbm` decoder announces through
+/// `output_params()` / `output_params_generation()` as each such child
+/// is returned.
+fn open_group(
+    mut input: Box<dyn ReadSeek>,
+    hdr: crate::chunk::ChunkHeader,
+) -> Result<Box<dyn Demuxer>> {
+    let body_size = u64::from(hdr.size);
+    let mut body = Vec::new();
+    (&mut *input).take(body_size).read_to_end(&mut body)?;
+    if (body.len() as u64) < body_size {
+        return Err(Error::invalid(format!(
+            "IFF: {} declares {} bytes but the stream ends after {}",
+            hdr.id_str(),
+            body_size,
+            body.len()
+        )));
+    }
+    let mut full = Vec::with_capacity(8 + body.len());
+    full.extend_from_slice(&hdr.id);
+    full.extend_from_slice(&hdr.size.to_be_bytes());
+    full.extend_from_slice(&body);
+    let mut packets = std::collections::VecDeque::new();
+    let mut first: Option<StreamInfo> = None;
+    for child in crate::api::group_children(&full)? {
+        if !is_still_raster_type(&child[8..12]) {
+            continue;
+        }
+        // The first child's full description is the stream's; later
+        // children are only checked to decode.
+        let ok = if first.is_none() {
+            native_form_stream(&child).map(|s| first = Some(s)).is_ok()
+        } else {
+            crate::decode(&child).is_ok()
+        };
+        if ok {
+            packets.push_back(child);
+        }
+    }
+    let mut stream = first.ok_or_else(|| {
+        Error::unsupported(format!(
+            "IFF: {} holds no decodable raster FORM",
+            hdr.id_str()
+        ))
+    })?;
+    stream.duration = Some(packets.len() as i64);
+    Ok(Box::new(GroupDemuxer {
+        streams: vec![stream],
+        packets,
+        next_pts: 0,
+    }))
+}
+
+/// `iff_ilbm` over a `CAT ` / `LIST`: one `ilbm` packet per raster child.
+struct GroupDemuxer {
+    streams: Vec<StreamInfo>,
+    packets: std::collections::VecDeque<Vec<u8>>,
+    next_pts: i64,
+}
+
+impl Demuxer for GroupDemuxer {
+    fn format_name(&self) -> &str {
+        "iff_ilbm"
+    }
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+    fn next_packet(&mut self) -> Result<Packet> {
+        let form = self.packets.pop_front().ok_or(Error::Eof)?;
+        let stream = &self.streams[0];
+        let mut pkt = Packet::new(0, stream.time_base, form);
+        pkt.pts = Some(self.next_pts);
+        pkt.dts = Some(self.next_pts);
+        pkt.duration = Some(1);
+        pkt.flags.keyframe = true;
+        self.next_pts += 1;
+        Ok(pkt)
+    }
+    fn metadata(&self) -> &[(String, String)] {
+        &[]
+    }
+    fn duration_micros(&self) -> Option<i64> {
+        None
+    }
 }
 
 /// Stream description of a whole raster `FORM` handed to the `ilbm`
@@ -1217,10 +1330,26 @@ fn open_tvpp(
         deep_stream_timing(img.dchg.and_then(|d| d.delay_millis()), frame_count);
 
     let has_alpha = img.dpel.has_alpha();
+    if img
+        .layers
+        .iter()
+        .any(|l| (l.width, l.height) != (width, height))
+    {
+        let layers = img.layers.into_iter().map(|l| (l.width, l.height, l.rgba));
+        return varying_size_deep_demuxer(
+            layers,
+            has_alpha,
+            &full,
+            time_base,
+            frame_duration,
+            duration_us,
+        );
+    }
     let mut stream = true_color_stream(width, height, has_alpha);
     stream.time_base = time_base;
     stream.duration = Some(frame_duration.saturating_mul(frame_count));
     stream.params.blobs = form_chunk_blobs(&full);
+    stream.params.frame_rate = deep_frame_rate(frame_count, time_base, frame_duration);
 
     let frames: std::collections::VecDeque<Vec<u8>> = img
         .layers
@@ -1256,6 +1385,78 @@ fn deep_stream_timing(delay_millis: Option<u32>, frame_count: i64) -> (TimeBase,
         }
         None => (TimeBase::new(1, 1), 1, None),
     }
+}
+
+/// The stream frame rate a §1.6 `DCHG` delay states for a cel animation:
+/// one frame per `frame_duration` ticks of `time_base` (`1000 / delay`
+/// frames per second). A still picture, or a FORM without a literal
+/// delay, states none.
+fn deep_frame_rate(
+    frame_count: i64,
+    time_base: TimeBase,
+    frame_duration: i64,
+) -> Option<oxideav_core::Rational> {
+    (frame_count > 1 && time_base == TimeBase::new(1, 1000) && frame_duration > 0)
+        .then(|| oxideav_core::Rational::new(1000, frame_duration))
+}
+
+/// A DEEP / TVPP whose bodies differ in size (§1.3: a `DLOC` gives the
+/// width and height of the `DBOD` that follows it) cannot ride one
+/// `rawvideo` stream — `rawvideo` frames have no shape of their own. Such
+/// a FORM is demuxed as an `ilbm` codec stream instead: each body becomes
+/// a self-contained uncompressed `FORM DEEP` of its own size (the
+/// decoded pixels re-written losslessly, the FORM's carried chunks
+/// alongside), the stream parameters state the first body's shape, and
+/// the `ilbm` decoder announces each size change through
+/// `output_params()` / `output_params_generation()`.
+fn varying_size_deep_demuxer(
+    frames: impl Iterator<Item = (u16, u16, Vec<u8>)>,
+    has_alpha: bool,
+    full: &[u8],
+    time_base: TimeBase,
+    frame_duration: i64,
+    duration_us: Option<i64>,
+) -> Result<Box<dyn Demuxer>> {
+    let chunks = crate::api::carried_chunks(full);
+    let opts = crate::EncodeOptions::default()
+        .with_form(crate::IffForm::Deep)
+        .with_compression(Compression::None);
+    let mut packets = std::collections::VecDeque::new();
+    for (w, h, rgba) in frames {
+        let (format, data, stride) = if has_alpha {
+            (crate::IffPixelFormat::Rgba, rgba, usize::from(w) * 4)
+        } else {
+            (
+                crate::IffPixelFormat::Rgb24,
+                strip_alpha(rgba),
+                usize::from(w) * 3,
+            )
+        };
+        let mut image = crate::IffImage::new(
+            u32::from(w),
+            u32::from(h),
+            format,
+            vec![crate::Plane::new(stride, data)],
+        )?;
+        image.form = crate::IffForm::Deep;
+        image.chunks.clone_from(&chunks);
+        packets.push_back(crate::encode(&image, &opts)?);
+    }
+    let frame_count = packets.len() as i64;
+    let first = packets
+        .front()
+        .ok_or_else(|| Error::invalid("DEEP: missing DBOD chunk"))?;
+    let mut stream = native_form_stream(first)?;
+    stream.time_base = time_base;
+    stream.duration = Some(frame_duration.saturating_mul(frame_count));
+    stream.params.frame_rate = deep_frame_rate(frame_count, time_base, frame_duration);
+    Ok(Box::new(DeepDemuxer {
+        streams: vec![stream],
+        frames: packets,
+        next_pts: 0,
+        frame_duration,
+        duration_us,
+    }))
 }
 
 /// Locate the first DGBL chunk in an in-memory `FORM DEEP` and return its
@@ -1331,6 +1532,7 @@ fn open_deep(
         stream.time_base = time_base;
         stream.duration = Some(frame_duration.saturating_mul(frame_count));
         stream.params.blobs = form_chunk_blobs(&full);
+        stream.params.frame_rate = deep_frame_rate(frame_count, time_base, frame_duration);
 
         let frames: std::collections::VecDeque<Vec<u8>> =
             movie.frames.into_iter().map(|f| f.jfif).collect();
@@ -1356,10 +1558,29 @@ fn open_deep(
     // an alpha / opacity component, else `Rgb24` (what `crate::decode`
     // returns for the same FORM).
     let has_alpha = movie.dpel.has_alpha();
+    if movie
+        .frames
+        .iter()
+        .any(|f| (f.width, f.height) != (width, height))
+    {
+        let frames = movie
+            .frames
+            .into_iter()
+            .map(|f| (f.width, f.height, f.rgba));
+        return varying_size_deep_demuxer(
+            frames,
+            has_alpha,
+            &full,
+            time_base,
+            frame_duration,
+            duration_us,
+        );
+    }
     let mut stream = true_color_stream(width, height, has_alpha);
     stream.time_base = time_base;
     stream.duration = Some(frame_duration.saturating_mul(frame_count));
     stream.params.blobs = form_chunk_blobs(&full);
+    stream.params.frame_rate = deep_frame_rate(frame_count, time_base, frame_duration);
 
     let frames: std::collections::VecDeque<Vec<u8>> = movie
         .frames

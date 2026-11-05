@@ -27,8 +27,8 @@
 use std::io::Read;
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, CodecTag, ContainerRegistry, Demuxer, Error, Packet,
-    ProbeData, ReadSeek, Result, RuntimeContext, SampleFormat, StreamInfo, TimeBase,
+    ChannelLayout, CodecId, CodecParameters, CodecResolver, CodecTag, ContainerRegistry, Demuxer,
+    Error, Packet, ProbeData, ReadSeek, Result, RuntimeContext, SampleFormat, StreamInfo, TimeBase,
 };
 
 use crate::aiff::common::{
@@ -62,11 +62,22 @@ impl AiffDemuxer {
     /// translated into the [`Demuxer`] trait surface.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         let form = crate::aiff::form::parse(&bytes).map_err(map_aiff_error)?;
-        let mut params = CodecParameters::audio(codec_id_for(form.common.compression_type));
+        let ct = form.common.compression_type;
+        let mut params = CodecParameters::audio(codec_id_for(form.common.sample_size, ct));
         params.sample_rate = Some(form.common.sample_rate as u32);
         params.channels = Some(form.common.num_channels);
-        params.sample_format =
-            sample_format_for(form.common.sample_size, form.common.compression_type);
+        params.sample_format = sample_format_for(form.common.sample_size, ct);
+        params.channel_layout = channel_layout_for(form.common.num_channels);
+        // Uncompressed flavours: every sample point occupies
+        // ceil(sampleSize / 8) bytes, so the rate is exact.
+        if let Some(sf) = params.sample_format {
+            params.bit_rate = Some(
+                u64::from(form.common.num_channels)
+                    * sf.bytes_per_sample() as u64
+                    * 8
+                    * u64::from(form.common.sample_rate as u32),
+            );
+        }
         // Preserve the on-wire compressionType FourCC so a sibling
         // codec crate (oxideav-adpcm / oxideav-g711 / ...) can
         // resolve to the right decoder. AIFF v1.3 (no compressionType
@@ -174,19 +185,38 @@ fn probe(p: &ProbeData<'_>) -> u8 {
     }
 }
 
-/// Map the on-wire AIFF-C `compressionType` FourCC to the codec id
-/// the framework registry knows for that bitstream. For PCM flavours
-/// the id stays a generic `"pcm"` family; for compressed flavours the
-/// id matches a sibling codec crate. AIFF v1.3 (no compressionType)
-/// is treated as big-endian 16-bit PCM.
-fn codec_id_for(ct: Option<[u8; 4]>) -> CodecId {
-    let ct = match ct {
-        Some(c) => c,
-        None => return CodecId::new("pcm_s16be"),
+/// Map the on-wire AIFF-C `compressionType` FourCC (and, for the
+/// uncompressed flavours, `sampleSize`) to the codec id the framework
+/// registry knows for that bitstream. A sample point occupies
+/// `ceil(sampleSize / 8)` bytes, two's complement, left-justified
+/// (AIFF 1.3 / AIFF-C Sound Data Chunk), so the PCM id names that
+/// container width: `pcm_s8` (1–8 bits), `pcm_s16*` (9–16), `pcm_s24*`
+/// (17–24), `pcm_s32*` (25–32), big-endian for `NONE` / `twos`,
+/// little-endian for `sowt`. AIFF v1.3 (no compressionType) is `NONE`.
+/// Compressed flavours map to the sibling codec crate's id.
+fn codec_id_for(sample_size: u16, ct: Option<[u8; 4]>) -> CodecId {
+    let ct = ct.unwrap_or(*b"NONE");
+    let width = match sample_size {
+        1..=8 => Some(8),
+        9..=16 => Some(16),
+        17..=24 => Some(24),
+        25..=32 => Some(32),
+        _ => None,
     };
     match &ct {
-        b"NONE" | b"twos" => CodecId::new("pcm_s16be"),
-        b"sowt" => CodecId::new("pcm_s16le"),
+        b"NONE" | b"twos" | b"sowt" => {
+            let le = &ct == b"sowt";
+            match (width, le) {
+                (Some(8), _) => CodecId::new("pcm_s8"),
+                (Some(16), false) => CodecId::new("pcm_s16be"),
+                (Some(16), true) => CodecId::new("pcm_s16le"),
+                (Some(24), false) => CodecId::new("pcm_s24be"),
+                (Some(24), true) => CodecId::new("pcm_s24le"),
+                (Some(32), false) => CodecId::new("pcm_s32be"),
+                (Some(32), true) => CodecId::new("pcm_s32le"),
+                _ => CodecId::new("unknown"),
+            }
+        }
         b"raw " => CodecId::new("pcm_u8"),
         b"fl32" | b"FL32" => CodecId::new("pcm_f32be"),
         b"fl64" | b"FL64" => CodecId::new("pcm_f64be"),
@@ -206,15 +236,17 @@ fn codec_id_for(ct: Option<[u8; 4]>) -> CodecId {
     }
 }
 
-/// Map (sampleSize, compressionType) to an `oxideav-core` packed
-/// [`SampleFormat`]. Returns `None` for codecs that aren't pure-PCM
-/// (the decoded sample format is the codec's responsibility, not the
-/// container's).
+/// Map (sampleSize, compressionType) to the `oxideav-core` packed
+/// [`SampleFormat`] of the SSND sample points: the
+/// `ceil(sampleSize / 8)`-byte container (a 12-bit sample is a
+/// left-justified 16-bit word, so `S16`). Returns `None` for codecs
+/// that aren't pure PCM (the decoded sample format is the codec's
+/// responsibility, not the container's).
 fn sample_format_for(sample_size: u16, ct: Option<[u8; 4]>) -> Option<SampleFormat> {
     let ct = ct.unwrap_or(*b"NONE");
     match &ct {
         b"NONE" | b"twos" | b"sowt" => match sample_size {
-            1..=8 => Some(SampleFormat::S16), // promoted to 16-bit signed at decode
+            1..=8 => Some(SampleFormat::S8),
             9..=16 => Some(SampleFormat::S16),
             17..=24 => Some(SampleFormat::S24),
             25..=32 => Some(SampleFormat::S32),
@@ -223,6 +255,22 @@ fn sample_format_for(sample_size: u16, ct: Option<[u8; 4]>) -> Option<SampleForm
         b"raw " => Some(SampleFormat::U8),
         c if *c == COMPRESSION_FL32 || *c == COMPRESSION_FL32_UC => Some(SampleFormat::F32),
         c if *c == COMPRESSION_FL64 || *c == COMPRESSION_FL64_UC => Some(SampleFormat::F64),
+        _ => None,
+    }
+}
+
+/// The AIFF 1.3 Common Chunk multichannel conventions that name a
+/// standard layout: 1 channel mono, 2 stereo (left, right), 3 channels
+/// left / right / center. Four channels are ambiguous (quad is left,
+/// right, rear left, rear right; "4 channel" is left, center, right,
+/// surround) and six (left, left center, center, right, right center,
+/// surround) match no standard layout, so only the count is stated for
+/// those.
+fn channel_layout_for(num_channels: u16) -> Option<ChannelLayout> {
+    match num_channels {
+        1 => Some(ChannelLayout::Mono),
+        2 => Some(ChannelLayout::Stereo),
+        3 => Some(ChannelLayout::Surround30),
         _ => None,
     }
 }

@@ -108,3 +108,7 @@ required-features = ["registry"]
 name = "svx_voice"
 required-features = ["registry"]
 
+
+[[test]]
+name = "output_params"
+required-features = ["registry"]

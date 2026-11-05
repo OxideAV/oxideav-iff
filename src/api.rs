@@ -392,7 +392,7 @@ fn rewrap_form(payload: &[u8]) -> Vec<u8> {
 
 /// The raster `FORM` children of a top-level `CAT ` / `LIST`, re-wrapped
 /// with their headers. `PROP` sets and non-raster children are skipped.
-fn group_children(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+pub(crate) fn group_children(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     let group = probe_top_level_group(bytes)?
         .ok_or_else(|| IffError::invalid("IFF: not a FORM / CAT / LIST"))?;
     let end = (group.size as usize).saturating_add(8).min(bytes.len());

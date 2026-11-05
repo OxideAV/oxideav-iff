@@ -95,6 +95,14 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
         .iter()
         .map(|f| (f.start_jiffies as i64, f.duration_jiffies as i64))
         .collect();
+    // ANHD timing is per frame; the stream states a frame rate only when
+    // every frame stays up equally long (60 / reltime jiffies per second).
+    params.frame_rate = match timing.split_first() {
+        Some((&(_, d), rest)) if d > 0 && !rest.is_empty() && rest.iter().all(|t| t.1 == d) => {
+            Some(oxideav_core::Rational::new(60, d))
+        }
+        _ => None,
+    };
     let stream = StreamInfo {
         index: 0,
         time_base: TimeBase::new(1, 60),

@@ -47,8 +47,8 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat,
-    StreamInfo, TimeBase,
+    ChannelLayout, CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result,
+    SampleFormat, StreamInfo, TimeBase,
 };
 use oxideav_core::{ContainerRegistry, Demuxer, Muxer, ReadSeek, WriteSeek};
 
@@ -1251,6 +1251,8 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
 
     let mut vhdr: Option<VoiceHeader> = None;
     let mut channels: u16 = 1;
+    // The CHAN `sampletype`, when the voice carries one.
+    let mut chan: Option<u32> = None;
     let mut body_offset: u64 = 0;
     let mut body_size: u64 = 0;
     let mut metadata: Vec<(String, String)> = Vec::new();
@@ -1272,6 +1274,7 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
                 if body.len() >= 4 {
                     let v = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
                     channels = if v == 6 { 2 } else { 1 };
+                    chan = Some(v);
                     // A mono voice routed to one specific speaker is
                     // surfaced as metadata — the sample data itself is
                     // plain mono either way.
@@ -1380,6 +1383,15 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     params.sample_rate = Some(sample_rate);
     params.sample_format = Some(SampleFormat::S8);
     params.bit_rate = Some(8 * channels as u64 * sample_rate as u64);
+    // 8SVX.CHAN: STEREO is a LEFT-then-RIGHT pair; a voice without CHAN
+    // is a plain mono voice. A LEFT / RIGHT `sampletype` routes one
+    // channel to one speaker — no standard layout says that, so only
+    // the count is stated (the routing is in the stream metadata).
+    params.channel_layout = match (chan, channels) {
+        (Some(6), 2) => Some(ChannelLayout::Stereo),
+        (None, 1) => Some(ChannelLayout::Mono),
+        _ => None,
+    };
 
     let stream = StreamInfo {
         index: 0,

@@ -361,21 +361,65 @@ impl TryFrom<(&VideoFrame, &CodecParameters)> for IffImage {
 /// returns. `params.pixel_format` is not consulted; a consumer that
 /// wants packed RGBA converts downstream (or calls
 /// [`crate::decode_rgba8`] on the packet bytes).
+///
+/// Stream parameters (core 0.1.42 contract): `output_params()` answers
+/// `width` / `height` / `pixel_format` of the frame last returned, and
+/// `output_params_generation()` moves by one at each frame whose shape
+/// differs from the previous frame's (a `CAT ` / `LIST` child of
+/// another size or layout, a DEEP `DLOC` resize) — zero for a constant
+/// stream. Palettes and metadata ride the frame side-channels and are
+/// not shape changes.
 pub fn make_decoder(_params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
     Ok(Box::new(IffDecoder {
         codec_id: CodecId::new(CODEC_ID_STR),
-        pending: None,
-        emitted: None,
+        pending: std::collections::VecDeque::new(),
+        current: None,
+        generation: 0,
         eof: false,
     }))
 }
 
+/// The output-describing facts of one decoded picture: what
+/// [`Decoder::output_params`] reports for it. Two pictures of the same
+/// shape need no consumer reconfiguration even when their palettes or
+/// metadata differ (those ride the frame's side-channels).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputShape {
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+}
+
+impl OutputShape {
+    fn of(image: &IffImage) -> Self {
+        Self {
+            width: image.width,
+            height: image.height,
+            pixel_format: to_core_pixel_format(image.format),
+        }
+    }
+}
+
+/// The `ilbm` decoder. Every packet is a self-contained `FORM`, so the
+/// output shape is a property of each picture: a stream of `CAT ` /
+/// `LIST` children, a DEEP whose `DLOC`s change the body size, or a
+/// caller feeding unrelated files may change width, height or layout
+/// (`Pal8` indexed / EHB, `Rgb24` HAM / 24-bit / per-line palettes,
+/// `Rgba` mask plane) from one frame to the next.
+///
+/// `output_params()` describes the frame most recently returned by
+/// `receive_frame` (before the first frame: the first queued picture),
+/// and `output_params_generation()` moves by one exactly when a
+/// returned frame's shape differs from the previous returned frame's —
+/// never for a constant stream, and across [`Decoder::reset`] under the
+/// same rule (the last returned shape is the reference).
 struct IffDecoder {
     codec_id: CodecId,
-    pending: Option<VideoFrame>,
-    /// The layout of the last decoded picture — what
-    /// [`Decoder::output_pixel_format`] reports.
-    emitted: Option<PixelFormat>,
+    /// Decoded pictures not yet returned, with their shapes.
+    pending: std::collections::VecDeque<(VideoFrame, OutputShape)>,
+    /// Shape of the frame most recently returned by `receive_frame`.
+    current: Option<OutputShape>,
+    generation: u64,
     eof: bool,
 }
 
@@ -385,18 +429,43 @@ impl Decoder for IffDecoder {
     }
     fn send_packet(&mut self, packet: &Packet) -> oxideav_core::Result<()> {
         let image = crate::decode(&packet.data)?;
-        self.emitted = Some(to_core_pixel_format(image.format));
-        self.pending = Some(image_into_video_frame(image, packet.pts));
+        let shape = OutputShape::of(&image);
+        self.pending
+            .push_back((image_into_video_frame(image, packet.pts), shape));
         Ok(())
     }
-    /// The layout of the last picture decoded (`None` before the first
-    /// packet): the file decides it, not `params.pixel_format`.
+    /// The layout of the frame described by [`Decoder::output_params`]
+    /// (`None` before the first packet): the file decides it, not
+    /// `params.pixel_format`.
     fn output_pixel_format(&self) -> Option<PixelFormat> {
-        self.emitted
+        self.output_params().and_then(|p| p.pixel_format)
+    }
+    /// `width`, `height` and `pixel_format` of the frame most recently
+    /// returned (or, before the first frame, of the first decoded
+    /// picture). IFF signals no frame rate and no colour, so those stay
+    /// unset.
+    fn output_params(&self) -> Option<CodecParameters> {
+        let shape = self
+            .current
+            .or_else(|| self.pending.front().map(|(_, s)| *s))?;
+        let mut p = CodecParameters::video(self.codec_id.clone());
+        p.width = Some(shape.width);
+        p.height = Some(shape.height);
+        p.pixel_format = Some(shape.pixel_format);
+        Some(p)
+    }
+    fn output_params_generation(&self) -> u64 {
+        self.generation
     }
     fn receive_frame(&mut self) -> oxideav_core::Result<Frame> {
-        match self.pending.take() {
-            Some(f) => Ok(Frame::Video(f)),
+        match self.pending.pop_front() {
+            Some((f, shape)) => {
+                if self.current.is_some_and(|c| c != shape) {
+                    self.generation = self.generation.wrapping_add(1);
+                }
+                self.current = Some(shape);
+                Ok(Frame::Video(f))
+            }
             None => {
                 if self.eof {
                     Err(oxideav_core::Error::Eof)
@@ -408,6 +477,14 @@ impl Decoder for IffDecoder {
     }
     fn flush(&mut self) -> oxideav_core::Result<()> {
         self.eof = true;
+        Ok(())
+    }
+    /// Drop the queued pictures and accept packets again. The shape of
+    /// the last returned frame stays the reference, so the generation
+    /// moves after a seek only when the next returned frame differs.
+    fn reset(&mut self) -> oxideav_core::Result<()> {
+        self.pending.clear();
+        self.eof = false;
         Ok(())
     }
 }

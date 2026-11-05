@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Stream output parameters (core 0.1.42 contract): the `ilbm` decoder
+  implements `Decoder::output_params()` (`width` / `height` /
+  `pixel_format` of the frame last returned; before the first frame,
+  of the first queued picture) and `output_params_generation()`, which
+  moves by one exactly when a returned frame's shape differs from the
+  previous one — never for a constant stream (palette or metadata
+  changes are not shape changes), and across `reset()` with the last
+  returned shape as the reference. `output_pixel_format()` forwards to
+  it. Queued pictures are kept (a second `send_packet` before
+  `receive_frame` no longer drops the first) and `reset()` re-arms a
+  flushed decoder.
+- `iff_ilbm` demuxes `CAT ` / `LIST` groups of still raster FORMs
+  (`ILBM` / `PBM ` / `ACBM` / `DEEP` / `RGB8` / `RGBN`; EA IFF 85 §5,
+  including a blank-typed `CAT ` whose first child is one): one `ilbm`
+  packet per decodable child, `pts` = child index; the stream states
+  the first child's shape and the decoder announces each child of
+  another size or layout.
+- `iff_deep` / `iff_tvpp`: a FORM whose bodies differ in size (§1.3
+  `DLOC` per `DBOD`) is demuxed as an `ilbm` codec stream of
+  self-contained uncompressed `FORM DEEP` packets (pixels identical to
+  `decode_all`), so each resize is announced by the decoder instead of
+  `rawvideo` packets silently changing size; uniform FORMs stay
+  `rawvideo`.
+- Stream facts the headers state: `frame_rate` for a multi-frame DEEP /
+  TVPP with a `DCHG` delay (`1000 / delay`) and for an ANIM whose frames
+  all stay up equally long (`60 / reltime`); `channel_layout` for 8SVX
+  (`Mono` without `CHAN`, `Stereo` for `CHAN` STEREO) and AIFF (1 / 2 /
+  3 channels = mono / stereo / left-right-center, AIFF 1.3 channel
+  conventions); `bit_rate` for uncompressed AIFF.
+
 - Palette alpha on the registry path (core 0.1.40): the `ilbm` decoder
   attaches the frame's palette-alpha record for a `BMHD` transparent
   colour key (that entry 0, every other 255; no record for an opaque
@@ -68,6 +98,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of writing one.
 
 ### Fixed
+
+- AIFF / AIFF-C stream codec id and sample format follow the sample
+  point width (`ceil(sampleSize / 8)` bytes): 1–8-bit `NONE` / `twos`
+  is `pcm_s8` / `S8` (was `pcm_s16be` / `S16`), 17–24-bit `pcm_s24be`,
+  25–32-bit `pcm_s32be`, and `sowt` maps to the matching little-endian
+  id at every width (was `pcm_s16le` for all).
 
 - Hostile input (found by the new `registry_path` fuzz target and the
   round-477 `ilbm_decode` campaign): the `iff_ilbm` / `iff_acbm` /

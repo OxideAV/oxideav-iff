@@ -96,17 +96,41 @@ With the default-on `registry` feature the crate depends on
     decoder produces the frame with the palette side-channel. Through
     the registry a palette picture therefore decodes to `Pal8` +
     palette where it used to arrive as pre-expanded `Rgba`.
+  - `iff_ilbm` also opens a **`CAT ` / `LIST`** of still raster FORMs
+    (`ILBM` / `PBM ` / `ACBM` / `DEEP` / `RGB8` / `RGBN`, or a
+    blank-typed `CAT ` whose first child is one): one `ilbm` packet per
+    decodable child (`pts` = child index), the stream stating the first
+    child's shape.
   - `iff_deep`, `iff_tvpp`, `iff_rgb8`, `iff_rgbn` emit decoded
     `rawvideo` keyframes in `Rgb24` (opaque pictures — an RGB 8:8:8
     DPEL, the default genlock policy) or `Rgba` (a DPEL alpha / opacity
     component); `iff_deep` passes a §1.5b JPEG body through as `mjpeg`.
+    A DEEP / TVPP whose bodies differ in size (`DLOC` per `DBOD`) is an
+    `ilbm` codec stream instead — one self-contained uncompressed
+    `FORM DEEP` packet per body — since `rawvideo` frames carry no shape.
+    A multi-frame FORM with a `DCHG` delay states `frame_rate`.
   - `iff_anim` keeps its composited `Rgba` frames (an animation is a
-    playback, like GIF's `decode_all`).
+    playback, like GIF's `decode_all`; the ANIM spec fixes size and
+    display mode for the whole animation); `frame_rate` when every frame
+    stays up equally long.
   - The muxers accept the same layouts: `iff_ilbm` writes `ilbm`
     packets verbatim and encodes `rawvideo` `Rgba` / `Rgb24` / `Pal8`
     (+ palette `extradata`); the DEEP / RGB8 / RGBN / ANIM muxers take
     `rawvideo` in any of the three.
-  - `iff_8svx` and `aiff` are unchanged.
+  - `iff_8svx` emits `pcm_s8` with `channel_layout` `Mono` (no `CHAN`)
+    or `Stereo` (`CHAN` STEREO); `aiff` names the PCM id by the sample
+    point width (`pcm_s8`, `pcm_s16be` / `le`, `pcm_s24be` / `le`,
+    `pcm_s32be` / `le`, `pcm_u8`, `pcm_f32be`, `pcm_f64be`; compressed
+    flavours by FourCC), with `channel_layout` for 1 / 2 / 3 channels
+    and `bit_rate` for PCM.
+- **Stream parameters, never per frame** (core 0.1.42): the `ilbm`
+  decoder's `output_params()` is the `width` / `height` /
+  `pixel_format` of the frame last returned, and
+  `output_params_generation()` moves by one at each returned frame whose
+  shape differs from the previous one (a group child or DEEP body of
+  another size or layout) — never for a constant stream, palette
+  changes included, and across `reset()` under the same rule. Fold it
+  into the stream with `OutputParamsWatch`.
 
 ## Supported layouts
 
@@ -130,7 +154,7 @@ available and byte-identical to the document-model renderers):
 Which layout each `ILBM` / `ACBM` mode emits (the `BMHD` / `CAMG` /
 chunk facts that decide it, in the order the decoder checks them; the
 registry decoder labels the same layout through
-`Decoder::output_pixel_format`):
+`Decoder::output_params` / `output_pixel_format`):
 
 | ILBM mode | Decided by | Layout |
 |---|---|---|
