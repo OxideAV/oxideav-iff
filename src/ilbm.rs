@@ -355,6 +355,129 @@ pub enum PlayfieldPriority {
     Playfield2InFront,
 }
 
+/// Dual-playfield compositing of an indexed planar body (Amiga Hardware
+/// Reference Manual ch. 3, "Forming a Dual-playfield Display";
+/// `docs/image/iff/ahrm-dual-playfield.txt`, mapped onto `CAMG` in
+/// `iff-chunk-gaps-2026-09.md` §7):
+///
+/// * the odd hardware bitplanes 1, 3, 5 — BODY planes 0, 2, 4 — form
+///   playfield 1, the even ones 2, 4, 6 — BODY planes 1, 3, 5 —
+///   playfield 2, each playfield's lowest-numbered plane its least
+///   significant bit;
+/// * a playfield value `000` is transparent; playfield 1's value `v`
+///   selects colour register `v` (COLOR1–7), playfield 2's selects
+///   register `8 + v` (COLOR9–15; the high-resolution 2-plane tables
+///   are the same rule on two bits);
+/// * playfield 1 is in front unless `CAMG` `PFBA` (the `BPLCON2`
+///   `PF2PRI` bit) puts playfield 2 in front; the back playfield shows
+///   where the front one is transparent, and the background colour
+///   (COLOR0) where both are.
+///
+/// The composite is a colour-register number, so a dual-playfield
+/// picture stays a `Pal8` picture over the `CMAP`. It applies to a
+/// `CAMG` with `DUALPF` and neither HAM nor EHB, on 1–6 planes: the
+/// staged manual is the ECS edition and does not define the AGA
+/// per-playfield colour banks a deeper body would need, so 7- and
+/// 8-plane bodies keep the single-playfield reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)] // internal — shared by the ILBM / ACBM / ANIM codecs
+pub struct DualPlayfield {
+    /// `PFBA` set: playfield 2 in front.
+    pub pf2_in_front: bool,
+}
+
+impl DualPlayfield {
+    /// The compositing a body of `n_planes` planes under `camg` needs,
+    /// or `None` for a single-playfield (or HAM / EHB, or deeper than
+    /// six planes) body.
+    pub fn for_body(camg: Camg, n_planes: u8) -> Option<Self> {
+        (camg.is_dualpf() && !camg.is_ham() && !camg.is_ehb() && (1..=6).contains(&n_planes))
+            .then_some(Self {
+                pf2_in_front: camg.is_pfba(),
+            })
+    }
+
+    /// The two playfield values `(pf1, pf2)` of a raw planar pixel value
+    /// (BODY plane `p` = bit `p`).
+    pub fn playfields(raw: u8) -> (u8, u8) {
+        let pf1 = (raw & 1) | ((raw >> 1) & 2) | ((raw >> 2) & 4);
+        let pf2 = ((raw >> 1) & 1) | ((raw >> 2) & 2) | ((raw >> 3) & 4);
+        (pf1, pf2)
+    }
+
+    /// The colour register a raw planar pixel value displays.
+    pub fn composite(self, raw: u8) -> u8 {
+        let (pf1, pf2) = Self::playfields(raw);
+        let front_back = if self.pf2_in_front {
+            [(pf2, 8), (pf1, 0)]
+        } else {
+            [(pf1, 0), (pf2, 8)]
+        };
+        front_back
+            .iter()
+            .find(|(v, _)| *v != 0)
+            .map_or(0, |(v, base)| v + base)
+    }
+
+    /// Composite a row of raw planar values in place.
+    pub fn composite_row(self, row: &mut [u8]) {
+        for v in row {
+            *v = self.composite(*v);
+        }
+    }
+
+    /// The raw planar value that displays colour register `register`
+    /// under either priority (the other playfield transparent): `0` for
+    /// the background, playfield 1 for COLOR1–7, playfield 2 for
+    /// COLOR9–15. `None` for a register no playfield can show (COLOR8,
+    /// playfield 2's transparent slot, and 16 and up).
+    pub fn raw_for_register(register: u8) -> Option<u8> {
+        let spread =
+            |v: u8, shift: u8| -> u8 { ((v & 1) | ((v & 2) << 1) | ((v & 4) << 2)) << shift };
+        match register {
+            0..=7 => Some(spread(register, 0)),
+            9..=15 => Some(spread(register - 8, 1)),
+            _ => None,
+        }
+    }
+
+    /// `raw_for_register` limited to a body of `n_planes` planes.
+    pub fn raw_for_register_in(register: u8, n_planes: u8) -> Option<u8> {
+        Self::raw_for_register(register).filter(|&raw| u32::from(raw) < 1u32 << n_planes)
+    }
+
+    /// The fewest planes (at least 1) that hold the raw value of every
+    /// register in `registers`, or `None` when one is not displayable.
+    pub fn planes_for(registers: impl IntoIterator<Item = u8>) -> Option<u8> {
+        let mut max = 0u8;
+        for r in registers {
+            max = max.max(Self::raw_for_register(r)?);
+        }
+        Some((8 - max.leading_zeros() as u8).max(1))
+    }
+
+    /// Nearest displayable register to `rgb` in `palette` for a body of
+    /// `n_planes` planes, returned as its raw planar value.
+    pub fn nearest_raw(palette: &[[u8; 3]], n_planes: u8, rgb: [u8; 3]) -> u8 {
+        let mut best = (i32::MAX, 0u8);
+        for (i, p) in palette.iter().enumerate().take(16) {
+            let Some(raw) = Self::raw_for_register_in(i as u8, n_planes) else {
+                continue;
+            };
+            let d: i32 = (0..3)
+                .map(|c| {
+                    let e = i32::from(rgb[c]) - i32::from(p[c]);
+                    e * e
+                })
+                .sum();
+            if d < best.0 {
+                best = (d, raw);
+            }
+        }
+        best.1
+    }
+}
+
 /// Which planar pixel interpretation a decoder should use for an
 /// indexed ILBM/ACBM BODY — the output of
 /// [`Camg::resolve_planar_format`].
@@ -452,11 +575,8 @@ impl Camg {
     /// (the `LORESDPF_KEY` vs `LORESDPF2_KEY` mode-key pair encodes exactly
     /// this DUALPF-without/with-PFBA distinction).
     ///
-    /// Note this crate does **not** composite dual-playfield ILBMs: the
-    /// staged docs pin only these two mode bits, not the display rules a
-    /// compositor needs (which bitplanes feed which playfield, where
-    /// playfield 2's colors start in the CMAP, or how a playfield shows
-    /// through the one in front) — see the README for the documented gap.
+    /// The decoders composite dual-playfield bodies by these rules; see
+    /// [`DualPlayfield`].
     pub fn dual_playfield_priority(self) -> Option<PlayfieldPriority> {
         if !self.is_dualpf() {
             return None;
@@ -3131,6 +3251,18 @@ pub(crate) type IndexedView = Option<(Vec<u8>, Vec<[u8; 3]>)>;
 
 /// [`parse_ilbm`] plus the [`IndexedView`] of the decoded picture.
 pub(crate) fn parse_ilbm_indexed(bytes: &[u8]) -> Result<(IlbmImage, IndexedView)> {
+    parse_ilbm_indexed_with(bytes, true)
+}
+
+/// [`parse_ilbm_indexed`] whose index view holds the **raw planar
+/// values** of a dual-playfield body instead of the composited colour
+/// registers (the RGBA render is composited either way) — the planar
+/// state an ANIM delta chain is applied to.
+pub(crate) fn parse_ilbm_indexed_raw(bytes: &[u8]) -> Result<(IlbmImage, IndexedView)> {
+    parse_ilbm_indexed_with(bytes, false)
+}
+
+fn parse_ilbm_indexed_with(bytes: &[u8], composite_dual: bool) -> Result<(IlbmImage, IndexedView)> {
     if bytes.len() < 12 {
         return Err(Error::invalid("ILBM: file shorter than FORM header"));
     }
@@ -3459,6 +3591,7 @@ pub(crate) fn parse_ilbm_indexed(bytes: &[u8]) -> Result<(IlbmImage, IndexedView
         crngs,
         ccrts,
         drngs,
+        composite_dual,
     })
 }
 
@@ -3488,6 +3621,9 @@ struct IndexedPlanarParts {
     crngs: Vec<Crng>,
     ccrts: Vec<Ccrt>,
     drngs: Vec<Drng>,
+    /// `false`: the index view keeps a dual-playfield body's raw planar
+    /// values (see [`parse_ilbm_indexed_raw`]).
+    composite_dual: bool,
 }
 
 /// Compute the `mskLasso` transparent-pixel set (ilbm.txt §BMHD).
@@ -3586,6 +3722,7 @@ fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<(IlbmImage, Indexe
         crngs,
         ccrts,
         drngs,
+        composite_dual,
     } = parts;
 
     let width = bmhd.width as u32;
@@ -3610,6 +3747,11 @@ fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<(IlbmImage, Indexe
     let resolution = camg.resolve_planar_format(bmhd.n_planes, palette.len());
     let fmt_ham = resolution.format == InferredFormat::Ham;
     let fmt_ehb = resolution.format == InferredFormat::Ehb;
+    // Dual playfield: each pixel becomes the colour register the display
+    // shows (ahrm-dual-playfield.txt), before any palette lookup.
+    let dual_pf = (resolution.format == InferredFormat::Indexed && !resolution.inferred)
+        .then(|| DualPlayfield::for_body(camg, n_planes as u8))
+        .flatten();
     let do_lasso = bmhd.masking == Masking::Lasso && !fmt_ham && !has_mask_plane;
     // The single-palette `Pal8` view exists when every pixel is a plain
     // palette index resolved through one table: no HAM state machine,
@@ -3667,8 +3809,14 @@ fn render_indexed_planar(parts: IndexedPlanarParts) -> Result<(IlbmImage, Indexe
         let plane_refs: Vec<&[u8]> = (0..n_planes)
             .map(|p| rows_planar[row_base + p].as_slice())
             .collect();
-        let indices = planar_row_to_indices(&plane_refs, bmhd.width);
-        if do_lasso || want_indices {
+        let mut indices = planar_row_to_indices(&plane_refs, bmhd.width);
+        if !composite_dual && want_indices {
+            lasso_indices.extend_from_slice(&indices);
+        }
+        if let Some(dpf) = dual_pf {
+            dpf.composite_row(&mut indices);
+        }
+        if do_lasso || (want_indices && composite_dual) {
             lasso_indices.extend_from_slice(&indices);
         }
 
@@ -3974,6 +4122,7 @@ pub(crate) fn parse_acbm_indexed(bytes: &[u8]) -> Result<(IlbmImage, IndexedView
         crngs,
         ccrts,
         drngs,
+        composite_dual: true,
     })
 }
 
@@ -4430,6 +4579,7 @@ fn encode_indexed_planar_rows(image: &IlbmImage) -> Result<Vec<Vec<u8>>> {
     }
     let row_bytes = bmhd.row_bytes();
     let has_mask_plane = bmhd.masking == Masking::HasMask;
+    let dual_pf = DualPlayfield::for_body(image.camg, bmhd.n_planes);
     let mut planar_rows: Vec<Vec<u8>> =
         Vec::with_capacity(bmhd.height as usize * (n_planes + has_mask_plane as usize));
 
@@ -4480,10 +4630,22 @@ fn encode_indexed_planar_rows(image: &IlbmImage) -> Result<Vec<Vec<u8>>> {
             // Transparent-colour key: pixels whose alpha is below
             // 0x80 are written as the BMHD-declared transparent
             // index (the decoder zeros them on read).
-            *idx_slot = if use_transparent_key && a < 0x80 {
-                bmhd.transparent_color as u8
-            } else {
-                nearest_index(palette, r, g, b) as u8
+            *idx_slot = match dual_pf {
+                // Dual playfield: the raw planar value of the register
+                // (only registers a playfield can show are candidates).
+                Some(_) if use_transparent_key && a < 0x80 => {
+                    DualPlayfield::raw_for_register_in(bmhd.transparent_color as u8, bmhd.n_planes)
+                        .ok_or_else(|| {
+                            Error::unsupported(format!(
+                                "ILBM dual-playfield encode: transparent colour {} is not \
+                                 displayable on {} planes",
+                                bmhd.transparent_color, bmhd.n_planes
+                            ))
+                        })?
+                }
+                Some(_) => DualPlayfield::nearest_raw(palette, bmhd.n_planes, [r, g, b]),
+                None if use_transparent_key && a < 0x80 => bmhd.transparent_color as u8,
+                None => nearest_index(palette, r, g, b) as u8,
             };
             if a >= 0x80 {
                 let bi = x / 8;

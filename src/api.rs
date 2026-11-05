@@ -30,12 +30,12 @@ use crate::anim::{
 use crate::chunk::{GroupChild, GroupKind, parse_group_children, probe_top_level_group};
 use crate::error::{IffError, Result};
 use crate::ilbm::{
-    Bmhd, Camg, Compression, Dchg, DeepCType, DeepCompression, Dpel, DpelElement, GenlockPolicy,
-    IlbmImage, IndexedView, InferredFormat, Masking, Pchg, assemble_acbm_form, assemble_ilbm_form,
-    build_palette, build_palette_capped, encode_acbm, encode_deep_frames, encode_ilbm,
-    encode_rgb8 as encode_rgb8_form, encode_rgbn as encode_rgbn_form, expand_ehb_palette,
-    pack_body_resolving, parse_acbm_indexed, parse_deep_frames, parse_deep_frames_with_tvdc_table,
-    parse_ilbm_indexed, parse_rgb8, parse_rgbn, push_planar_row,
+    Bmhd, Camg, Compression, Dchg, DeepCType, DeepCompression, Dpel, DpelElement, DualPlayfield,
+    GenlockPolicy, IlbmImage, IndexedView, InferredFormat, Masking, Pchg, assemble_acbm_form,
+    assemble_ilbm_form, build_palette, build_palette_capped, encode_acbm, encode_deep_frames,
+    encode_ilbm, encode_rgb8 as encode_rgb8_form, encode_rgbn as encode_rgbn_form,
+    expand_ehb_palette, pack_body_resolving, parse_acbm_indexed, parse_deep_frames,
+    parse_deep_frames_with_tvdc_table, parse_ilbm_indexed, parse_rgb8, parse_rgbn, push_planar_row,
 };
 use crate::image::{
     Frame, IffChunk, IffForm, IffImage, ImageInfo, Palette, PixelFormat, Plane, RgbImage, RgbaImage,
@@ -1082,6 +1082,54 @@ fn bmhd_for(
     }
 }
 
+/// Bitplane count of a dual-playfield `Pal8` body: enough for the raw
+/// playfield split of every register the picture (and its transparent
+/// colour key) uses, at most six ([`DualPlayfield`]). A register no
+/// playfield can show (COLOR8, 16 and up) is refused.
+fn dual_playfield_planes(
+    image: &IffImage,
+    opts: &EncodeOptions,
+    masking: Masking,
+    key: u16,
+    label: &str,
+) -> Result<u8> {
+    let (w, h, stride) = (image.width as usize, image.height as usize, image.stride());
+    let data = image.data();
+    let mut used = [false; 256];
+    for y in 0..h {
+        for &i in &data[y * stride..y * stride + w] {
+            used[usize::from(i)] = true;
+        }
+    }
+    if masking == Masking::HasTransparentColor {
+        used[usize::from(key as u8)] = true;
+    }
+    let registers = (0..=255u8).filter(|&r| used[usize::from(r)]);
+    let need = DualPlayfield::planes_for(registers.clone()).ok_or_else(|| {
+        let bad = registers
+            .clone()
+            .find(|&r| DualPlayfield::raw_for_register(r).is_none())
+            .unwrap_or(8);
+        IffError::unsupported(format!(
+            "{label} dual-playfield encode: colour register {bad} is shown by neither \
+             playfield (COLOR1-7 = playfield 1, COLOR9-15 = playfield 2)"
+        ))
+    })?;
+    let n = opts
+        .n_planes
+        .or((1..=6).contains(&image.n_planes).then_some(image.n_planes))
+        .unwrap_or(need)
+        .max(need);
+    if n > 6 || opts.n_planes.is_some_and(|o| o < need) {
+        return Err(IffError::invalid(format!(
+            "{label} dual-playfield encode: {} bitplanes requested, the registers used \
+             need {need} (at most 6)",
+            opts.n_planes.unwrap_or(n)
+        )));
+    }
+    Ok(n)
+}
+
 /// `ILBM` / `PBM ` / `ACBM` from any layout.
 fn encode_planar_family(image: &IffImage, form: IffForm, opts: &EncodeOptions) -> Result<Vec<u8>> {
     let viewmode = opts.viewmode.or(image.viewmode).unwrap_or(0);
@@ -1113,8 +1161,15 @@ fn encode_planar_family(image: &IffImage, form: IffForm, opts: &EncodeOptions) -
             ));
         }
         let mut cmap = palette.to_rgb_triples();
+        // Dual playfield: each index is a colour register the composite
+        // must show, so the body stores its playfield split.
+        let dual = (form != IffForm::Pbm)
+            .then(|| DualPlayfield::for_body(camg, 6))
+            .flatten();
         let n_planes = if form == IffForm::Pbm {
             8
+        } else if dual.is_some() {
+            dual_playfield_planes(image, opts, masking, key, label)?
         } else if is_ehb {
             if cmap.len() > 64 {
                 return Err(IffError::unsupported(format!(
@@ -1161,10 +1216,21 @@ fn encode_planar_family(image: &IffImage, form: IffForm, opts: &EncodeOptions) -
         };
         let w = image.width as usize;
         let stride = image.stride();
-        let data = image.data();
+        let split: Vec<u8>;
+        let data = if dual.is_some() {
+            split = image
+                .data()
+                .iter()
+                .map(|&i| DualPlayfield::raw_for_register(i).unwrap_or(0))
+                .collect();
+            &split[..]
+        } else {
+            image.data()
+        };
         // A mask plane from the palette alpha: a pixel is opaque unless
         // its entry is transparent (alpha below `TRANSPARENT_BELOW`).
         let mask: Option<Vec<u8>> = (masking == Masking::HasMask).then(|| {
+            let data = image.data();
             (0..image.height as usize)
                 .flat_map(|y| data[y * stride..y * stride + w].iter())
                 .map(|&i| u8::from(!palette.is_transparent(i)))
@@ -1537,6 +1603,19 @@ fn encode_anim(frames: &[Frame], w: u16, h: u16, opts: &EncodeOptions) -> Result
         let mut p = palette;
         p.truncate(32);
         (p, 6)
+    } else if DualPlayfield::for_body(camg, 6).is_some() {
+        // Dual playfield: enough planes for every register a playfield
+        // can show among the CMAP's first 16 (COLOR8 never shows).
+        let shown = (0..palette.len().min(16) as u8)
+            .filter(|&r| DualPlayfield::raw_for_register(r).is_some());
+        let need = DualPlayfield::planes_for(shown).unwrap_or(1);
+        let n = opts.n_planes.unwrap_or(need);
+        if !(1..=6).contains(&n) {
+            return Err(IffError::invalid(format!(
+                "ANIM dual-playfield encode: {n} bitplanes, a dual playfield has 1..=6"
+            )));
+        }
+        (palette, n)
     } else {
         let need = planes_for(palette.len());
         let n = opts.n_planes.unwrap_or(need);

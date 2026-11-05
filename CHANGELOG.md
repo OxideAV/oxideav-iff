@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dual-playfield compositing (`CAMG` `DUALPF` / `PFBA`, Amiga Hardware
+  Reference Manual ch. 3 as staged in `ahrm-dual-playfield.txt`): ILBM /
+  ACBM / ANIM bodies of 1–6 planes without HAM / EHB decode to the
+  colour register the display shows — BODY planes 0 / 2 / 4 = playfield
+  1 (COLOR1–7), 1 / 3 / 5 = playfield 2 (COLOR9–15), value 0
+  transparent, playfield 1 in front unless `PFBA`, COLOR0 behind both —
+  as `Pal8`; ANIM deltas apply to the raw planar state behind it. The
+  `Pal8` encoders write the playfield split (fewest planes, ≤ 6; COLOR8
+  and 16+ refused as undisplayable) and round-trip index-for-index; the
+  RGB, document-model and ANIM encoders quantise to displayable
+  registers. 7- / 8-plane `DUALPF` keeps the single-playfield reading
+  (AGA colour banks are not in the staged manual).
 - Stream output parameters (core 0.1.42 contract): the `ilbm` decoder
   implements `Decoder::output_params()` (`width` / `height` /
   `pixel_format` of the frame last returned; before the first frame,

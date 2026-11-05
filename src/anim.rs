@@ -66,9 +66,9 @@
 
 use crate::error::{IffError as Error, Result};
 use crate::ilbm::{
-    Bmhd, Camg, Compression, IlbmImage, Masking, byterun1_decode_row, byterun1_encode_row,
-    expand_ehb_palette, expand_ham_row, indices_to_planar_row, parse_ilbm_indexed,
-    planar_row_to_indices,
+    Bmhd, Camg, Compression, DualPlayfield, IlbmImage, Masking, byterun1_decode_row,
+    byterun1_encode_row, expand_ehb_palette, expand_ham_row, indices_to_planar_row,
+    parse_ilbm_indexed, parse_ilbm_indexed_raw, planar_row_to_indices,
 };
 
 /// Framework (`oxideav-core`) adapters: the `iff_anim` container demuxer,
@@ -476,9 +476,19 @@ pub(crate) fn parse_anim_indexed(bytes: &[u8]) -> Result<(AnimImage, Vec<Option<
                     // pattern and corrupt every delta applied to it);
                     // HAM / masked / per-line-palette seeds fall back to
                     // the nearest-palette re-pack.
-                    planar_history.push(match &indexed {
-                        Some((indices, _)) => indices_to_planar(indices, &img.bmhd),
-                        None => rgba_to_planar(&img),
+                    // A dual-playfield seed's indices are composited
+                    // colour registers; the delta chain needs the raw
+                    // planar values behind them.
+                    let raw = if DualPlayfield::for_body(img.camg, img.bmhd.n_planes).is_some() {
+                        parse_ilbm_indexed_raw(&full)?.1
+                    } else {
+                        None
+                    };
+                    planar_history.push(match (&raw, &indexed) {
+                        (Some((indices, _)), _) | (None, Some((indices, _))) => {
+                            indices_to_planar(indices, &img.bmhd)
+                        }
+                        (None, None) => rgba_to_planar(&img),
                     });
                     frame_indices.push(indexed.map(|(indices, _)| indices));
                     frames.push(img);
@@ -656,6 +666,7 @@ fn rgba_to_planar(image: &IlbmImage) -> Vec<Vec<u8>> {
     } else {
         image.palette.clone()
     };
+    let dual_pf = DualPlayfield::for_body(image.camg, bmhd.n_planes);
     let mut out: Vec<Vec<u8>> =
         Vec::with_capacity(bmhd.height as usize * (n_planes + has_mask as usize));
     for y in 0..bmhd.height as usize {
@@ -667,20 +678,26 @@ fn rgba_to_planar(image: &IlbmImage) -> Vec<Vec<u8>> {
             let g = image.rgba[src + 1];
             let b = image.rgba[src + 2];
             let a = image.rgba[src + 3];
-            // Nearest match.
-            let mut best = 0usize;
-            let mut best_d = i32::MAX;
-            for (i, p) in pal.iter().enumerate() {
-                let dr = r as i32 - p[0] as i32;
-                let dg = g as i32 - p[1] as i32;
-                let db = b as i32 - p[2] as i32;
-                let d = dr * dr + dg * dg + db * db;
-                if d < best_d {
-                    best_d = d;
-                    best = i;
+            if dual_pf.is_some() {
+                // Dual playfield: only the registers a playfield can
+                // show, written as their raw planar value.
+                indices[x] = DualPlayfield::nearest_raw(&pal, bmhd.n_planes, [r, g, b]);
+            } else {
+                // Nearest match.
+                let mut best = 0usize;
+                let mut best_d = i32::MAX;
+                for (i, p) in pal.iter().enumerate() {
+                    let dr = r as i32 - p[0] as i32;
+                    let dg = g as i32 - p[1] as i32;
+                    let db = b as i32 - p[2] as i32;
+                    let d = dr * dr + dg * dg + db * db;
+                    if d < best_d {
+                        best_d = d;
+                        best = i;
+                    }
                 }
+                indices[x] = best as u8;
             }
-            indices[x] = best as u8;
             if a >= 0x80 {
                 let bi = x / 8;
                 let bit = 7 - (x % 8);
@@ -724,12 +741,16 @@ fn planar_to_rgba(
     } else {
         palette.to_vec()
     };
+    let dual_pf = DualPlayfield::for_body(*camg, bmhd.n_planes);
     for y in 0..bmhd.height as usize {
         let row_base = y * planes_per_row;
         let plane_refs: Vec<&[u8]> = (0..n_planes)
             .map(|p| planar[row_base + p].as_slice())
             .collect();
-        let indices = planar_row_to_indices(&plane_refs, bmhd.width);
+        let mut indices = planar_row_to_indices(&plane_refs, bmhd.width);
+        if let Some(dpf) = dual_pf {
+            dpf.composite_row(&mut indices);
+        }
         if want_indices {
             all_indices.extend_from_slice(&indices);
         }
@@ -3855,6 +3876,7 @@ fn encode_full_body(image: &IlbmImage) -> Result<Vec<u8>> {
     } else {
         image.palette.clone()
     };
+    let dual_pf = DualPlayfield::for_body(image.camg, bmhd.n_planes);
     let mut out =
         Vec::with_capacity(bmhd.height as usize * (n_planes + has_mask as usize) * row_bytes);
     for y in 0..bmhd.height as usize {
@@ -3866,19 +3888,23 @@ fn encode_full_body(image: &IlbmImage) -> Result<Vec<u8>> {
             let g = image.rgba[src + 1];
             let b = image.rgba[src + 2];
             let a = image.rgba[src + 3];
-            let mut best = 0usize;
-            let mut best_d = i32::MAX;
-            for (i, p) in pal.iter().enumerate() {
-                let dr = r as i32 - p[0] as i32;
-                let dg = g as i32 - p[1] as i32;
-                let db = b as i32 - p[2] as i32;
-                let d = dr * dr + dg * dg + db * db;
-                if d < best_d {
-                    best_d = d;
-                    best = i;
+            if dual_pf.is_some() {
+                indices[x] = DualPlayfield::nearest_raw(&pal, bmhd.n_planes, [r, g, b]);
+            } else {
+                let mut best = 0usize;
+                let mut best_d = i32::MAX;
+                for (i, p) in pal.iter().enumerate() {
+                    let dr = r as i32 - p[0] as i32;
+                    let dg = g as i32 - p[1] as i32;
+                    let db = b as i32 - p[2] as i32;
+                    let d = dr * dr + dg * dg + db * db;
+                    if d < best_d {
+                        best_d = d;
+                        best = i;
+                    }
                 }
+                indices[x] = best as u8;
             }
-            indices[x] = best as u8;
             if a >= 0x80 {
                 let bi = x / 8;
                 let bit = 7 - (x % 8);

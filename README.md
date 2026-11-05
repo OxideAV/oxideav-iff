@@ -745,14 +745,27 @@ Read + round-trip support for `FORM / ILBM`:
   an `Option<`[`ilbm::PlayfieldPriority`]`>` (`None` outside DUALPF;
   PFBA set = "playfield 2 has display priority over playfield 1", clear
   = playfield 1 in front — the same distinction the `LORESDPF_KEY` /
-  `LORESDPF2_KEY` mode-key pair encodes). **Compositing a dual-playfield
-  ILBM is not implemented**: the staged references pin only the flag
-  meanings, not the display rules a compositor needs — which bitplanes
-  feed which playfield, where playfield 2's colors start in the CMAP,
-  and how the back playfield shows through the front one. Until those
-  rules are staged, a DUALPF image decodes as the flat indexed image its
-  BODY stores (all planes as one index), with the flags exposed so a
-  caller can detect the case.
+  `LORESDPF2_KEY` mode-key pair encodes). **Dual-playfield bodies are
+  composited** by the Amiga Hardware Reference Manual's rules
+  (`docs/image/iff/ahrm-dual-playfield.txt`): BODY planes 0 / 2 / 4
+  (hardware planes 1 / 3 / 5) form playfield 1, planes 1 / 3 / 5
+  playfield 2; a playfield value of 0 is transparent, playfield 1 shows
+  COLOR1–7 and playfield 2 COLOR9–15; playfield 1 is in front unless
+  `PFBA`, the back playfield shows through the front one's transparent
+  pixels and COLOR0 shows where both are transparent. The result is the
+  colour register the display shows, so a dual-playfield picture
+  decodes as `Pal8` over the `CMAP` (the transparent-colour key and the
+  lasso fill apply to that register), the RGBA render looks it up, and
+  ANIM deltas apply to the raw planes behind it. It applies to 1–6
+  planes without HAM / EHB; 7- and 8-plane `DUALPF` bodies keep the
+  single-playfield reading (the staged manual is the ECS edition and
+  does not cover the AGA per-playfield colour banks). The encoders
+  invert it: a `Pal8` picture with a `DUALPF` viewmode is written as
+  its playfield split (COLOR1–7 on playfield 1, COLOR9–15 on
+  playfield 2, the fewest planes that hold them, at most six) and
+  decodes back index-for-index; COLOR8 and registers 16+ are shown by
+  no playfield and are refused. The RGB / ANIM encoders quantise to
+  the displayable registers only.
 
 - Public API: [`ilbm::parse_ilbm`], [`ilbm::encode_ilbm`],
   [`ilbm::IlbmImage`], [`ilbm::Bmhd`], [`ilbm::Camg`],
