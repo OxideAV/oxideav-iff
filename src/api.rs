@@ -391,7 +391,13 @@ fn rewrap_form(payload: &[u8]) -> Vec<u8> {
 }
 
 /// The raster `FORM` children of a top-level `CAT ` / `LIST`, re-wrapped
-/// with their headers. `PROP` sets and non-raster children are skipped.
+/// with their headers, in document order. Nested `LIST` / `CAT` groups
+/// are walked too, and a `LIST`'s `PROP`s apply to the FORMs in its
+/// scope (EA IFF 85 §5): "shared properties are semantically equivalent
+/// to copying those properties into each of the nested FORMs right after
+/// their FORM type IDs", outer scopes first, so a FORM's own chunk of
+/// the same id — read later — overrides the shared one. Non-raster
+/// children are skipped.
 pub(crate) fn group_children(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     let group = probe_top_level_group(bytes)?
         .ok_or_else(|| IffError::invalid("IFF: not a FORM / CAT / LIST"))?;
@@ -401,23 +407,61 @@ pub(crate) fn group_children(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     }
     let children = parse_group_children(group.kind, &bytes[12..end])?;
     let mut out = Vec::new();
+    collect_group_children(children, &[], 0, &mut out);
+    Ok(out)
+}
+
+/// Nesting bound for [`group_children`]: deeper `LIST` / `CAT` groups are
+/// skipped (§5 notes CATs are "rarely nested"; the bound keeps hostile
+/// input from recursing without limit).
+const MAX_GROUP_DEPTH: usize = 16;
+
+fn collect_group_children<'a>(
+    children: Vec<GroupChild<'a>>,
+    scope: &[([u8; 4], &'a [u8])],
+    depth: usize,
+    out: &mut Vec<Vec<u8>>,
+) {
+    // §5: a LIST's PROPs all come before its FORMs / LISTs / CATs and
+    // apply to every one of them.
+    let mut props = scope.to_vec();
+    props.extend(children.iter().filter_map(|c| match c {
+        GroupChild::Prop { form_type, body } => Some((*form_type, *body)),
+        GroupChild::Group { .. } => None,
+    }));
     for child in children {
-        if let GroupChild::Group {
-            kind: GroupKind::Form,
+        let GroupChild::Group {
+            kind,
             inner_type,
             body,
         } = child
-            && (IffForm::from_form_type(&inner_type).is_some() || &inner_type == b"ANIM")
-        {
-            let mut full = Vec::with_capacity(12 + body.len());
-            full.extend_from_slice(b"FORM");
-            full.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
-            full.extend_from_slice(&inner_type);
-            full.extend_from_slice(body);
-            out.push(full);
+        else {
+            continue;
+        };
+        match kind {
+            GroupKind::Form
+                if IffForm::from_form_type(&inner_type).is_some() || &inner_type == b"ANIM" =>
+            {
+                let mut payload = inner_type.to_vec();
+                for (_, shared) in props.iter().filter(|(t, _)| *t == inner_type) {
+                    payload.extend_from_slice(shared);
+                    if shared.len() & 1 == 1 {
+                        payload.push(0);
+                    }
+                }
+                payload.extend_from_slice(body);
+                out.push(rewrap_form(&payload));
+            }
+            GroupKind::List | GroupKind::Cat if depth < MAX_GROUP_DEPTH => {
+                // A malformed nested group is skipped, like any other
+                // child that does not decode.
+                if let Ok(nested) = parse_group_children(kind, body) {
+                    collect_group_children(nested, &props, depth + 1, out);
+                }
+            }
+            _ => {}
         }
     }
-    Ok(out)
 }
 
 enum TopLevel {

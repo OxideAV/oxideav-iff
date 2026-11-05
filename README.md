@@ -100,7 +100,9 @@ With the default-on `registry` feature the crate depends on
     (`ILBM` / `PBM ` / `ACBM` / `DEEP` / `RGB8` / `RGBN`, or a
     blank-typed `CAT ` whose first child is one): one `ilbm` packet per
     decodable child (`pts` = child index), the stream stating the first
-    child's shape.
+    child's shape. Nested `LIST` / `CAT` groups are walked and a
+    `LIST`'s `PROP`s are copied into each FORM of their type right after
+    its type id (EA IFF 85 §5; the FORM's own chunks override).
   - `iff_deep`, `iff_tvpp`, `iff_rgb8`, `iff_rgbn` emit decoded
     `rawvideo` keyframes in `Rgb24` (opaque pictures — an RGB 8:8:8
     DPEL, the default genlock policy) or `Rgba` (a DPEL alpha / opacity
@@ -149,7 +151,7 @@ available and byte-identical to the document-model renderers):
 | `DEEP` | `DPEL` with / without ALPHA or OPACITY | `Rgba` / `Rgb24` | components scaled to 8 bits (top 8 bits of deeper ones); NOCOMPRESSION, RUNLENGTH, TVDC with `DecodeOptions::tvdc_table` |
 | `RGB8` / `RGBN` | Turbo Silver genlock RLE | `Rgb24` (`Rgba` under `GenlockPolicy::BrushTransparency`) | RGBN guns are 4-bit, nibble-replicated |
 | `ANIM` | ops 0, 1, 2, 3, 4, 5, 7, 8 | as the seed frame (`Pal8` unless HAM / masked) | `decode` = seed frame, `decode_all` = every frame with its display duration |
-| `CAT ` / `LIST` | raster `FORM` children | each child's own layout | `decode` = first child, `decode_all` = all decodable children |
+| `CAT ` / `LIST` | raster `FORM` children (nested groups walked, `LIST` `PROP`s applied) | each child's own layout | `decode` = first child, `decode_all` = all decodable children |
 
 Which layout each `ILBM` / `ACBM` mode emits (the `BMHD` / `CAMG` /
 chunk facts that decide it, in the order the decoder checks them; the

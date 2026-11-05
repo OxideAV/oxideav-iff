@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `CAT ` / `LIST` walks (`decode`, `decode_all`, the `iff_ilbm` group
+  demuxer) apply a `LIST`'s `PROP` shared properties to the FORMs of
+  their type in scope — copied in right after the FORM type id, outer
+  scope first, so the FORM's own chunks override (EA IFF 85 §5) — and
+  descend into nested `LIST` / `CAT` groups (16 levels at most). A
+  `LIST` whose children carry only a `BODY` under a shared `PROP ILBM
+  { BMHD CMAP }` used to decode nothing.
 - Dual-playfield compositing (`CAMG` `DUALPF` / `PFBA`, Amiga Hardware
   Reference Manual ch. 3 as staged in `ahrm-dual-playfield.txt`): ILBM /
   ACBM / ANIM bodies of 1–6 planes without HAM / EHB decode to the

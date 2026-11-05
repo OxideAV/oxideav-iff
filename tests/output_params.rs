@@ -829,3 +829,49 @@ fn aiff_codec_id_follows_the_sample_point_width() {
         );
     }
 }
+
+/// The padded wire bytes of the chunks of `form` whose id is in `ids`.
+fn pick(form: &[u8], ids: &[&[u8; 4]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pos = 12;
+    while pos + 8 <= form.len() {
+        let id: [u8; 4] = form[pos..pos + 4].try_into().unwrap();
+        let size = u32::from_be_bytes(form[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let end = (pos + 8 + size + (size & 1)).min(form.len());
+        if ids.contains(&&id) {
+            out.extend_from_slice(&form[pos..end]);
+        }
+        pos = end;
+    }
+    out
+}
+
+#[test]
+fn list_prop_children_demux_with_the_shared_header() {
+    // PROP ILBM { BMHD CMAP } shared by two body-only FORMs; a third
+    // FORM overrides BMHD + CMAP with its own (another size).
+    let a = indexed(6, 4, 4, 0);
+    let other = indexed(3, 2, 4, 9);
+    let prop = chunk(
+        b"PROP",
+        &[b"ILBM".to_vec(), pick(&a, &[b"BMHD", b"CMAP"])].concat(),
+    );
+    let body_only = form(b"ILBM", &[pick(&a, &[b"BODY"])]);
+    let own = form(b"ILBM", &[pick(&other, &[b"BMHD", b"CMAP", b"BODY"])]);
+    let bytes = chunk(
+        b"LIST",
+        &[b"ILBM".to_vec(), prop, body_only.clone(), body_only, own].concat(),
+    );
+    let (declared, run) = demux_and_decode(&bytes, "iff_ilbm");
+    assert_eq!((declared.width, declared.height), (Some(6), Some(4)));
+    assert_eq!(
+        run.shapes,
+        vec![
+            (6, 4, PixelFormat::Pal8),
+            (6, 4, PixelFormat::Pal8),
+            (3, 2, PixelFormat::Pal8)
+        ]
+    );
+    assert_eq!(run.generations, vec![0, 0, 1]);
+    assert_eq!(run.changes, vec![2]);
+}
