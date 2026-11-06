@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- In-band shape announcements (core 0.1.43 `Frame::StreamParams`): the
+  `ilbm` decoder returns one `Frame::StreamParams` event immediately
+  before the first frame of each new shape (a `CAT ` / `LIST` child of
+  another size or layout, a DEEP / TVPP `DLOC` resize, mask on / off,
+  HAM / EHB / 24-bit switches) — never for the first shape or a
+  constant stream. When it is returned `output_params()` already
+  answers the new shape (the payload equals it) and
+  `output_params_generation()` has moved by one, so the counter and the
+  events agree 1:1; draining after `flush()` keeps old-shape frames
+  ahead of the event, and after `reset()` the last announced shape is
+  the reference. `receive_arena_frame` skips the event (core default).
+- The `ilbm` encoder re-configures on a `Frame::StreamParams` event:
+  the new `width` / `height` / `pixel_format` (unset fields kept) drive
+  the next `FORM`, `output_params()` follows (palette `extradata`
+  refined from the next written FORM); a non-video event or a layout
+  outside `ENCODER_PIXEL_FORMATS` is refused with `Unsupported`,
+  leaving the encoder as it was.
+- The `iff_ilbm` muxer takes several `ilbm` packets: one is still
+  written verbatim, several are gathered into a `CAT ` (EA IFF 85 §5)
+  whose contents type is the children's common FORM type, or four
+  spaces when they mix kinds — so an encoded stream whose shape changes
+  mid-way round-trips through the group demuxer. A packet that is not a
+  raster FORM is refused at `write_packet`.
+
+Shapes that stay constant: ANIM is demuxed as composited `rawvideo`
+`Rgba` at the animation's one canvas size (no decoder of this crate is
+involved), and the
+8SVX / AIFF demuxers emit PCM / compressed-audio packets for decoders
+in other crates — this crate has no audio decoder, so no audio event.
+
 - `CAT ` / `LIST` walks (`decode`, `decode_all`, the `iff_ilbm` group
   demuxer) apply a `LIST`'s `PROP` shared properties to the FORMs of
   their type in scope — copied in right after the FORM type id, outer

@@ -132,7 +132,17 @@ With the default-on `registry` feature the crate depends on
   shape differs from the previous one (a group child or DEEP body of
   another size or layout) — never for a constant stream, palette
   changes included, and across `reset()` under the same rule. Fold it
-  into the stream with `OutputParamsWatch`.
+  into the stream with `OutputParamsWatch`. Each change is also
+  announced in-band (core 0.1.43): `receive_frame` returns one
+  `Frame::StreamParams` event — payload = the new `output_params()`,
+  generation already moved — right before the first frame of the new
+  shape; skip it with `is_stream_params()` if the counter is enough.
+  The encoder takes the event as a new input shape (the next packet is
+  a `FORM` of that shape; refused with `Unsupported` for layouts it does
+  not accept), and the `iff_ilbm` muxer writes several packets as a
+  `CAT ` (contents type = the common FORM type, four spaces when
+  mixed). ANIM (composited `rawvideo` at the canvas size) and the audio
+  forms (packets for other crates' decoders) have a constant shape.
 
 ## Supported layouts
 

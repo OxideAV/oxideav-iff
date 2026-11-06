@@ -179,9 +179,9 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
 /// one-per-picture time base. Children that do not decode are skipped
 /// (as in [`crate::decode_all`]), so every packet decodes. The stream
 /// parameters state the first picture's shape; children may differ in
-/// size and layout, which the `ilbm` decoder announces through
-/// `output_params()` / `output_params_generation()` as each such child
-/// is returned.
+/// size and layout, which the `ilbm` decoder announces through a
+/// `Frame::StreamParams` event and `output_params()` /
+/// `output_params_generation()` as each such child is reached.
 fn open_group(
     mut input: Box<dyn ReadSeek>,
     hdr: crate::chunk::ChunkHeader,
@@ -378,6 +378,39 @@ impl Demuxer for IlbmDemuxer {
 
 // ───────────────────── Muxer ─────────────────────
 
+/// A `CAT ` around complete `FORM`s (EA IFF 85 §5: `"CAT " #{
+/// ContentsType (FORM | LIST | CAT)* }`). The contents type is the hint
+/// §5 describes — the children's FORM type when they share one, four
+/// spaces when they mix kinds. Odd-length children are padded to an
+/// even boundary.
+fn cat_of_forms(forms: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let form_type = |f: &[u8]| -> [u8; 4] {
+        f.get(8..12)
+            .and_then(|t| <[u8; 4]>::try_from(t).ok())
+            .unwrap_or(*b"    ")
+    };
+    let first = form_type(&forms[0]);
+    let contents = if forms.iter().all(|f| form_type(f) == first) {
+        first
+    } else {
+        *b"    "
+    };
+    let mut body = contents.to_vec();
+    for f in forms {
+        body.extend_from_slice(f);
+        if f.len() % 2 == 1 {
+            body.push(0);
+        }
+    }
+    let size = u32::try_from(body.len())
+        .map_err(|_| Error::invalid("ILBM muxer: the CAT exceeds the 32-bit chunk size"))?;
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(b"CAT ");
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
 fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
     Ok(Box::new(IlbmMuxer::new(output, streams)?))
 }
@@ -425,8 +458,12 @@ pub enum MuxerMode {
 
 /// Container-level ILBM / PBM muxer. Accepts a single video stream:
 /// either an `ilbm` codec stream (what the `iff_ilbm` / `iff_acbm`
-/// demuxers and [`crate::make_encoder`] produce — the one packet is a
-/// complete raster `FORM`, written verbatim), or a `rawvideo` stream in
+/// demuxers and [`crate::make_encoder`] produce — each packet is a
+/// complete raster `FORM`: one packet is written verbatim, several are
+/// gathered into a `CAT ` (EA IFF 85 §5) whose contents type is the
+/// children's common FORM type, or four spaces when they mix types —
+/// so a stream whose shape changes mid-way keeps every picture), or a
+/// `rawvideo` stream in
 /// `Rgba`, `Rgb24` or `Pal8` (palette RGB triples in `extradata`),
 /// which is expanded to RGBA and encoded. The emitted file's encoder
 /// mode follows [`MuxerMode`] (default [`MuxerMode::IndexedAuto`]) and
@@ -445,6 +482,8 @@ pub struct IlbmMuxer {
     transparent_color: u16,
     written: bool,
     pending: Vec<u8>,
+    /// `ilbm` codec packets (complete raster `FORM`s), in order.
+    forms: Vec<Vec<u8>>,
 }
 
 /// Packet layout a raster muxer was opened with.
@@ -571,6 +610,7 @@ impl IlbmMuxer {
             transparent_color: 0,
             written: false,
             pending: Vec::new(),
+            forms: Vec::new(),
         })
     }
 
@@ -608,16 +648,21 @@ impl Muxer for IlbmMuxer {
         Ok(()) // header is emitted lazily at write_trailer time
     }
     fn write_packet(&mut self, packet: &Packet) -> Result<()> {
+        if self.input == MuxInput::Form {
+            // `ilbm` codec packet: a complete raster FORM, kept verbatim
+            // (one) or as a `CAT ` child (several).
+            if !crate::probe(&packet.data) {
+                return Err(Error::invalid(
+                    "ILBM muxer: ilbm packet is not a raster FORM",
+                ));
+            }
+            self.forms.push(packet.data.to_vec());
+            return Ok(());
+        }
         if !self.pending.is_empty() {
             return Err(Error::unsupported(
                 "ILBM muxer: the FORM stores one image (single packet)",
             ));
-        }
-        if self.input == MuxInput::Form {
-            // `ilbm` codec packet: a complete raster FORM, kept verbatim
-            // (validated at write_trailer).
-            self.pending.extend_from_slice(&packet.data);
-            return Ok(());
         }
         self.pending = self.input.to_rgba(
             "ILBM",
@@ -632,12 +677,12 @@ impl Muxer for IlbmMuxer {
             return Ok(());
         }
         if self.input == MuxInput::Form {
-            if !crate::probe(&self.pending) {
-                return Err(Error::invalid(
-                    "ILBM muxer: ilbm packet is not a raster FORM",
-                ));
-            }
-            self.output.write_all(&self.pending)?;
+            let bytes = match self.forms.len() {
+                0 => return Err(Error::invalid("ILBM muxer: no frame written")),
+                1 => std::mem::take(&mut self.forms[0]),
+                _ => cat_of_forms(&self.forms)?,
+            };
+            self.output.write_all(&bytes)?;
             self.output.flush()?;
             self.written = true;
             return Ok(());
@@ -1407,8 +1452,9 @@ fn deep_frame_rate(
 /// a self-contained uncompressed `FORM DEEP` of its own size (the
 /// decoded pixels re-written losslessly, the FORM's carried chunks
 /// alongside), the stream parameters state the first body's shape, and
-/// the `ilbm` decoder announces each size change through
-/// `output_params()` / `output_params_generation()`.
+/// the `ilbm` decoder announces each size change through a
+/// `Frame::StreamParams` event and `output_params()` /
+/// `output_params_generation()`.
 fn varying_size_deep_demuxer(
     frames: impl Iterator<Item = (u16, u16, Vec<u8>)>,
     has_alpha: bool,

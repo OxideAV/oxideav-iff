@@ -155,7 +155,9 @@ fn ilbm_muxer_rejects_a_non_form_ilbm_packet() {
     let ws: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
     let mut mux = reg.open_muxer("iff_ilbm", ws, dmx.streams()).unwrap();
     mux.write_header().unwrap();
-    mux.write_packet(&pkt).unwrap();
+    // Refused as it arrives (each packet must be a raster FORM), and
+    // nothing was gathered for the trailer to write.
+    assert!(mux.write_packet(&pkt).is_err());
     assert!(mux.write_trailer().is_err());
 }
 

@@ -362,13 +362,15 @@ impl TryFrom<(&VideoFrame, &CodecParameters)> for IffImage {
 /// wants packed RGBA converts downstream (or calls
 /// [`crate::decode_rgba8`] on the packet bytes).
 ///
-/// Stream parameters (core 0.1.42 contract): `output_params()` answers
-/// `width` / `height` / `pixel_format` of the frame last returned, and
-/// `output_params_generation()` moves by one at each frame whose shape
-/// differs from the previous frame's (a `CAT ` / `LIST` child of
-/// another size or layout, a DEEP `DLOC` resize) — zero for a constant
-/// stream. Palettes and metadata ride the frame side-channels and are
-/// not shape changes.
+/// Stream parameters (core 0.1.42 / 0.1.43 contract): `output_params()`
+/// answers `width` / `height` / `pixel_format` of the frame last
+/// returned, and at each picture whose shape differs from the previous
+/// one (a `CAT ` / `LIST` child of another size or layout, a DEEP
+/// `DLOC` resize) `receive_frame` first returns one
+/// [`Frame::StreamParams`] event carrying the new `output_params()`,
+/// with `output_params_generation()` already moved by one — no event
+/// and generation zero for a constant stream. Palettes and metadata
+/// ride the frame side-channels and are not shape changes.
 pub fn make_decoder(_params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
     Ok(Box::new(IffDecoder {
         codec_id: CodecId::new(CODEC_ID_STR),
@@ -408,16 +410,21 @@ impl OutputShape {
 /// `Rgba` mask plane) from one frame to the next.
 ///
 /// `output_params()` describes the frame most recently returned by
-/// `receive_frame` (before the first frame: the first queued picture),
-/// and `output_params_generation()` moves by one exactly when a
-/// returned frame's shape differs from the previous returned frame's —
-/// never for a constant stream, and across [`Decoder::reset`] under the
-/// same rule (the last returned shape is the reference).
+/// `receive_frame` (before the first frame: the first queued picture).
+/// When the next picture's shape differs, `receive_frame` returns one
+/// [`Frame::StreamParams`] event first — `output_params()` and
+/// `output_params_generation()` (moved by one) already describe the
+/// new shape when it does, and the event's payload equals
+/// `output_params()` — then the picture. Never for a constant stream,
+/// and across [`Decoder::reset`] under the same rule (the last
+/// announced shape is the reference).
 struct IffDecoder {
     codec_id: CodecId,
     /// Decoded pictures not yet returned, with their shapes.
     pending: std::collections::VecDeque<(VideoFrame, OutputShape)>,
-    /// Shape of the frame most recently returned by `receive_frame`.
+    /// The shape last announced: the frame most recently returned by
+    /// `receive_frame`, or the one a `StreamParams` event just
+    /// announced for the picture now at the queue front.
     current: Option<OutputShape>,
     generation: u64,
     eof: bool,
@@ -457,12 +464,23 @@ impl Decoder for IffDecoder {
     fn output_params_generation(&self) -> u64 {
         self.generation
     }
+    /// The next picture — preceded, when its shape differs from the
+    /// shape last announced, by one [`Frame::StreamParams`] event
+    /// carrying the new [`Decoder::output_params`] (the generation has
+    /// moved by then). The picture stays queued behind the event, so a
+    /// second call returns it.
     fn receive_frame(&mut self) -> oxideav_core::Result<Frame> {
-        match self.pending.pop_front() {
-            Some((f, shape)) => {
-                if self.current.is_some_and(|c| c != shape) {
-                    self.generation = self.generation.wrapping_add(1);
-                }
+        match self.pending.front() {
+            Some(&(_, shape)) if self.current.is_some_and(|c| c != shape) => {
+                self.generation = self.generation.wrapping_add(1);
+                self.current = Some(shape);
+                let params = self
+                    .output_params()
+                    .expect("a queued picture always has a shape");
+                Ok(Frame::StreamParams(Box::new(params)))
+            }
+            Some(_) => {
+                let (f, shape) = self.pending.pop_front().expect("front checked");
                 self.current = Some(shape);
                 Ok(Frame::Video(f))
             }
@@ -479,9 +497,12 @@ impl Decoder for IffDecoder {
         self.eof = true;
         Ok(())
     }
-    /// Drop the queued pictures and accept packets again. The shape of
-    /// the last returned frame stays the reference, so the generation
-    /// moves after a seek only when the next returned frame differs.
+    /// Drop the queued pictures and accept packets again. The last
+    /// announced shape (the last returned frame's, or the one a
+    /// `StreamParams` event announced just before the reset) stays the
+    /// reference, so the generation moves — and an event precedes the
+    /// frame — after a seek only when the next picture differs from
+    /// what the consumer was last told.
     fn reset(&mut self) -> oxideav_core::Result<()> {
         self.pending.clear();
         self.eof = false;
@@ -745,6 +766,14 @@ fn output_label(input: PixelFormat, opts: &IlbmEncoderOptions) -> Option<PixelFo
 /// decodes to (`Pal8` + palette `extradata`, `Rgb24`, `Rgba`), refined
 /// after the first frame from the file itself.
 ///
+/// A [`Frame::StreamParams`] event re-configures the encoder for the
+/// new input `width` / `height` / `pixel_format` (unset fields keep
+/// theirs) and `output_params()` follows: every packet is a complete
+/// `FORM`, so the next picture just starts a `FORM` of the new shape,
+/// and the `iff_ilbm` muxer gathers several packets into a `CAT `. An
+/// event for a non-video stream or a layout outside
+/// [`ENCODER_PIXEL_FORMATS`] is refused with `Unsupported`.
+///
 /// Metadata: the stream's `params.blobs` with the frame's blobs laid
 /// over them ([`merged_blobs`]) are written back — carried chunks
 /// (`iff-anno` … `iff-dest`) ahead of the body, `iff-camg` as `CAMG`
@@ -789,6 +818,40 @@ struct IffEncoder {
     opts: IlbmEncoderOptions,
     pending: Option<Vec<u8>>,
     eof: bool,
+}
+
+impl IffEncoder {
+    /// Adopt a mid-stream input shape: `width` / `height` /
+    /// `pixel_format` of the event replace the stream's (fields the
+    /// event leaves unset keep their value), and the output label is
+    /// re-derived for the new layout (its palette `extradata` is
+    /// refined from the next written `FORM`). A non-video event or an
+    /// input layout outside [`ENCODER_PIXEL_FORMATS`] is refused with
+    /// `Unsupported`, leaving the encoder as it was.
+    fn reconfigure(&mut self, p: &CodecParameters) -> oxideav_core::Result<()> {
+        if p.media_type != oxideav_core::MediaType::Video {
+            return Err(oxideav_core::Error::unsupported(
+                "IFF encoder: a StreamParams event for a non-video stream",
+            ));
+        }
+        let format = p.pixel_format.or(self.input_format);
+        if let Some(pf) = format
+            && !ENCODER_PIXEL_FORMATS.contains(&pf)
+        {
+            return Err(oxideav_core::Error::unsupported(format!(
+                "IFF encoder: {pf:?} is not an accepted input layout \
+                 (Pal8, Rgb24, Rgba, Bgr24, Bgra, Gray8); convert upstream"
+            )));
+        }
+        self.input_format = format;
+        self.out_params.width = p.width.or(self.out_params.width);
+        self.out_params.height = p.height.or(self.out_params.height);
+        self.out_params.pixel_format = format
+            .and_then(|pf| output_label(pf, &self.opts))
+            .or(format);
+        self.out_params.extradata = Vec::new();
+        Ok(())
+    }
 }
 
 /// The number of distinct RGB triples in packed RGBA, stopping at
@@ -922,9 +985,16 @@ impl Encoder for IffEncoder {
     fn output_params(&self) -> &CodecParameters {
         &self.out_params
     }
+    /// Encode one picture into a complete raster `FORM`. A
+    /// [`Frame::StreamParams`] event re-configures the encoder for the
+    /// new input shape (see [`IffEncoder::reconfigure`]): every packet
+    /// is a self-contained `FORM`, so the next picture simply starts a
+    /// `FORM` of the new size / layout — what an `iff_ilbm` muxer
+    /// gathers into a `CAT ` (EA IFF 85 §5).
     fn send_frame(&mut self, frame: &Frame) -> oxideav_core::Result<()> {
         let vf = match frame {
             Frame::Video(v) => v,
+            Frame::StreamParams(p) => return self.reconfigure(p),
             _ => {
                 return Err(oxideav_core::Error::invalid(
                     "IFF encoder: expected video frame",
