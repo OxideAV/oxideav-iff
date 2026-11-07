@@ -174,6 +174,7 @@ impl Demuxer for AnimDemuxer {
 /// a multiple of 4 (the 4-byte item width); op-8 instead word-splits
 /// an odd-long plane per its §3.2 trailing-WORD-column rule.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AnimMuxerOp {
     /// Op-0 — full literal BODY per frame (the universal fallback).
     Op0,

@@ -42,15 +42,13 @@ fn make_indexed_image(palette: Vec<[u8; 3]>) -> IlbmImage {
         page_width: w as i16,
         page_height: h as i16,
     };
-    IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd,
-        palette,
-        camg: Camg::default(),
-        rgba,
-        ..IlbmImage::default()
-    }
+    IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(bmhd)
+        .with_palette(palette)
+        .with_camg(Camg::default())
+        .with_rgba(rgba)
 }
 
 fn make_16_color_image() -> IlbmImage {

@@ -77,6 +77,7 @@ fn probe(p: &oxideav_core::ProbeData) -> u8 {
 
 /// 8SVX `sCompression` values we support end-to-end.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Compression {
     /// No compression; BODY is raw signed 8-bit PCM.
     #[default]
@@ -833,6 +834,7 @@ impl ChannelSamples {
 /// voice-structure chunk, the text metadata, and the decoded waveform
 /// data per channel and per octave.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Voice {
     /// The mandatory `VHDR` header.
     pub header: VoiceHeader,
@@ -856,6 +858,54 @@ pub struct Voice {
     /// Decoded waveform data: one entry for mono, two (left, right)
     /// for stereo.
     pub channels: Vec<ChannelSamples>,
+}
+
+impl Voice {
+    /// Builder-style setter for [`header`](Self::header).
+    pub fn with_header(mut self, header: VoiceHeader) -> Self {
+        self.header = header;
+        self
+    }
+    /// Builder-style setter for [`channel`](Self::channel).
+    pub fn with_channel(mut self, channel: Option<ChannelAssignment>) -> Self {
+        self.channel = channel;
+        self
+    }
+    /// Builder-style setter for [`pan`](Self::pan).
+    pub fn with_pan(mut self, pan: Option<Pan>) -> Self {
+        self.pan = pan;
+        self
+    }
+    /// Builder-style setter for [`attack`](Self::attack).
+    pub fn with_attack(mut self, attack: Vec<Envelope>) -> Self {
+        self.attack = attack;
+        self
+    }
+    /// Builder-style setter for [`release`](Self::release).
+    pub fn with_release(mut self, release: Vec<Envelope>) -> Self {
+        self.release = release;
+        self
+    }
+    /// Builder-style setter for [`seqn`](Self::seqn).
+    pub fn with_seqn(mut self, seqn: Option<Seqn>) -> Self {
+        self.seqn = seqn;
+        self
+    }
+    /// Builder-style setter for [`fade`](Self::fade).
+    pub fn with_fade(mut self, fade: Option<Fade>) -> Self {
+        self.fade = fade;
+        self
+    }
+    /// Builder-style setter for [`metadata`](Self::metadata).
+    pub fn with_metadata(mut self, metadata: Vec<(String, String)>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+    /// Builder-style setter for [`channels`](Self::channels).
+    pub fn with_channels(mut self, channels: Vec<ChannelSamples>) -> Self {
+        self.channels = channels;
+        self
+    }
 }
 
 impl Default for VoiceHeader {

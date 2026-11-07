@@ -423,6 +423,7 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
 /// [`MuxerMode::Ham8`] / [`MuxerMode::Ehb`] / [`MuxerMode::Pbm`] for
 /// the matching ILBM viewport / form variant.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MuxerMode {
     /// Indexed planar `FORM/ILBM`. Plane count = ceil(log2(palette))
     /// clamped to 1..=8. CAMG omitted unless the caller sets one.
@@ -987,6 +988,7 @@ fn open_rgbn(
 
 /// Body-compression choice for [`DeepMuxer`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeepMuxerCompression {
     /// Try both NOCOMPRESSION and RUNLENGTH across all frames and emit
     /// whichever FORM is smaller (the DGBL compression method is global to

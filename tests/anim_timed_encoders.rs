@@ -46,14 +46,12 @@ fn frames() -> Vec<IlbmImage> {
                     rgba.extend_from_slice(&[p[0], p[1], p[2], 0xFF]);
                 }
             }
-            IlbmImage {
-                width: 32,
-                height: 4,
-                bmhd,
-                palette: palette.clone(),
-                rgba,
-                ..IlbmImage::default()
-            }
+            IlbmImage::default()
+                .with_width(32)
+                .with_height(4)
+                .with_bmhd(bmhd)
+                .with_palette(palette.clone())
+                .with_rgba(rgba)
         })
         .collect()
 }

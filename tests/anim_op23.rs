@@ -51,16 +51,14 @@ fn make_frame(
             rgba.extend_from_slice(&[p[0], p[1], p[2], 0xFF]);
         }
     }
-    IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd: bmhd(w, h, n_planes),
-        palette: palette.to_vec(),
-        camg: Camg::default(),
-        rgba,
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    }
+    IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(bmhd(w, h, n_planes))
+        .with_palette(palette.to_vec())
+        .with_camg(Camg::default())
+        .with_rgba(rgba)
+        .with_form_type(*b"ILBM")
 }
 
 /// Build a DLTA whose plane-0 pointer is 32 (data immediately after

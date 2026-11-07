@@ -135,10 +135,10 @@ fn from_lines_pchg_serialises_through_encode_ilbm() {
 
     let pchg = Pchg::from_lines(vec![line(1, &[(0, [0x33, 0x66, 0x99])])], PchgKind::Big);
 
-    let img = IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd: Bmhd {
+    let img = IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(Bmhd {
             width: w,
             height: h,
             x_origin: 0,
@@ -152,13 +152,11 @@ fn from_lines_pchg_serialises_through_encode_ilbm() {
             y_aspect: 1,
             page_width: w as i16,
             page_height: h as i16,
-        },
-        camg: Camg::default(),
-        palette,
-        rgba,
-        pchg: Some(pchg),
-        ..IlbmImage::default()
-    };
+        })
+        .with_camg(Camg::default())
+        .with_palette(palette)
+        .with_rgba(rgba)
+        .with_pchg(Some(pchg));
 
     let bytes = encode_ilbm(&img).unwrap();
     let decoded = parse_ilbm(&bytes).unwrap();

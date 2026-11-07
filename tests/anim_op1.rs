@@ -45,16 +45,14 @@ fn make_frame_planes(
             rgba.extend_from_slice(&[p[0], p[1], p[2], 0xFF]);
         }
     }
-    IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd,
-        palette: palette.to_vec(),
-        camg: Camg::default(),
-        rgba,
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    }
+    IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(bmhd)
+        .with_palette(palette.to_vec())
+        .with_camg(Camg::default())
+        .with_rgba(rgba)
+        .with_form_type(*b"ILBM")
 }
 
 #[test]

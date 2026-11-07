@@ -443,10 +443,10 @@ fn mk_pchg() -> Pchg {
 }
 
 fn mk_image_with_pchg(pchg: Option<Pchg>) -> IlbmImage {
-    IlbmImage {
-        width: 4,
-        height: 8,
-        bmhd: Bmhd {
+    IlbmImage::default()
+        .with_width(4)
+        .with_height(8)
+        .with_bmhd(Bmhd {
             width: 4,
             height: 8,
             x_origin: 0,
@@ -460,20 +460,19 @@ fn mk_image_with_pchg(pchg: Option<Pchg>) -> IlbmImage {
             y_aspect: 1,
             page_width: 4,
             page_height: 8,
-        },
-        palette: mk_palette(),
-        camg: Default::default(),
-        form_type: *b"ILBM",
-        grab: None,
-        dest: None,
-        sprt: None,
-        sham: None,
-        pchg,
-        crngs: vec![],
-        ccrts: vec![],
-        drngs: vec![],
-        rgba: vec![0u8; 4 * 8 * 4],
-    }
+        })
+        .with_palette(mk_palette())
+        .with_camg(Default::default())
+        .with_form_type(*b"ILBM")
+        .with_grab(None)
+        .with_dest(None)
+        .with_sprt(None)
+        .with_sham(None)
+        .with_pchg(pchg)
+        .with_crngs(vec![])
+        .with_ccrts(vec![])
+        .with_drngs(vec![])
+        .with_rgba(vec![0u8; 4 * 8 * 4])
 }
 
 #[test]

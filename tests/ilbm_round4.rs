@@ -305,16 +305,14 @@ fn encoder_hasmask_plane_alpha_pattern() {
             rgba.extend_from_slice(&[0xFF, 0, 0, a]);
         }
     }
-    let img = IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd,
-        palette,
-        camg: Camg::default(),
-        rgba: rgba.clone(),
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    };
+    let img = IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(bmhd)
+        .with_palette(palette)
+        .with_camg(Camg::default())
+        .with_rgba(rgba.clone())
+        .with_form_type(*b"ILBM");
     let bytes = encode_ilbm(&img).unwrap();
     let dec = parse_ilbm(&bytes).unwrap();
     assert_eq!(dec.bmhd.masking, Masking::HasMask);
@@ -368,16 +366,14 @@ fn encoder_has_transparent_colour_keys_off_low_alpha() {
     for _x in 0..w {
         rgba.extend_from_slice(&[0, 0xFF, 0, 0xFF]);
     }
-    let img = IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd,
-        palette,
-        camg: Camg::default(),
-        rgba: rgba.clone(),
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    };
+    let img = IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(bmhd)
+        .with_palette(palette)
+        .with_camg(Camg::default())
+        .with_rgba(rgba.clone())
+        .with_form_type(*b"ILBM");
     let bytes = encode_ilbm(&img).unwrap();
     let dec = parse_ilbm(&bytes).unwrap();
     assert_eq!(dec.bmhd.masking, Masking::HasTransparentColor);
@@ -723,20 +719,15 @@ fn pbm_byterun1_beats_uncompressed_for_uniform() {
     let rgba: Vec<u8> = (0..((w as usize) * (h as usize)))
         .flat_map(|_| [0x42u8, 0x42, 0x42, 0xFF])
         .collect();
-    let img_raw = IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd: bmhd_raw,
-        palette: palette.clone(),
-        camg: Camg::default(),
-        rgba: rgba.clone(),
-        form_type: *b"PBM ",
-        ..IlbmImage::default()
-    };
-    let img_rle = IlbmImage {
-        bmhd: bmhd_rle,
-        ..img_raw.clone()
-    };
+    let img_raw = IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(bmhd_raw)
+        .with_palette(palette.clone())
+        .with_camg(Camg::default())
+        .with_rgba(rgba.clone())
+        .with_form_type(*b"PBM ");
+    let img_rle = img_raw.clone().with_bmhd(bmhd_rle);
     let raw = encode_ilbm(&img_raw).unwrap();
     let rle = encode_ilbm(&img_rle).unwrap();
     assert!(

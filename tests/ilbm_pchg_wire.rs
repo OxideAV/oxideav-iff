@@ -182,10 +182,10 @@ fn pchg_takes_precedence_over_sham() {
         rgba.extend_from_slice(&[0xFF, 0x00, 0x00, 0xFF]);
     }
 
-    let img = IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd: Bmhd {
+    let img = IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(Bmhd {
             width: w,
             height: h,
             x_origin: 0,
@@ -199,14 +199,12 @@ fn pchg_takes_precedence_over_sham() {
             y_aspect: 1,
             page_width: w as i16,
             page_height: h as i16,
-        },
-        camg: Camg::default(),
-        palette,
-        rgba,
-        sham: Some(sham),
-        pchg: Some(pchg),
-        ..IlbmImage::default()
-    };
+        })
+        .with_camg(Camg::default())
+        .with_palette(palette)
+        .with_rgba(rgba)
+        .with_sham(Some(sham))
+        .with_pchg(Some(pchg));
 
     let decoded = parse_ilbm(&encode_ilbm(&img).unwrap()).unwrap();
     assert!(decoded.sham.is_some(), "SHAM survives the round-trip");

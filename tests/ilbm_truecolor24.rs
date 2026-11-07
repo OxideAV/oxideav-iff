@@ -76,16 +76,14 @@ fn tc24_image(width: u16, height: u16, compression: Compression, rgba: Vec<u8>) 
         page_width: width as i16,
         page_height: height as i16,
     };
-    IlbmImage {
-        width: width as u32,
-        height: height as u32,
-        bmhd,
-        palette: Vec::new(),
-        camg: Camg::default(),
-        form_type: *b"ILBM",
-        rgba,
-        ..IlbmImage::default()
-    }
+    IlbmImage::default()
+        .with_width(width as u32)
+        .with_height(height as u32)
+        .with_bmhd(bmhd)
+        .with_palette(Vec::new())
+        .with_camg(Camg::default())
+        .with_form_type(*b"ILBM")
+        .with_rgba(rgba)
 }
 
 /// A 16x4 RGB gradient that exercises low, mid and high bits of every
@@ -323,16 +321,14 @@ fn encode_truecolor24_empty_palette_with_indexed_planes_still_rejected() {
         page_width: 8,
         page_height: 2,
     };
-    let img = IlbmImage {
-        width: 8,
-        height: 2,
-        bmhd,
-        palette: Vec::new(),
-        camg: Camg::default(),
-        form_type: *b"ILBM",
-        rgba: vec![0u8; 8 * 2 * 4],
-        ..IlbmImage::default()
-    };
+    let img = IlbmImage::default()
+        .with_width(8)
+        .with_height(2)
+        .with_bmhd(bmhd)
+        .with_palette(Vec::new())
+        .with_camg(Camg::default())
+        .with_form_type(*b"ILBM")
+        .with_rgba(vec![0u8; 8 * 2 * 4]);
     assert!(
         encode_ilbm(&img).is_err(),
         "indexed encode with empty palette should still fail"

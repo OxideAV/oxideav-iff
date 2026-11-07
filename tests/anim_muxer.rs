@@ -206,14 +206,12 @@ fn op5_timed_authoring_roundtrips_frame_timing() {
             let v = if on == 1 { 255 } else { 0 };
             rgba.extend_from_slice(&[v, v, v, 255]);
         }
-        IlbmImage {
-            width: 8,
-            height: 2,
-            bmhd,
-            palette: palette.clone(),
-            rgba,
-            ..IlbmImage::default()
-        }
+        IlbmImage::default()
+            .with_width(8)
+            .with_height(2)
+            .with_bmhd(bmhd)
+            .with_palette(palette.clone())
+            .with_rgba(rgba)
     };
     let frames = vec![mk(0), mk(1), mk(0)];
     let timing = vec![

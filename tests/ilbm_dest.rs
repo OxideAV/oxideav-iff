@@ -46,16 +46,14 @@ fn make_indexed_image(w: u16, h: u16, n_planes: u8) -> IlbmImage {
         page_width: w as i16,
         page_height: h as i16,
     };
-    IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd,
-        palette,
-        camg: Camg::default(),
-        rgba,
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    }
+    IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(bmhd)
+        .with_palette(palette)
+        .with_camg(Camg::default())
+        .with_rgba(rgba)
+        .with_form_type(*b"ILBM")
 }
 
 // ───────────────────── unit-level wire layout ─────────────────────

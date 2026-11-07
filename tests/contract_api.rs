@@ -47,14 +47,12 @@ fn legacy_indexed(masking: Masking, key: u16) -> IlbmImage {
         };
         rgba.extend_from_slice(&[c[0], c[1], c[2], alpha]);
     }
-    IlbmImage {
-        width: 8,
-        height: 2,
-        bmhd: bmhd(8, 2, 2, masking, key),
-        palette,
-        rgba,
-        ..IlbmImage::default()
-    }
+    IlbmImage::default()
+        .with_width(8)
+        .with_height(2)
+        .with_bmhd(bmhd(8, 2, 2, masking, key))
+        .with_palette(palette)
+        .with_rgba(rgba)
 }
 
 // ───────────────────────── probe ─────────────────────────
@@ -290,15 +288,13 @@ fn ehb_decodes_to_pal8_with_the_expanded_palette() {
         let c = expanded[i as usize];
         rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
     }
-    let legacy = IlbmImage {
-        width: 64,
-        height: 1,
-        bmhd: bmhd(64, 1, 6, Masking::None, 0),
-        palette,
-        camg: Camg { raw: CAMG_EHB },
-        rgba,
-        ..IlbmImage::default()
-    };
+    let legacy = IlbmImage::default()
+        .with_width(64)
+        .with_height(1)
+        .with_bmhd(bmhd(64, 1, 6, Masking::None, 0))
+        .with_palette(palette)
+        .with_camg(Camg { raw: CAMG_EHB })
+        .with_rgba(rgba);
     let bytes = encode_ilbm(&legacy).unwrap();
     let i = info(&bytes).unwrap();
     assert!(i.ehb);
@@ -326,15 +322,13 @@ fn ham6_decodes_to_rgb24_and_matches_legacy() {
     for x in 0..32u8 {
         rgba.extend_from_slice(&[x * 8, 255 - x * 8, x * 4, 255]);
     }
-    let legacy = IlbmImage {
-        width: 32,
-        height: 1,
-        bmhd: bmhd(32, 1, 6, Masking::None, 0),
-        palette: vec![[0, 0, 0]; 16],
-        camg: Camg { raw: CAMG_HAM },
-        rgba,
-        ..IlbmImage::default()
-    };
+    let legacy = IlbmImage::default()
+        .with_width(32)
+        .with_height(1)
+        .with_bmhd(bmhd(32, 1, 6, Masking::None, 0))
+        .with_palette(vec![[0, 0, 0]; 16])
+        .with_camg(Camg { raw: CAMG_HAM })
+        .with_rgba(rgba);
     let bytes = encode_ilbm(&legacy).unwrap();
     let i = info(&bytes).unwrap();
     assert!(i.ham);

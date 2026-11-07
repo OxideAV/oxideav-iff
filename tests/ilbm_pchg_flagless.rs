@@ -121,14 +121,12 @@ fn flagless_unvalidatable_chunk_is_rejected_by_parse() {
 fn flagless_unvalidatable_chunk_is_ignored_by_the_ilbm_reader() {
     // Reader policy: ignore the unusable PCHG, render from CMAP alone.
     let palette = vec![[0x00, 0x00, 0x00], [0xE0, 0x30, 0x30]];
-    let base = IlbmImage {
-        width: 4,
-        height: 4,
-        bmhd: bmhd(4, 4),
-        palette: palette.clone(),
-        rgba: [0xE0, 0x30, 0x30, 0xFF].repeat(16),
-        ..IlbmImage::default()
-    };
+    let base = IlbmImage::default()
+        .with_width(4)
+        .with_height(4)
+        .with_bmhd(bmhd(4, 4))
+        .with_palette(palette.clone())
+        .with_rgba([0xE0, 0x30, 0x30, 0xFF].repeat(16));
     let mut form = encode_ilbm(&base).unwrap();
     // Splice the bad PCHG chunk in front of BODY.
     let body_at = form
@@ -183,16 +181,13 @@ fn lace_changes_apply_at_stored_frame_lines_without_halving() {
     // spliced into a pre-encoded BODY so every stored pixel keeps
     // palette register 1 (the encoder itself quantises PCHG-aware).
     let palette = vec![[0x00, 0x00, 0x00], [0x10, 0x10, 0x10]];
-    let base = IlbmImage {
-        width: 4,
-        height: 8,
-        bmhd: bmhd(4, 8),
-        palette: palette.clone(),
-        camg: Camg { raw: CAMG_LACE },
-        // Every pixel uses register 1.
-        rgba: [0x10, 0x10, 0x10, 0xFF].repeat(32),
-        ..IlbmImage::default()
-    };
+    let base = IlbmImage::default()
+        .with_width(4)
+        .with_height(8)
+        .with_bmhd(bmhd(4, 8))
+        .with_palette(palette.clone())
+        .with_camg(Camg { raw: CAMG_LACE })
+        .with_rgba([0x10, 0x10, 0x10, 0xFF].repeat(32));
     let mut form = encode_ilbm(&base).unwrap();
     let pchg_body = Pchg::from_lines(vec![line(2, &[(1, [0xAA, 0xBB, 0xCC])])], PchgKind::Big)
         .encode(PchgKind::Big);

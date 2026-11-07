@@ -44,6 +44,7 @@ use crate::aiff::form::Form;
 /// [`ChunkClass::rank`] returns the same number as a `u8`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ChunkClass {
     /// `FVER` — the §3 Format Version Chunk. Sits above the §14
     /// "Highest precedence … Lowest precedence" block as the

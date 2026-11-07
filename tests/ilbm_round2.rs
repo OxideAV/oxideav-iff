@@ -39,16 +39,14 @@ fn make_pbm_image(w: u16, h: u16, palette: Vec<[u8; 3]>) -> IlbmImage {
         page_width: w as i16,
         page_height: h as i16,
     };
-    IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd,
-        palette,
-        camg: Camg::default(),
-        rgba,
-        form_type: *b"PBM ",
-        ..IlbmImage::default()
-    }
+    IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(bmhd)
+        .with_palette(palette)
+        .with_camg(Camg::default())
+        .with_rgba(rgba)
+        .with_form_type(*b"PBM ")
 }
 
 #[test]
@@ -186,17 +184,15 @@ fn sham_per_line_palette_overrides_cmap() {
         version: 0,
         palettes: vec![pal_row0.clone(), pal_row1.clone()],
     };
-    let img = IlbmImage {
-        width: 4,
-        height: 2,
-        bmhd,
-        palette: pal_row0.clone(),
-        camg: Camg { raw: CAMG_HAM },
-        rgba: rgba.clone(),
-        form_type: *b"ILBM",
-        sham: Some(sham.clone()),
-        ..IlbmImage::default()
-    };
+    let img = IlbmImage::default()
+        .with_width(4)
+        .with_height(2)
+        .with_bmhd(bmhd)
+        .with_palette(pal_row0.clone())
+        .with_camg(Camg { raw: CAMG_HAM })
+        .with_rgba(rgba.clone())
+        .with_form_type(*b"ILBM")
+        .with_sham(Some(sham.clone()));
 
     let bytes = encode_ilbm(&img).unwrap();
     let pos = bytes
@@ -377,17 +373,15 @@ fn pchg_small_format_roundtrip() {
     for _ in 0..4 {
         rgba.extend_from_slice(&[0, 0xFF, 0, 0xFF]);
     }
-    let img = IlbmImage {
-        width: 4,
-        height: 2,
-        bmhd,
-        palette: pal,
-        camg: Camg::default(),
-        rgba: rgba.clone(),
-        form_type: *b"ILBM",
-        pchg: Some(pchg),
-        ..IlbmImage::default()
-    };
+    let img = IlbmImage::default()
+        .with_width(4)
+        .with_height(2)
+        .with_bmhd(bmhd)
+        .with_palette(pal)
+        .with_camg(Camg::default())
+        .with_rgba(rgba.clone())
+        .with_form_type(*b"ILBM")
+        .with_pchg(Some(pchg));
     let bytes = encode_ilbm(&img).unwrap();
     let pos = bytes
         .windows(4)
@@ -436,16 +430,14 @@ fn ham6_encode_decode_smooth_gradient() {
             rgba.extend_from_slice(&[v, v, v, 0xFF]);
         }
     }
-    let img = IlbmImage {
-        width: 16,
-        height: 2,
-        bmhd,
-        palette,
-        camg: Camg { raw: CAMG_HAM },
-        rgba: rgba.clone(),
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    };
+    let img = IlbmImage::default()
+        .with_width(16)
+        .with_height(2)
+        .with_bmhd(bmhd)
+        .with_palette(palette)
+        .with_camg(Camg { raw: CAMG_HAM })
+        .with_rgba(rgba.clone())
+        .with_form_type(*b"ILBM");
     let bytes = encode_ilbm(&img).unwrap();
     let dec = parse_ilbm(&bytes).unwrap();
     assert_eq!(dec.width, 16);
@@ -500,16 +492,14 @@ fn ham8_encode_decode_smooth_gradient() {
             rgba.extend_from_slice(&[v, v, v, 0xFF]);
         }
     }
-    let img = IlbmImage {
-        width: 64,
-        height: 2,
-        bmhd,
-        palette,
-        camg: Camg { raw: CAMG_HAM },
-        rgba: rgba.clone(),
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    };
+    let img = IlbmImage::default()
+        .with_width(64)
+        .with_height(2)
+        .with_bmhd(bmhd)
+        .with_palette(palette)
+        .with_camg(Camg { raw: CAMG_HAM })
+        .with_rgba(rgba.clone())
+        .with_form_type(*b"ILBM");
     let bytes = encode_ilbm(&img).unwrap();
     let dec = parse_ilbm(&bytes).unwrap();
     assert_eq!(dec.width, 64);
@@ -566,16 +556,14 @@ fn ehb_encode_uses_expanded_palette() {
             rgba.extend_from_slice(&[0x7F, 0, 0, 0xFF]); // pal[33] = half of pal[1]
         }
     }
-    let img = IlbmImage {
-        width: 8,
-        height: 1,
-        bmhd,
-        palette: palette.clone(),
-        camg: Camg { raw: CAMG_EHB },
-        rgba: rgba.clone(),
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    };
+    let img = IlbmImage::default()
+        .with_width(8)
+        .with_height(1)
+        .with_bmhd(bmhd)
+        .with_palette(palette.clone())
+        .with_camg(Camg { raw: CAMG_EHB })
+        .with_rgba(rgba.clone())
+        .with_form_type(*b"ILBM");
     let bytes = encode_ilbm(&img).unwrap();
     let dec = parse_ilbm(&bytes).unwrap();
     assert!(dec.camg.is_ehb(), "CAMG EHB bit preserved");
@@ -620,16 +608,14 @@ fn op5_short_form_writes_literals_at_row_cursor() {
     for _ in 0..(16 * 4) {
         rgba.extend_from_slice(&[0, 0, 0, 0xFF]); // index 0 = black
     }
-    let seed = IlbmImage {
-        width: 16,
-        height: 4,
-        bmhd,
-        palette: palette.clone(),
-        camg: Camg::default(),
-        rgba: rgba.clone(),
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    };
+    let seed = IlbmImage::default()
+        .with_width(16)
+        .with_height(4)
+        .with_bmhd(bmhd)
+        .with_palette(palette.clone())
+        .with_camg(Camg::default())
+        .with_rgba(rgba.clone())
+        .with_form_type(*b"ILBM");
 
     // Simulate the planar state for the seed frame: 4 rows × 1 plane,
     // each plane row is `(width + 15) / 16 * 2 = 2` bytes (all zero).
@@ -743,16 +729,16 @@ fn anim_op0_roundtrip_via_iff_anim_demuxer() {
                 rgba.extend_from_slice(&[255, 0, 0, 0xFF]);
             }
         }
-        frames.push(IlbmImage {
-            width: 8,
-            height: 2,
-            bmhd,
-            palette: pal.clone(),
-            camg: Camg::default(),
-            rgba,
-            form_type: *b"ILBM",
-            ..IlbmImage::default()
-        });
+        frames.push(
+            IlbmImage::default()
+                .with_width(8)
+                .with_height(2)
+                .with_bmhd(bmhd)
+                .with_palette(pal.clone())
+                .with_camg(Camg::default())
+                .with_rgba(rgba)
+                .with_form_type(*b"ILBM"),
+        );
     }
     let bytes = oxideav_iff::anim::encode_anim_op0(&frames).unwrap();
     let parsed: AnimImage = parse_anim(&bytes).unwrap();

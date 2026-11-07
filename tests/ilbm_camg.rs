@@ -172,10 +172,10 @@ fn display_id_camg_roundtrips_through_encode() {
             [c[0], c[1], c[2], 0xFF]
         })
         .collect();
-    let img = IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd: Bmhd {
+    let img = IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(Bmhd {
             width: w,
             height: h,
             x_origin: 0,
@@ -189,14 +189,12 @@ fn display_id_camg_roundtrips_through_encode() {
             y_aspect: 1,
             page_width: w as i16,
             page_height: h as i16,
-        },
-        camg: Camg {
+        })
+        .with_camg(Camg {
             raw: PAL_MONITOR_ID | HIRESLACE_KEY,
-        },
-        palette,
-        rgba,
-        ..IlbmImage::default()
-    };
+        })
+        .with_palette(palette)
+        .with_rgba(rgba);
     let decoded = parse_ilbm(&encode_ilbm(&img).unwrap()).unwrap();
     assert_eq!(decoded.camg.raw, PAL_MONITOR_ID | HIRESLACE_KEY);
     assert!(decoded.camg.is_mode_id());
@@ -221,10 +219,10 @@ fn ham_bit_in_mode_id_form_drives_ham_decode() {
             [v, v, v, 0xFF]
         })
         .collect();
-    let img = IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd: Bmhd {
+    let img = IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(Bmhd {
             width: w,
             height: h,
             x_origin: 0,
@@ -238,14 +236,12 @@ fn ham_bit_in_mode_id_form_drives_ham_decode() {
             y_aspect: 1,
             page_width: w as i16,
             page_height: h as i16,
-        },
-        camg: Camg {
+        })
+        .with_camg(Camg {
             raw: PAL_MONITOR_ID | HAMLACE_KEY,
-        },
-        palette,
-        rgba: rgba.clone(),
-        ..IlbmImage::default()
-    };
+        })
+        .with_palette(palette)
+        .with_rgba(rgba.clone());
     let decoded = parse_ilbm(&encode_ilbm(&img).unwrap()).unwrap();
     assert_eq!(decoded.camg.raw, PAL_MONITOR_ID | HAMLACE_KEY);
     assert!(decoded.camg.is_ham());

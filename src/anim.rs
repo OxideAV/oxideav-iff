@@ -172,6 +172,7 @@ pub struct FrameTiming {
 /// Decoded ANIM container — the leading frame plus the delta-decoded
 /// follow-on frames.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct AnimImage {
     /// Width/height shared by all frames (taken from the leading BMHD).
     pub width: u32,
@@ -190,6 +191,7 @@ pub struct AnimImage {
 /// A single entry in an [`AnimPlayback`] timeline: which frame to show,
 /// when to show it (its cumulative start time), and for how long.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PlaybackFrame {
     /// Index into [`AnimImage::frames`].
     pub frame_index: usize,
@@ -228,6 +230,7 @@ impl PlaybackFrame {
 /// its own `rel_time` (and to `1` jiffy if that is `0`) so a looping
 /// player never stalls on a zero-length final frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AnimPlayback {
     /// One entry per frame, in display order.
     pub frames: Vec<PlaybackFrame>,

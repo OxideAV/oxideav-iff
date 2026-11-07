@@ -35,6 +35,7 @@ use crate::aiff::error::{AiffError, Result};
 /// have to keep track of `sample_size`. Float flavours carry their
 /// native f32 / f64 precision.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum PcmSamples {
     /// One signed-i32 plane per channel. Produced for
     /// `NONE` / `twos` / `sowt` / `raw `.

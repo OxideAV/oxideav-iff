@@ -117,6 +117,7 @@ impl Masking {
 /// it instructs [`encode_ilbm`] to try both modes and emit the shorter
 /// output, writing the winning mode into BMHD before assembly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Compression {
     /// BODY is a literal stack of bitplane rows.
     None,
@@ -482,6 +483,7 @@ impl DualPlayfield {
 /// indexed ILBM/ACBM BODY — the output of
 /// [`Camg::resolve_planar_format`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InferredFormat {
     /// Plain indexed palette lookup.
     Indexed,
@@ -3134,6 +3136,7 @@ pub fn expand_ham_row(indices: &[u8], palette: &[[u8; 3]], bits: u8) -> Vec<[u8;
 /// (HasMask plane or transparent-colour key) — masked-out pixels get
 /// alpha `0`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct IlbmImage {
     pub width: u32,
     pub height: u32,
@@ -3174,6 +3177,84 @@ pub struct IlbmImage {
     pub drngs: Vec<Drng>,
     /// Packed RGBA bytes, row-major, top-to-bottom, 4 bytes/pixel.
     pub rgba: Vec<u8>,
+}
+
+impl IlbmImage {
+    /// Builder-style setter for [`width`](Self::width).
+    pub fn with_width(mut self, width: u32) -> Self {
+        self.width = width;
+        self
+    }
+    /// Builder-style setter for [`height`](Self::height).
+    pub fn with_height(mut self, height: u32) -> Self {
+        self.height = height;
+        self
+    }
+    /// Builder-style setter for [`bmhd`](Self::bmhd).
+    pub fn with_bmhd(mut self, bmhd: Bmhd) -> Self {
+        self.bmhd = bmhd;
+        self
+    }
+    /// Builder-style setter for [`palette`](Self::palette).
+    pub fn with_palette(mut self, palette: Vec<[u8; 3]>) -> Self {
+        self.palette = palette;
+        self
+    }
+    /// Builder-style setter for [`camg`](Self::camg).
+    pub fn with_camg(mut self, camg: Camg) -> Self {
+        self.camg = camg;
+        self
+    }
+    /// Builder-style setter for [`form_type`](Self::form_type).
+    pub fn with_form_type(mut self, form_type: [u8; 4]) -> Self {
+        self.form_type = form_type;
+        self
+    }
+    /// Builder-style setter for [`grab`](Self::grab).
+    pub fn with_grab(mut self, grab: Option<Grab>) -> Self {
+        self.grab = grab;
+        self
+    }
+    /// Builder-style setter for [`dest`](Self::dest).
+    pub fn with_dest(mut self, dest: Option<Dest>) -> Self {
+        self.dest = dest;
+        self
+    }
+    /// Builder-style setter for [`sprt`](Self::sprt).
+    pub fn with_sprt(mut self, sprt: Option<Sprt>) -> Self {
+        self.sprt = sprt;
+        self
+    }
+    /// Builder-style setter for [`sham`](Self::sham).
+    pub fn with_sham(mut self, sham: Option<Sham>) -> Self {
+        self.sham = sham;
+        self
+    }
+    /// Builder-style setter for [`pchg`](Self::pchg).
+    pub fn with_pchg(mut self, pchg: Option<Pchg>) -> Self {
+        self.pchg = pchg;
+        self
+    }
+    /// Builder-style setter for [`crngs`](Self::crngs).
+    pub fn with_crngs(mut self, crngs: Vec<Crng>) -> Self {
+        self.crngs = crngs;
+        self
+    }
+    /// Builder-style setter for [`ccrts`](Self::ccrts).
+    pub fn with_ccrts(mut self, ccrts: Vec<Ccrt>) -> Self {
+        self.ccrts = ccrts;
+        self
+    }
+    /// Builder-style setter for [`drngs`](Self::drngs).
+    pub fn with_drngs(mut self, drngs: Vec<Drng>) -> Self {
+        self.drngs = drngs;
+        self
+    }
+    /// Builder-style setter for [`rgba`](Self::rgba).
+    pub fn with_rgba(mut self, rgba: Vec<u8>) -> Self {
+        self.rgba = rgba;
+        self
+    }
 }
 
 impl Default for IlbmImage {
@@ -5011,6 +5092,7 @@ pub(crate) fn build_palette(rgba: &[u8]) -> (Vec<[u8; 3]>, Vec<u8>) {
 /// RGB value reaches the output and no pixel is silently blacked or made
 /// transparent. A caller wanting genlock / brush semantics opts in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum GenlockPolicy {
     /// *Turbo Silver* "picture" semantics: a set genlock bit writes the
     /// **zero colour** (transparent-to-genlock black) into the pixel —
@@ -5253,6 +5335,7 @@ pub fn decode_rgb8_body(
 /// A decoded Turbo-Silver / Imagine true-colour image (`FORM RGB8` or
 /// `FORM RGBN`).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct RgbTrueColor {
     /// `true` for `FORM RGB8` (24-bit), `false` for `FORM RGBN` (12-bit).
     pub is_rgb8: bool,
@@ -5600,6 +5683,7 @@ pub fn encode_rgbn(width: u16, height: u16, rgba: &[u8]) -> Result<Vec<u8>> {
 /// DEEP DBOD compression method, from the DGBL `Compression` field
 /// (§1.1 of the truecolor doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeepCompression {
     /// `0` — raw chunky stream, no compression.
     None,
@@ -5696,6 +5780,7 @@ impl Dgbl {
 
 /// DEEP pixel component type — the `cType` field of a DPEL element (§1.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeepCType {
     Red,
     Green,
@@ -6528,6 +6613,7 @@ fn scale_to_u8(value: u16, depth: u16) -> u8 {
 
 /// A decoded `FORM DEEP` image.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct DeepImage {
     /// Parsed DGBL global header.
     pub dgbl: Dgbl,
@@ -6808,6 +6894,7 @@ fn decode_deep_dbod(
 
 /// One decoded frame of a multi-image `FORM DEEP` (§1.4).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct DeepFrame {
     /// The DLOC that preceded this frame's DBOD, if any (§1.3).
     pub dloc: Option<Dloc>,
@@ -6822,6 +6909,7 @@ pub struct DeepFrame {
 /// A decoded multi-image `FORM DEEP` — the global header, the pixel layout, the
 /// optional cel-anim timing, and every decoded DBOD frame (§1.4 / §1.6).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct DeepMovie {
     /// Parsed DGBL global header (§1.1).
     pub dgbl: Dgbl,
@@ -7055,6 +7143,7 @@ pub struct TvppExtraChunk {
 /// TVPP-specific `MIXR` / `BGP1` / `BGP2` chunks are surfaced raw in
 /// `extra_chunks` in document order. See [`parse_tvpp`].
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct TvppImage {
     /// Parsed DGBL global header (§1.1, shared with DEEP).
     pub dgbl: Dgbl,
@@ -7310,6 +7399,7 @@ fn check_deep_jfif(body: &[u8]) -> Result<()> {
 
 /// One JFIF stream extracted from a JPEG-compressed `FORM DEEP` (§1.5b).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct DeepJpegFrame {
     /// The DLOC that preceded this frame's DBOD, if any (§1.3).
     pub dloc: Option<Dloc>,
@@ -7326,6 +7416,7 @@ pub struct DeepJpegFrame {
 /// A JPEG-compressed `FORM DEEP` broken into its JFIF streams (§1.5b), one
 /// per DBOD, plus the surrounding container state.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct DeepJpegMovie {
     /// Parsed DGBL global header (§1.1); `compression` is always
     /// [`DeepCompression::Jpeg`].

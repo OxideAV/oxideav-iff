@@ -64,15 +64,13 @@ fn ham6_image() -> IlbmImage {
             rgba.extend_from_slice(&[x * 17, x * 17, x * 17, 0xFF]);
         }
     }
-    IlbmImage {
-        width: 16,
-        height: 2,
-        bmhd: bmhd(16, 2, 6),
-        palette,
-        camg: Camg { raw: CAMG_HAM },
-        rgba,
-        ..IlbmImage::default()
-    }
+    IlbmImage::default()
+        .with_width(16)
+        .with_height(2)
+        .with_bmhd(bmhd(16, 2, 6))
+        .with_palette(palette)
+        .with_camg(Camg { raw: CAMG_HAM })
+        .with_rgba(rgba)
 }
 
 #[test]
@@ -128,14 +126,12 @@ fn five_planes_without_camg_stay_indexed() {
             rgba.extend_from_slice(&[p[0], p[1], p[2], 0xFF]);
         }
     }
-    let img = IlbmImage {
-        width: 8,
-        height: 4,
-        bmhd: bmhd(8, 4, 5),
-        palette: palette.clone(),
-        rgba: rgba.clone(),
-        ..IlbmImage::default()
-    };
+    let img = IlbmImage::default()
+        .with_width(8)
+        .with_height(4)
+        .with_bmhd(bmhd(8, 4, 5))
+        .with_palette(palette.clone())
+        .with_rgba(rgba.clone());
     let decoded = parse_ilbm(&encode_ilbm(&img).unwrap()).unwrap();
     assert_eq!(decoded.rgba, rgba, "plain indexed round-trip");
     let res = decoded.format_resolution();
@@ -155,14 +151,12 @@ fn eight_planes_without_camg_stay_indexed_not_ham8() {
             rgba.extend_from_slice(&[g, g, g, 0xFF]);
         }
     }
-    let img = IlbmImage {
-        width: 16,
-        height: 2,
-        bmhd: bmhd(16, 2, 8),
-        palette,
-        rgba: rgba.clone(),
-        ..IlbmImage::default()
-    };
+    let img = IlbmImage::default()
+        .with_width(16)
+        .with_height(2)
+        .with_bmhd(bmhd(16, 2, 8))
+        .with_palette(palette)
+        .with_rgba(rgba.clone());
     let decoded = parse_ilbm(&encode_ilbm(&img).unwrap()).unwrap();
     assert_eq!(decoded.rgba, rgba);
     assert_eq!(decoded.format_resolution().format, InferredFormat::Indexed);

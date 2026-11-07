@@ -209,11 +209,7 @@ use oxideav_iff::svx::{
 };
 
 fn voice_of(header: VoiceHeader, channels: Vec<ChannelSamples>) -> Voice {
-    Voice {
-        header,
-        channels,
-        ..Voice::default()
-    }
+    Voice::default().with_header(header).with_channels(channels)
 }
 
 fn octave_ramp(len: usize, base: i8) -> Vec<i8> {
@@ -257,11 +253,11 @@ fn voice_roundtrip_stereo_full_chunk_set() {
         compression_byte: 0,
         volume: 0x0001_0000,
     };
-    let v = Voice {
-        header,
-        channel: Some(ChannelAssignment::Stereo),
-        pan: None, // PAN is for mono voices; exercised separately below
-        attack: vec![Envelope {
+    let v = Voice::default()
+        .with_header(header)
+        .with_channel(Some(ChannelAssignment::Stereo))
+        .with_pan(None)
+        .with_attack(vec![Envelope {
             points: vec![
                 EgPoint {
                     duration_ms: 10,
@@ -272,34 +268,33 @@ fn voice_roundtrip_stereo_full_chunk_set() {
                     dest: 0x0001_0000,
                 },
             ],
-        }],
-        release: vec![Envelope {
+        }])
+        .with_release(vec![Envelope {
             points: vec![EgPoint {
                 duration_ms: 50,
                 dest: 0,
             }],
-        }],
-        seqn: Some(Seqn {
+        }])
+        .with_seqn(Some(Seqn {
             segments: vec![
                 SeqnSegment { start: 0, end: 4 },
                 SeqnSegment { start: 4, end: 8 },
                 SeqnSegment { start: 0, end: 8 },
             ],
-        }),
-        fade: Some(Fade { segment: 2 }),
-        metadata: vec![
+        }))
+        .with_fade(Some(Fade { segment: 2 }))
+        .with_metadata(vec![
             ("title".into(), "chord".into()),
             ("comment".into(), "two segments then all".into()),
-        ],
-        channels: vec![
+        ])
+        .with_channels(vec![
             ChannelSamples {
                 octaves: vec![octave_ramp(8, 5)],
             },
             ChannelSamples {
                 octaves: vec![octave_ramp(8, -5)],
             },
-        ],
-    };
+        ]);
     let bytes = encode_voice(&v).unwrap();
     let back = parse_voice(&bytes).unwrap();
     assert_eq!(back, v);
@@ -320,15 +315,13 @@ fn voice_pan_and_right_routing() {
         samples_per_sec: 8000,
         ..VoiceHeader::default()
     };
-    let v = Voice {
-        header,
-        channel: Some(ChannelAssignment::Right),
-        pan: Some(Pan { position: 0x8000 }),
-        channels: vec![ChannelSamples {
+    let v = Voice::default()
+        .with_header(header)
+        .with_channel(Some(ChannelAssignment::Right))
+        .with_pan(Some(Pan { position: 0x8000 }))
+        .with_channels(vec![ChannelSamples {
             octaves: vec![octave_ramp(4, 1)],
-        }],
-        ..Voice::default()
-    };
+        }]);
     let back = parse_voice(&encode_voice(&v).unwrap()).unwrap();
     assert_eq!(back, v);
     let pan = back.pan.unwrap();
@@ -368,19 +361,17 @@ fn voice_roundtrip_stereo_fibonacci() {
     let smooth: Vec<i8> = (0..64)
         .map(|i| (60.0 * (i as f64 * 0.2).sin()) as i8)
         .collect();
-    let v = Voice {
-        header,
-        channel: Some(ChannelAssignment::Stereo),
-        channels: vec![
+    let v = Voice::default()
+        .with_header(header)
+        .with_channel(Some(ChannelAssignment::Stereo))
+        .with_channels(vec![
             ChannelSamples {
                 octaves: vec![smooth.clone()],
             },
             ChannelSamples {
                 octaves: vec![smooth.iter().map(|&s| -s).collect()],
             },
-        ],
-        ..Voice::default()
-    };
+        ]);
     let back = parse_voice(&encode_voice(&v).unwrap()).unwrap();
     assert_eq!(back.channel_count(), 2);
     assert_eq!(back.octave_count(), 1);
@@ -532,18 +523,16 @@ fn encode_voice_shape_validation() {
     );
     assert!(encode_voice(&bad_len).is_err());
     // Stereo CHAN but one channel of data.
-    let v = Voice {
-        header: VoiceHeader {
+    let v = Voice::default()
+        .with_header(VoiceHeader {
             one_shot_hi_samples: 4,
             samples_per_sec: 8000,
             ..VoiceHeader::default()
-        },
-        channel: Some(ChannelAssignment::Stereo),
-        channels: vec![ChannelSamples {
+        })
+        .with_channel(Some(ChannelAssignment::Stereo))
+        .with_channels(vec![ChannelSamples {
             octaves: vec![octave_ramp(4, 0)],
-        }],
-        ..Voice::default()
-    };
+        }]);
     assert!(encode_voice(&v).is_err());
 }
 

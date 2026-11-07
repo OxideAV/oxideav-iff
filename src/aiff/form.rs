@@ -83,6 +83,7 @@ pub fn write_sound_data(sound: &SoundData<'_>) -> Vec<u8> {
 
 /// Result of walking a FORM chunk.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Form<'a> {
     /// `formType` field — either `b"AIFF"` (v1.3 uncompressed) or
     /// `b"AIFC"` (compressed-capable).

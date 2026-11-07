@@ -65,16 +65,14 @@ fn indexed_image(w: u16, h: u16, n_planes: u8, palette: Vec<[u8; 3]>) -> IlbmIma
             rgba.extend_from_slice(&[p[0], p[1], p[2], 0xFF]);
         }
     }
-    IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd: bmhd(w, h, n_planes, Masking::None),
-        palette,
-        camg: Camg::default(),
-        rgba,
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    }
+    IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(bmhd(w, h, n_planes, Masking::None))
+        .with_palette(palette)
+        .with_camg(Camg::default())
+        .with_rgba(rgba)
+        .with_form_type(*b"ILBM")
 }
 
 fn pal16() -> Vec<[u8; 3]> {
@@ -213,16 +211,14 @@ fn acbm_ehb_roundtrip() {
         }
     }
     let camg = Camg { raw: CAMG_EHB };
-    let img = IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd: bmhd(w, h, 6, Masking::None),
-        palette: base,
-        camg,
-        rgba,
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    };
+    let img = IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(bmhd(w, h, 6, Masking::None))
+        .with_palette(base)
+        .with_camg(camg)
+        .with_rgba(rgba)
+        .with_form_type(*b"ILBM");
     let bytes = encode_acbm(&img).unwrap();
     let dec = parse_acbm(&bytes).unwrap();
     assert_eq!(dec.rgba, img.rgba, "ACBM EHB round-trips");
@@ -244,16 +240,14 @@ fn acbm_ham6_roundtrip() {
         }
     }
     let camg = Camg { raw: CAMG_HAM };
-    let img = IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd: bmhd(w, h, 6, Masking::None),
-        palette,
-        camg,
-        rgba,
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    };
+    let img = IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(bmhd(w, h, 6, Masking::None))
+        .with_palette(palette)
+        .with_camg(camg)
+        .with_rgba(rgba)
+        .with_form_type(*b"ILBM");
     let acbm = parse_acbm(&encode_acbm(&img).unwrap()).unwrap();
     let ilbm = parse_ilbm(&encode_ilbm(&img).unwrap()).unwrap();
     assert_eq!(
@@ -280,16 +274,14 @@ fn acbm_hasmask_roundtrip() {
             rgba.extend_from_slice(&[p[0], p[1], p[2], a]);
         }
     }
-    let img = IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd: bmhd(w, h, 4, Masking::HasMask),
-        palette,
-        camg: Camg::default(),
-        rgba: rgba.clone(),
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    };
+    let img = IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(bmhd(w, h, 4, Masking::HasMask))
+        .with_palette(palette)
+        .with_camg(Camg::default())
+        .with_rgba(rgba.clone())
+        .with_form_type(*b"ILBM");
     let dec = parse_acbm(&encode_acbm(&img).unwrap()).unwrap();
     // Compare alpha channel survives the contiguous mask plane.
     for (i, chunk) in dec.rgba.as_chunks::<4>().0.iter().enumerate() {

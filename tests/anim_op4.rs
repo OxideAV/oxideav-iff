@@ -298,15 +298,13 @@ fn frame_pattern(w: u16, h: u16, seed: u8, palette: Vec<[u8; 3]>) -> IlbmImage {
             rgba.extend_from_slice(&[p[0], p[1], p[2], 0xFF]);
         }
     }
-    IlbmImage {
-        width: w as u32,
-        height: h as u32,
-        bmhd,
-        palette,
-        camg: Camg::default(),
-        rgba,
-        ..IlbmImage::default()
-    }
+    IlbmImage::default()
+        .with_width(w as u32)
+        .with_height(h as u32)
+        .with_bmhd(bmhd)
+        .with_palette(palette)
+        .with_camg(Camg::default())
+        .with_rgba(rgba)
 }
 
 #[test]
@@ -396,15 +394,13 @@ fn op4_full_container_roundtrip_long_4plane() {
                 rgba.extend_from_slice(&[p[0], p[1], p[2], 0xFF]);
             }
         }
-        IlbmImage {
-            width: 32,
-            height: 5,
-            bmhd,
-            palette: palette.clone(),
-            camg: Camg::default(),
-            rgba,
-            ..IlbmImage::default()
-        }
+        IlbmImage::default()
+            .with_width(32)
+            .with_height(5)
+            .with_bmhd(bmhd)
+            .with_palette(palette.clone())
+            .with_camg(Camg::default())
+            .with_rgba(rgba)
     };
     let frames = vec![mk(0), mk(5), mk(9)];
     let bytes = encode_anim_op4(&frames, true).unwrap();

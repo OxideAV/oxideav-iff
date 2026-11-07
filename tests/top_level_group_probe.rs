@@ -41,16 +41,14 @@ fn tiny_ilbm() -> IlbmImage {
             rgba.extend_from_slice(&[p[0], p[1], p[2], 0xFF]);
         }
     }
-    IlbmImage {
-        width: 4,
-        height: 2,
-        bmhd,
-        palette: pal,
-        camg: Camg::default(),
-        rgba,
-        form_type: *b"ILBM",
-        ..IlbmImage::default()
-    }
+    IlbmImage::default()
+        .with_width(4)
+        .with_height(2)
+        .with_bmhd(bmhd)
+        .with_palette(pal)
+        .with_camg(Camg::default())
+        .with_rgba(rgba)
+        .with_form_type(*b"ILBM")
 }
 
 /// Build a minimal `FORM 8SVX { VHDR, BODY }` file the way `svx.rs`

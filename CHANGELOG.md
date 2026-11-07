@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `with_<field>` builder setters on `ilbm::IlbmImage` and `svx::Voice`
+  (both build from `Default`).
+
+### Changed
+
+- `#[non_exhaustive]` on the document models `anim::AnimImage`,
+  `AnimPlayback`, `PlaybackFrame`, `ilbm::IlbmImage`, `RgbTrueColor`,
+  `DeepImage`, `DeepFrame`, `DeepMovie`, `TvppImage`, `DeepJpegFrame`,
+  `DeepJpegMovie`, `svx::Voice`, `aiff::Form`, and on the enums
+  `ilbm::Compression`, `InferredFormat`, `GenlockPolicy`,
+  `DeepCompression`, `DeepCType`, `svx::Compression`, `AnimMuxerOp`,
+  `aiff::ApplicationDialect`, `PcmSamples`, `ChunkClass`,
+  `MuxerMode`, `DeepMuxerCompression`. The 1:1 chunk-layout records
+  (`Bmhd`, `Anhd`, `Camg`, `Grab`, `Dest`, `Crng`, `VoiceHeader`,
+  `CommonChunk`, …) and the spec-fixed enums (`GroupKind`,
+  `ReservedId`, `Masking`, `PchgKind`, `PlayMode`, `TextKind`,
+  `Channels`, `ChannelAssignment`, `PlayfieldPriority`) stay
+  exhaustive, as does `FormatResolution`.
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-iff/compare/v0.0.11...v0.0.12) - 2026-11-06
 
 ### Other
@@ -1642,8 +1663,6 @@ in other crates — this crate has no audio decoder, so no audio event.
 - `aiff::Form` gains an `instrument: Option<InstrumentChunk>`
   field — `None` when the FORM has no `INST` chunk, `Some(_)`
   otherwise. New since the previous Unreleased entry.
-
-
 
 ## [0.0.8](https://github.com/OxideAV/oxideav-iff/compare/v0.0.7...v0.0.8) - 2026-05-30
 

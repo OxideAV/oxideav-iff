@@ -44,6 +44,7 @@ use crate::aiff::error::{AiffError, Result};
 /// The `applicationSignature` dialect a parsed APPL chunk falls
 /// into, per §12.0 of the spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ApplicationDialect {
     /// `pdos` — Apple II application. The data area starts with a
     /// Pascal-string application name.
