@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-iff/compare/v0.0.12...v0.0.13) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive document models + growable enums, builders
+
 ### Added
 
 - `with_<field>` builder setters on `ilbm::IlbmImage` and `svx::Voice`
